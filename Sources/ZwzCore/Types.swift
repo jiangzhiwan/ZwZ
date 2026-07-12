@@ -90,6 +90,7 @@ public enum ZwzCompressionMethod: UInt8, CaseIterable {
 public struct CompressionOptions {
     public var level: CompressionLevel
     public var password: String?
+    public var encryption: ZwzEncryptionMode
     public var aes256: Bool
     public var splitVolume: SplitVolume?
     public var format: CompressionFormat
@@ -105,6 +106,28 @@ public struct CompressionOptions {
     ) {
         self.level = level
         self.password = password
+        self.encryption = password.map(ZwzEncryptionMode.password) ?? .none
+        self.aes256 = aes256
+        self.splitVolume = splitVolume
+        self.format = format
+        self.threadCount = threadCount
+    }
+
+    public init(
+        level: CompressionLevel = .normal,
+        encryption: ZwzEncryptionMode,
+        aes256: Bool = true,
+        splitVolume: SplitVolume? = nil,
+        format: CompressionFormat = .zip,
+        threadCount: Int = 0
+    ) {
+        self.level = level
+        if case .password(let password) = encryption {
+            self.password = password
+        } else {
+            self.password = nil
+        }
+        self.encryption = encryption
         self.aes256 = aes256
         self.splitVolume = splitVolume
         self.format = format
