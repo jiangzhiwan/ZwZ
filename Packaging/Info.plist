@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
+    <key>CFBundleDisplayName</key><string>ZwZ</string>
+    <key>CFBundleExecutable</key><string>ZwZ</string>
+    <key>CFBundleIconFile</key><string>ZwZ.icns</string>
+    <key>CFBundleIconName</key><string>ZwZ</string>
+    <key>CFBundleIdentifier</key><string>com.jiangzhiwan.zwz</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleName</key><string>ZwZ</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>LSMinimumSystemVersion</key><string>15.0</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict><key>CFBundleTypeName</key><string>ZwZ Archive</string><key>CFBundleTypeIconFile</key><string>ZwZ.icns</string><key>CFBundleTypeRole</key><string>Viewer</string><key>LSHandlerRank</key><string>Alternate</string><key>LSItemContentTypes</key><array><string>com.zwz.archive</string></array></dict>
+        <dict><key>CFBundleTypeName</key><string>ZIP Archive</string><key>CFBundleTypeRole</key><string>Viewer</string><key>LSHandlerRank</key><string>Alternate</string><key>LSItemContentTypes</key><array><string>public.zip-archive</string></array></dict>
+        <dict><key>CFBundleTypeName</key><string>RAR Archive</string><key>CFBundleTypeRole</key><string>Viewer</string><key>LSHandlerRank</key><string>Alternate</string><key>LSItemContentTypes</key><array><string>com.zwz.rar-archive</string></array></dict>
+        <dict><key>CFBundleTypeName</key><string>7-Zip Archive</string><key>CFBundleTypeRole</key><string>Viewer</string><key>LSHandlerRank</key><string>Alternate</string><key>LSItemContentTypes</key><array><string>com.zwz.7z-archive</string></array></dict>
+        <dict><key>CFBundleTypeName</key><string>TAR.GZ Archive</string><key>CFBundleTypeRole</key><string>Viewer</string><key>LSHandlerRank</key><string>Alternate</string><key>LSItemContentTypes</key><array><string>com.zwz.tar-gz-archive</string></array></dict>
+        <dict><key>CFBundleTypeName</key><string>TGZ Archive</string><key>CFBundleTypeRole</key><string>Viewer</string><key>LSHandlerRank</key><string>Alternate</string><key>LSItemContentTypes</key><array><string>com.zwz.tgz-archive</string></array></dict>
+        <dict><key>CFBundleTypeName</key><string>Gzip Archive</string><key>CFBundleTypeRole</key><string>Viewer</string><key>LSHandlerRank</key><string>Alternate</string><key>LSItemContentTypes</key><array><string>com.zwz.gzip-archive</string></array></dict>
+    </array>
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict><key>UTTypeIdentifier</key><string>com.zwz.archive</string><key>UTTypeDescription</key><string>ZwZ Archive</string><key>UTTypeConformsTo</key><array><string>public.archive</string><string>public.data</string></array><key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>zwz</string></array></dict></dict>
+        <dict><key>UTTypeIdentifier</key><string>com.zwz.rar-archive</string><key>UTTypeDescription</key><string>RAR Archive</string><key>UTTypeConformsTo</key><array><string>public.archive</string><string>public.data</string></array><key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>rar</string></array></dict></dict>
+        <dict><key>UTTypeIdentifier</key><string>com.zwz.7z-archive</string><key>UTTypeDescription</key><string>7-Zip Archive</string><key>UTTypeConformsTo</key><array><string>public.archive</string><string>public.data</string></array><key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>7z</string></array></dict></dict>
+        <dict><key>UTTypeIdentifier</key><string>com.zwz.tar-gz-archive</string><key>UTTypeDescription</key><string>TAR.GZ Archive</string><key>UTTypeConformsTo</key><array><string>public.archive</string><string>public.data</string></array><key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>tar.gz</string></array></dict></dict>
+        <dict><key>UTTypeIdentifier</key><string>com.zwz.tgz-archive</string><key>UTTypeDescription</key><string>TGZ Archive</string><key>UTTypeConformsTo</key><array><string>public.archive</string><string>public.data</string></array><key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>tgz</string></array></dict></dict>
+        <dict><key>UTTypeIdentifier</key><string>com.zwz.gzip-archive</string><key>UTTypeDescription</key><string>Gzip Archive</string><key>UTTypeConformsTo</key><array><string>public.archive</string><string>public.data</string></array><key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>gz</string></array></dict></dict>
+    </array>
+</dict>
+</plist>

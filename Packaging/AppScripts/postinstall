@@ -1,0 +1,14 @@
+#!/bin/bash
+set -e
+
+APP="/Applications/ZwZ.app"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
+if [[ -d "$APP" ]]; then
+  /usr/bin/touch "$APP"
+  if [[ -x "$LSREGISTER" ]]; then
+    "$LSREGISTER" -f "$APP" >/dev/null 2>&1 || true
+  fi
+fi
+
+exit 0

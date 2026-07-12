@@ -1,0 +1,25 @@
+# Subagent Driven Development Progress
+
+- Baseline: swift test passed (5 tests, 0 failures) on 2026-07-11 12:36 local.
+- Workspace: original folder, not a Git repository; using checkpoint reports instead of commits.
+- Preflight: adjusted Task 9 to avoid depending on Task 10 extractor; adjusted Task 12 to assert v2 magic.
+- Task 1: verified with `swift test --filter PackageBoundaryTests` (2 tests, 0 failures) and `swift test` (7 tests, 0 failures); review fixes applied.
+- Task 1 verified with swift test --filter PackageBoundaryTests
+- Task 2: fix verification passed with `swift test --filter PublicAPIBoundaryTests`, `swift test --filter ZwzV2TypesTests`, `swift test --filter PackageBoundaryTests`, and `swift test` (10 tests, 0 failures).
+- Task 2 verified with swift test --filter ZwzV2TypesTests
+- Task 3: final verification passed with `swift test --filter ZwzV2BinaryCodecTests` (16 tests, 0 failures) and `swift test` (26 tests, 0 failures); review clean after encoder/decoder overflow fixes.
+- Task 3 verified with swift test --filter ZwzV2BinaryCodecTests
+- Task 4: final verification passed with `swift test --filter ZwzV2PathTests` (6 tests, 0 failures) and `swift test` (32 tests, 0 failures); review clean after file/descendant conflict fix.
+- Task 4 verified with swift test --filter ZwzV2PathTests
+- Task 5: final verification passed with `swift test --filter ZwzV2BlockCodecTests` (6 tests, 0 failures) and `swift test` (38 tests, 0 failures); review clean after Deflate threshold test seam.
+- Task 5 verified with swift test --filter ZwzV2BlockCodecTests
+- Task 6: verification passed with `swift test --filter ZwzV2CryptoTests` (2 tests, 0 failures) and `swift test` (40 tests, 0 failures); review approved with minor future hardening suggestions for nonce byte-layout and tamper tests.
+- Task 6 verified with swift test --filter ZwzV2CryptoTests
+- Task 7: final verification passed with `swift test --filter ZwzV2IndexCodecTests` (10 tests, 0 failures), `swift test --filter ZwzV2CryptoTests` (2 tests, 0 failures), and `swift test` (50 tests, 0 failures); review clean after timestamp/privacy/tamper fixes.
+- Task 7 verified with swift test --filter ZwzV2IndexCodecTests
+- Task 8: final verification passed with `swift test --filter ZwzV2VolumeIOTests` (10 tests), `swift test --filter ZwzV2BinaryCodecTests` (16 tests), and `swift test` (60 tests); review clean after zero-based/reordered-volume fixes.
+- Task 8 verified with swift test --filter ZwzV2VolumeIOTests
+- Task 9: final verification passed with `swift test --filter ZwzV2CompressorTests` (4 tests) and `swift test` (64 tests); follow-up review approved after bounded reorder-window backpressure and split/block-boundary tests. Index materialization remains a format/API follow-up, not a Task 9 blocker.
+- Task 9 verified with swift test --filter ZwzV2CompressorTests
+- Task 10: final verification passed with `swift test --filter ZwzV2ExtractorTests` (7 tests) and `swift test` (71 tests); review approved after symlink destination rejection, index layout validation, and existing-output truncation fixes.
+- Task 10 verified with swift test --filter ZwzV2ExtractorTests

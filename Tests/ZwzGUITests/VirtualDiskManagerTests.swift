@@ -1,0 +1,34 @@
+import XCTest
+@testable import ZwzGUI
+
+final class VirtualDiskManagerTests: XCTestCase {
+    func testSessionOwnerRoundTripsAndOlderJSONDefaultsToNil() throws {
+        let owner = UUID()
+        let session = VirtualDiskSession(archivePath: "a.zwz", imagePath: "a", mountPath: "m", password: nil, capacityMB: 256, baselineFingerprint: "x", splitVolumeBytes: nil, isMounted: true, ownerTabID: owner)
+        XCTAssertEqual(try JSONDecoder().decode(VirtualDiskSession.self, from: JSONEncoder().encode(session)).ownerTabID, owner)
+
+        let oldJSON = #"{"archivePath":"a.zwz","imagePath":"a","mountPath":"m","capacityMB":256,"baselineFingerprint":"x","isMounted":true}"#
+        XCTAssertNil(try JSONDecoder().decode(VirtualDiskSession.self, from: Data(oldJSON.utf8)).ownerTabID)
+    }
+    func testRecommendedCapacityAddsHeadroomAndRoundsTo256MB() {
+        XCTAssertEqual(VirtualDiskManager.recommendedCapacityMB(uncompressedBytes: 0), 256)
+        XCTAssertEqual(VirtualDiskManager.recommendedCapacityMB(uncompressedBytes: 1), 512)
+        XCTAssertEqual(VirtualDiskManager.recommendedCapacityMB(uncompressedBytes: 256 * 1_048_576), 512)
+        XCTAssertEqual(VirtualDiskManager.recommendedCapacityMB(uncompressedBytes: 257 * 1_048_576), 768)
+    }
+
+    func testSessionRoundTripsThroughJSON() throws {
+        let session = VirtualDiskSession(
+            archivePath: "/tmp/a.zwz",
+            imagePath: "/tmp/a.sparsebundle",
+            mountPath: "/tmp/mount",
+            password: "secret",
+            capacityMB: 512,
+            baselineFingerprint: "fingerprint",
+            splitVolumeBytes: 262_144,
+            isMounted: true
+        )
+        let decoded = try JSONDecoder().decode(VirtualDiskSession.self, from: JSONEncoder().encode(session))
+        XCTAssertEqual(decoded, session)
+    }
+}
