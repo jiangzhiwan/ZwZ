@@ -3,6 +3,56 @@ import XCTest
 @testable import ZwzCore
 
 final class ZwzV3BinaryCodecTests: XCTestCase {
+    func testGoldenHeaderLocksCanonicalByteLayout() throws {
+        let golden = Data.v3HeaderGolden
+        let expected = ZwzV3Header(
+            archiveID: UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!,
+            recipientCount: 2,
+            recipientRegionOffset: 160,
+            recipientRegionLength: 300,
+            dataRegionOffset: 460,
+            dataRegionLength: 100,
+            encryptedIndexOffset: 560,
+            encryptedIndexLength: 40,
+            signerRegionOffset: 600,
+            signerRegionLength: 130,
+            signatureOffset: 666,
+            signatureLength: 64,
+            dataBlockCount: 3,
+            signatureAlgorithm: .ed25519
+        )
+
+        XCTAssertEqual(golden.count, 160)
+        XCTAssertEqual(Array(golden[0..<4]), [0x5A, 0x57, 0x5A, 0x33])
+        XCTAssertEqual(Array(golden[4..<12]), [0x03, 0x00, 0xA0, 0x00, 0x01, 0x00, 0x00, 0x00])
+        XCTAssertEqual(Array(golden[12..<20]), [0x02, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00])
+        XCTAssertEqual(
+            Array(golden[20..<36]),
+            [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+             0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]
+        )
+        XCTAssertEqual(
+            Array(golden[36..<128]),
+            [
+                0x02, 0x00, 0x00, 0x00,
+                0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x2C, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0xCC, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x30, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x58, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x82, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x9A, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ]
+        )
+        XCTAssertTrue(golden[128..<160].allSatisfy { $0 == 0 })
+        XCTAssertEqual(try ZwzV3BinaryCodec.decodeHeader(golden), expected)
+        XCTAssertEqual(try ZwzV3BinaryCodec.encodeHeader(expected), golden)
+    }
+
     func testHeaderRoundTripPreservesAlgorithmsAndOffsets() throws {
         let header = ZwzV3Header(
             archiveID: UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!,
@@ -100,10 +150,36 @@ final class ZwzV3BinaryCodecTests: XCTestCase {
         Data.writeUInt32(.max, at: recipientOffset + 4, in: &corruptNameLength)
         assertMalformed(corruptNameLength)
 
-        var signed = try Data.signedFixture(signature: Data(repeating: 1, count: 64))
+        var corruptFingerprintLength = fixture
+        let recipientFingerprintLengthOffset = recipientOffset + 8 + "Alice".utf8.count
+        Data.writeUInt32(.max, at: recipientFingerprintLengthOffset, in: &corruptFingerprintLength)
+        assertMalformed(corruptFingerprintLength)
+
+        let signed = try Data.signedFixture(signature: Data(repeating: 1, count: 64))
         let signerOffset = Int(Data.readUInt64(at: 88, in: signed))
-        Data.writeUInt32(.max, at: signerOffset, in: &signed)
-        assertMalformed(signed)
+        for lengthOffset in [signerOffset + 4, signerOffset + 8 + "Sender".utf8.count] {
+            var corruptSignerStringLength = signed
+            Data.writeUInt32(.max, at: lengthOffset, in: &corruptSignerStringLength)
+            assertMalformed(corruptSignerStringLength)
+        }
+
+        for delta: Int64 in [-1, 1] {
+            var corruptSignatureOffset = signed
+            let signatureOffset = Data.readUInt64(at: 104, in: signed)
+            Data.writeUInt64(UInt64(Int64(signatureOffset) + delta), at: 104, in: &corruptSignatureOffset)
+            assertMalformed(corruptSignatureOffset)
+        }
+    }
+
+    func testParserRejectsEmptyDataRegionWithNonzeroBlockCount() throws {
+        var archive = try Data.fixture()
+        let dataOffset = Int(Data.readUInt64(at: 56, in: archive))
+        let indexOffset = Int(Data.readUInt64(at: 72, in: archive))
+        archive.removeSubrange(dataOffset..<indexOffset)
+        Data.writeUInt64(0, at: 64, in: &archive)
+        Data.writeUInt64(UInt64(dataOffset), at: 72, in: &archive)
+
+        assertMalformed(archive)
     }
 
     func testParserRejectsUnknownFlagsAlgorithmsReservedBytesAndInconsistentSignature() throws {
