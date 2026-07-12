@@ -618,12 +618,34 @@ enum ZwzCLI {
 
     static let usage = """
     zwz - archive and public-key identity tool
-    Usage: zwz <command> [options]
+    Usage:
+      zwz compress [options] <source-path> [output-path]
+      zwz extract [options] <archive-path> [output-directory]
+      zwz list [options] <archive-path>
+      zwz key <operation> [options]
 
     Commands:
       c, compress    Create an archive
       x, extract     Extract an archive
       l, list        List archive contents
+      h, help        Show this help
+
+    Compression options:
+      -f, --format <zip|zwz>                    Archive format (default: zip)
+      -l, --level <none|fastest|normal|max>     Compression level (default: normal)
+      -p, --password <password>                 Password encryption
+      --no-aes                                  Disable AES-256 for supported legacy formats
+      -s, --split <positive-size>               Split size in MB or KB, for example 100MB
+      -t, --threads <nonnegative-count>         Worker count; 0 selects automatically
+      --recipient <name-or-fingerprint>         Repeat for multiple recipients; requires -f zwz
+      --sign <local-identity-or-fingerprint>    Requires -f zwz and at least one --recipient
+
+    Password encryption and --recipient/--sign public-key encryption are mutually exclusive.
+
+    Extract and list options:
+      -p, --password <password>                 Password for a password-encrypted archive
+
+    Key commands:
       key create <name>
       key list
       key rename <identity-or-fingerprint> <new-name>
@@ -633,9 +655,18 @@ enum ZwzCLI {
       key backup <identity-or-fingerprint> <output.zwzkey>
       key restore [--replace] <input.zwzkey>
 
-    Compression public-key options:
-      --recipient <name-or-fingerprint>   Repeat for multiple recipients
-      --sign <local-identity-or-fingerprint>
+    Backup and restore passwords are read from stdin. On a TTY, input is hidden; backup asks
+    for confirmation. Backup passwords are never accepted as command arguments or environment options.
+
+    Examples:
+      zwz c -f zip -l max Documents documents.zip
+      zwz c -f zwz -s 100MB Source source.zwz
+      zwz c -f zwz --recipient Alice --recipient Bob --sign Me Source shared.zwz
+      zwz x -p secret archive.zwz extracted
+      zwz l archive.zwz
+      zwz key export-public Alice alice.zwzpub
+      zwz key backup Me me.zwzkey
+      zwz key restore me.zwzkey
     """
 }
 

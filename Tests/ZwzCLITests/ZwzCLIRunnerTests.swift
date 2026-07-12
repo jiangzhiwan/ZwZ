@@ -128,13 +128,30 @@ final class ZwzCLIRunnerTests: XCTestCase {
         }
     }
 
-    func testHelpContainsKeyCommandsAndPublicKeyFlags() {
+    func testHelpDocumentsLegacyAndPublicKeyWorkflows() {
         let harness = Harness()
         XCTAssertEqual(harness.run(["help"]), 0)
-        XCTAssertTrue(harness.output.text.contains("key export-public"))
-        XCTAssertTrue(harness.output.text.contains("key restore"))
-        XCTAssertTrue(harness.output.text.contains("--recipient"))
-        XCTAssertTrue(harness.output.text.contains("--sign"))
+        let help = harness.output.text
+        for expected in [
+            "compress [options] <source-path> [output-path]",
+            "extract [options] <archive-path> [output-directory]",
+            "c, compress", "x, extract", "l, list", "h, help",
+            "-f, --format <zip|zwz>",
+            "-l, --level <none|fastest|normal|max>",
+            "-p, --password <password>", "--no-aes",
+            "-s, --split <positive-size>", "MB or KB",
+            "-t, --threads <nonnegative-count>",
+            "key create", "key list", "key rename", "key delete",
+            "key export-public", "key import-public", "key backup", "key restore",
+            "--recipient <name-or-fingerprint>", "Repeat for multiple recipients; requires -f zwz",
+            "--sign <local-identity-or-fingerprint>",
+            "Requires -f zwz and at least one --recipient",
+            "mutually exclusive", "read from stdin", "On a TTY, input is hidden",
+            "never accepted as command arguments or environment options",
+            "zwz c -f zwz --recipient Alice --recipient Bob --sign Me Source shared.zwz"
+        ] {
+            XCTAssertTrue(help.contains(expected), "help is missing: \(expected)")
+        }
     }
 
     func testActualUnsignedAndSignedMultiRecipientV3RoundTrips() throws {
