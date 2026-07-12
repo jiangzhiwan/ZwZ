@@ -98,8 +98,11 @@ public enum ZwzV3Error: LocalizedError, Equatable, Sendable {
     case noMatchingPrivateKey([String])
     case userAuthenticationCancelled
     case invalidSignature
+    case invalidKeyFile
     case invalidBackup
+    case invalidIdentityName
     case identityConflict(String)
+    case keychainFailure(Int32)
     case unsupportedVersion(UInt16)
 
     public var errorDescription: String? {
@@ -120,10 +123,16 @@ public enum ZwzV3Error: LocalizedError, Equatable, Sendable {
             return "User authentication was cancelled"
         case .invalidSignature:
             return "The archive signature is invalid"
+        case .invalidKeyFile:
+            return "The public identity file is invalid"
         case .invalidBackup:
             return "The identity backup is invalid"
+        case .invalidIdentityName:
+            return "The identity name must not be empty"
         case .identityConflict:
             return "An identity conflict was detected"
+        case .keychainFailure(let status):
+            return "Keychain operation failed with status: \(status)"
         case .unsupportedVersion(let version):
             return "Unsupported ZWZ version: \(version)"
         }
