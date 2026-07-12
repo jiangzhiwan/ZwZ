@@ -31,6 +31,17 @@ public struct ZwzRecipient: Equatable, Sendable {
     }
 }
 
+/// Public, untrusted recipient labels embedded in an archive.
+public struct ZwzRecipientInfo: Equatable, Sendable {
+    public let name: String
+    public let fingerprint: String
+
+    public init(name: String, fingerprint: String) {
+        self.name = name
+        self.fingerprint = fingerprint
+    }
+}
+
 public struct ZwzSigningIdentity: Equatable, Sendable {
     public let name: String
     public let fingerprint: String

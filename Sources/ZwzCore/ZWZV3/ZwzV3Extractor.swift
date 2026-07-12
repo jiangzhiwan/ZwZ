@@ -7,6 +7,15 @@ public final class ZwzV3Extractor {
 
     public init() {}
 
+    public func recipientInfo(archivePath: String) throws -> [ZwzRecipientInfo] {
+        let urls = try Self.archiveURLs(for: archivePath)
+        let archive = try Self.loadLogicalArchive(from: urls)
+        let parsed = try ZwzV3BinaryCodec.parse(archive)
+        return parsed.recipients.map {
+            ZwzRecipientInfo(name: $0.recipientName, fingerprint: $0.recipientFingerprint)
+        }
+    }
+
     public func listEntries(
         archivePath: String,
         keyProvider: ZwzPrivateKeyProvider

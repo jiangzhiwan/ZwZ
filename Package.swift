@@ -51,6 +51,11 @@ let package = Package(
             dependencies: ["ZwzGUI"],
             path: "Tests/ZwzGUITests"
         ),
+        .testTarget(
+            name: "ZwzCLITests",
+            dependencies: ["zwz", "ZwzCore"],
+            path: "Tests/ZwzCLITests"
+        ),
     ],
     swiftLanguageModes: [.v6]
 )
