@@ -1,5 +1,11 @@
 import Foundation
 
+public protocol ZwzPrivateKeyProvider: Sendable {
+    func agreementPrivateKey(fingerprint: String, reason: String) throws -> Data
+    func signingPrivateKey(fingerprint: String, reason: String) throws -> Data
+    func isKnownSigningKey(fingerprint: String) -> Bool
+}
+
 public enum ZwzEncryptionMode: Equatable, Sendable {
     case none
     case password(String)
@@ -28,10 +34,19 @@ public struct ZwzRecipient: Equatable, Sendable {
 public struct ZwzSigningIdentity: Equatable, Sendable {
     public let name: String
     public let fingerprint: String
+    public let agreementPublicKey: Data
+    public let signingPublicKey: Data
 
-    public init(name: String, fingerprint: String) {
+    public init(
+        name: String,
+        fingerprint: String,
+        agreementPublicKey: Data = Data(),
+        signingPublicKey: Data = Data()
+    ) {
         self.name = name
         self.fingerprint = fingerprint
+        self.agreementPublicKey = agreementPublicKey
+        self.signingPublicKey = signingPublicKey
     }
 }
 
@@ -61,6 +76,16 @@ public struct ZwzArchiveSecurityInfo: Equatable, Sendable {
         self.encryption = encryption
         self.recipientFingerprints = recipientFingerprints
         self.signature = signature
+    }
+}
+
+public struct ZwzV3ArchiveListing: Equatable, Sendable {
+    public let entries: [ZwzV2Entry]
+    public let securityInfo: ZwzArchiveSecurityInfo
+
+    public init(entries: [ZwzV2Entry], securityInfo: ZwzArchiveSecurityInfo) {
+        self.entries = entries
+        self.securityInfo = securityInfo
     }
 }
 

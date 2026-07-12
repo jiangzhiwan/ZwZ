@@ -2,6 +2,20 @@ import XCTest
 @testable import ZwzCore
 
 final class ZwzV3TypesTests: XCTestCase {
+    func testSigningIdentityCarriesBothPublicKeysWhileLegacyInitializerRemainsAvailable() {
+        let legacy = ZwzSigningIdentity(name: "Legacy", fingerprint: "fingerprint")
+        XCTAssertTrue(legacy.agreementPublicKey.isEmpty)
+        XCTAssertTrue(legacy.signingPublicKey.isEmpty)
+
+        let identity = ZwzSigningIdentity(
+            name: "Sender",
+            fingerprint: "fingerprint",
+            agreementPublicKey: Data(repeating: 1, count: 32),
+            signingPublicKey: Data(repeating: 2, count: 32)
+        )
+        XCTAssertEqual(identity.agreementPublicKey.count, 32)
+        XCTAssertEqual(identity.signingPublicKey.count, 32)
+    }
     func testCompressionOptionsMapsLegacyPassword() {
         XCTAssertEqual(
             CompressionOptions(password: "secret", format: .zwz).encryption,
