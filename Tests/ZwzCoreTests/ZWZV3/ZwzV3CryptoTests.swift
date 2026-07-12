@@ -3,6 +3,24 @@ import XCTest
 @testable import ZwzCore
 
 final class ZwzV3CryptoTests: XCTestCase {
+    func testFingerprintUsesVersionedTypedCanonicalFields() {
+        let agreement = Data(UInt8(0)...UInt8(31))
+        let signing = Data(UInt8(32)...UInt8(63))
+
+        XCTAssertEqual(
+            ZwzV3Crypto.fingerprint(agreement: agreement, signing: signing),
+            "20f48b0d432704d6b4240c092cbddb0330149080aba7dd8ec863956805e14836"
+        )
+        XCTAssertNotEqual(
+            ZwzV3Crypto.fingerprint(agreement: agreement, signing: signing),
+            ZwzV3Crypto.fingerprint(agreement: signing, signing: agreement)
+        )
+        XCTAssertNotEqual(
+            ZwzV3Crypto.fingerprint(agreement: agreement, signing: signing),
+            ZwzV3Crypto.fingerprint(agreement: agreement, signing: nil)
+        )
+    }
+
     func testAnyRecipientCanUnwrapSameContentKey() throws {
         let alice = Curve25519.KeyAgreement.PrivateKey()
         let bob = Curve25519.KeyAgreement.PrivateKey()

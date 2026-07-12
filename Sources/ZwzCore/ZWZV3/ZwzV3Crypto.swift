@@ -45,8 +45,11 @@ public enum ZwzV3Crypto {
     private static let envelopeDomain = Data("ZWZ3 recipient envelope".utf8)
 
     public static func fingerprint(agreement: Data, signing: Data?) -> String {
-        var canonical = Data("ZWZ3 fingerprint".utf8)
+        var canonical = Data()
+        canonical.appendLengthPrefixed(Data("ZWZ3 fingerprint v1".utf8))
+        canonical.appendLengthPrefixed(Data("X25519 agreement public key".utf8))
         canonical.appendLengthPrefixed(agreement)
+        canonical.appendLengthPrefixed(Data("Ed25519 signing public key".utf8))
         canonical.appendLengthPrefixed(signing ?? Data())
         return SHA256.hash(data: canonical).map { String(format: "%02x", $0) }.joined()
     }
@@ -60,17 +63,23 @@ public enum ZwzV3Crypto {
         let ephemeralPublicKey = ephemeralKey.publicKey.rawRepresentation
 
         return try recipients.map { recipient in
+            let wrappingKey: SymmetricKey
             do {
                 let publicKey = try Curve25519.KeyAgreement.PublicKey(
                     rawRepresentation: recipient.agreementPublicKey
                 )
                 let sharedSecret = try ephemeralKey.sharedSecretFromKeyAgreement(with: publicKey)
-                let wrappingKey = sharedSecret.hkdfDerivedSymmetricKey(
+                wrappingKey = sharedSecret.hkdfDerivedSymmetricKey(
                     using: SHA256.self,
                     salt: archiveID.bytes,
                     sharedInfo: wrapDomain,
                     outputByteCount: 32
                 )
+            } catch {
+                throw ZwzV3Error.invalidRecipientPublicKey(recipient.name)
+            }
+
+            do {
                 let nonce = AES.GCM.Nonce()
                 let sealed = try AES.GCM.seal(
                     contentKey.data,
@@ -91,7 +100,7 @@ public enum ZwzV3Crypto {
                     authenticationTag: sealed.tag
                 )
             } catch {
-                throw ZwzV3Error.invalidRecipientPublicKey(recipient.name)
+                throw ZwzV3Error.authenticationFailed
             }
         }
     }
