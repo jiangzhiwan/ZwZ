@@ -4,6 +4,10 @@ import XCTest
 @testable import ZwzCore
 
 final class ZwzV3SecurityTests: XCTestCase {
+    private enum KeychainFailure: Error, Equatable {
+        case unavailable
+    }
+
     func testWrongRecipientAndCancelledAuthenticationRemainDistinct() throws {
         let fixture = try makeArchive(signed: false)
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
@@ -67,7 +71,8 @@ final class ZwzV3SecurityTests: XCTestCase {
         )
 
         let known = fixture.identity.provider
-        known.knownSigningKeys.insert(fixture.identity.signingFingerprint)
+        known.knownSigningKeys[fixture.identity.signingFingerprint]
+            = fixture.identity.signingIdentity.signingPublicKey
         let knownListing = try ZwzV3Extractor().listEntries(archivePath: fixture.archive.path, keyProvider: known)
         XCTAssertEqual(
             knownListing.securityInfo.signature,
@@ -84,6 +89,88 @@ final class ZwzV3SecurityTests: XCTestCase {
                 XCTAssertEqual(error as? ZwzV3Error, .invalidSignature)
             }
         }
+    }
+
+    func testKnownFingerprintWithDifferentValidSigningKeyRemainsUnknown() throws {
+        let fixture = try makeArchive(signed: true)
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let parsed = try ZwzV3BinaryCodec.parse(Data(contentsOf: fixture.archive))
+        let attacker = Curve25519.Signing.PrivateKey()
+        let placeholder = ZwzV3SignerRecord(
+            name: "Attacker",
+            fingerprint: fixture.identity.signingFingerprint,
+            signingPublicKey: attacker.publicKey.rawRepresentation,
+            signature: Data(repeating: 0, count: 64)
+        )
+        var forged = try ZwzV3ArchiveCodec.encode(
+            recipients: parsed.recipients,
+            dataRegion: parsed.dataRegion,
+            encryptedIndex: parsed.encryptedIndex,
+            signer: placeholder,
+            archiveID: parsed.header.archiveID,
+            dataBlockCount: parsed.header.dataBlockCount
+        )
+        let unsigned = try ZwzV3BinaryCodec.parse(forged)
+        let signature = try ZwzV3Crypto.sign(unsigned.canonicalSignedBytes, privateKey: attacker)
+        forged.replaceSubrange(
+            Int(unsigned.header.signatureOffset)..<(Int(unsigned.header.signatureOffset) + 64),
+            with: signature
+        )
+        let url = fixture.directory.appendingPathComponent("forged-known-fingerprint.zwz")
+        try forged.write(to: url)
+        let provider = fixture.identity.provider
+        provider.knownSigningKeys[fixture.identity.signingFingerprint]
+            = fixture.identity.signingIdentity.signingPublicKey
+
+        let listing = try ZwzV3Extractor().listEntries(archivePath: url.path, keyProvider: provider)
+        XCTAssertEqual(
+            listing.securityInfo.signature,
+            .validUnknownSigner(name: "Attacker", fingerprint: fixture.identity.signingFingerprint)
+        )
+    }
+
+    func testNonMissingProviderFailureIsPropagated() throws {
+        let fixture = try makeArchive(signed: false)
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let provider = ZwzV3MemoryKeyProvider()
+        provider.lookupError = KeychainFailure.unavailable
+        XCTAssertThrowsError(try ZwzV3Extractor().listEntries(
+            archivePath: fixture.archive.path,
+            keyProvider: provider
+        )) { error in
+            XCTAssertEqual(error as? KeychainFailure, .unavailable)
+        }
+    }
+
+    func testSecondMatchingEnvelopeCanSucceedAfterFirstKeyFails() throws {
+        let directory = try ZwzV3TestSupport.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = try ZwzV3TestSupport.makeSource(in: directory)
+        let identity = ZwzV3IdentityFixture.make(name: "Alice")
+        let archive = directory.appendingPathComponent("duplicate-recipient.zwz")
+        try ZwzV3Compressor().compress(
+            sourcePath: source.path,
+            destinationPath: archive.path,
+            options: CompressionOptions(
+                encryption: .publicKey(
+                    recipients: [identity.recipient, identity.recipient],
+                    signer: nil
+                ),
+                format: .zwz
+            ),
+            keyProvider: nil,
+            progress: nil,
+            cancellationToken: nil
+        )
+        let provider = identity.provider
+        provider.agreementKeyResponses[identity.recipient.fingerprint] = [
+            .success(Data(repeating: 0, count: 31)),
+            .success(identity.agreementPrivateKey),
+        ]
+        XCTAssertFalse(try ZwzV3Extractor().listEntries(
+            archivePath: archive.path,
+            keyProvider: provider
+        ).entries.isEmpty)
     }
 
     func testSigningPrivateKeyMustMatchSelectedFingerprint() throws {

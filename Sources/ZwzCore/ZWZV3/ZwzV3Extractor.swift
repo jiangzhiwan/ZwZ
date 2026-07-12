@@ -2,13 +2,20 @@ import CryptoKit
 import Foundation
 
 public final class ZwzV3Extractor {
+    static let defaultLogicalArchiveSizeLimit: UInt64 = 512 * 1_024 * 1_024
+    private static let defaultReadChunkSize = 1 * 1_024 * 1_024
+
     public init() {}
 
     public func listEntries(
         archivePath: String,
         keyProvider: ZwzPrivateKeyProvider
     ) throws -> ZwzV3ArchiveListing {
-        let opened = try openArchive(archivePath: archivePath, keyProvider: keyProvider)
+        let opened = try openArchive(
+            archivePath: archivePath,
+            keyProvider: keyProvider,
+            cancellationToken: nil
+        )
         return ZwzV3ArchiveListing(entries: opened.index.entries, securityInfo: opened.securityInfo)
     }
 
@@ -20,7 +27,11 @@ public final class ZwzV3Extractor {
         cancellationToken: CancellationToken?
     ) throws -> ZwzArchiveSecurityInfo {
         try cancellationToken?.checkCancellation()
-        let opened = try openArchive(archivePath: archivePath, keyProvider: keyProvider)
+        let opened = try openArchive(
+            archivePath: archivePath,
+            keyProvider: keyProvider,
+            cancellationToken: cancellationToken
+        )
         try extract(
             entries: opened.index.entries,
             opened: opened,
@@ -38,7 +49,12 @@ public final class ZwzV3Extractor {
         progress: ProgressHandler? = nil,
         cancellationToken: CancellationToken? = nil
     ) throws -> URL {
-        let opened = try openArchive(archivePath: archivePath, keyProvider: keyProvider)
+        try cancellationToken?.checkCancellation()
+        let opened = try openArchive(
+            archivePath: archivePath,
+            keyProvider: keyProvider,
+            cancellationToken: cancellationToken
+        )
         guard let root = opened.index.entries.first(where: { $0.path == entryPath }) else {
             throw ZwzV3Error.malformedArchive("requested entry not found")
         }
@@ -62,41 +78,137 @@ public final class ZwzV3Extractor {
         }
     }
 
-    static func loadLogicalArchive(from urls: [URL]) throws -> Data {
+    static func loadLogicalArchive(
+        from urls: [URL],
+        sizeLimit: UInt64 = defaultLogicalArchiveSizeLimit,
+        cancellationToken: CancellationToken? = nil,
+        chunkSize: Int = defaultReadChunkSize,
+        onChunkRead: ((Int) -> Void)? = nil
+    ) throws -> Data {
         guard let first = urls.first else {
             throw ZwzV3Error.malformedArchive("no archive volumes")
         }
+        guard chunkSize > 0 else {
+            throw ZwzV3Error.malformedArchive("invalid archive read chunk size")
+        }
+        try cancellationToken?.checkCancellation()
         let prefix = try readExactly(first, count: 4)
         if Array(prefix) == ZwzV2Format.splitMagic {
-            let reader = try ZwzV2VolumeReader(urls: urls)
+            var volumes: [(url: URL, envelope: ZwzV2SplitEnvelope)] = []
             var logicalLength: UInt64 = 0
+            var archiveID: UUID?
+            var seenNumbers = Set<UInt32>()
             for url in urls {
+                try cancellationToken?.checkCancellation()
                 let envelope = try ZwzV2BinaryCodec.decodeSplitEnvelope(
                     try readExactly(url, count: ZwzV2SplitEnvelope.encodedLength)
                 )
+                if let archiveID {
+                    guard envelope.archiveID == archiveID else {
+                        throw ZwzV3Error.malformedArchive("split volume archive IDs do not match")
+                    }
+                } else {
+                    archiveID = envelope.archiveID
+                }
+                guard seenNumbers.insert(envelope.volumeNumber).inserted else {
+                    throw ZwzV3Error.malformedArchive("duplicate split volume number")
+                }
                 let end = envelope.logicalOffset.addingReportingOverflow(envelope.payloadLength)
                 guard !end.overflow else {
                     throw ZwzV3Error.malformedArchive("overflowing split archive length")
                 }
-                logicalLength = max(logicalLength, end.partialValue)
+                let expectedFileSize = UInt64(ZwzV2SplitEnvelope.encodedLength)
+                    .addingReportingOverflow(envelope.payloadLength)
+                guard !expectedFileSize.overflow,
+                      try fileSize(of: url) == expectedFileSize.partialValue else {
+                    throw ZwzV3Error.malformedArchive("split payload length does not match file size")
+                }
+                try requireWithinSizeLimit(end.partialValue, limit: sizeLimit)
+                volumes.append((url, envelope))
             }
+            for (index, number) in seenNumbers.sorted().enumerated() {
+                guard let expectedNumber = UInt32(exactly: index) else {
+                    throw ZwzV3Error.malformedArchive("too many split volumes")
+                }
+                guard number == expectedNumber else { throw ZwzV2Error.missingVolume(index) }
+            }
+            for (index, volume) in volumes.enumerated() {
+                guard let expectedNumber = UInt32(exactly: index) else {
+                    throw ZwzV3Error.malformedArchive("too many split volumes")
+                }
+                guard volume.envelope.volumeNumber == expectedNumber else {
+                    throw ZwzV3Error.malformedArchive("reordered split volume URLs")
+                }
+                guard volume.envelope.logicalOffset == logicalLength else {
+                    throw ZwzV3Error.malformedArchive("non-contiguous split logical ranges")
+                }
+                guard volume.envelope.isFinal == (index == volumes.count - 1) else {
+                    throw ZwzV3Error.malformedArchive("inconsistent final-volume marker")
+                }
+                let end = logicalLength.addingReportingOverflow(volume.envelope.payloadLength)
+                guard !end.overflow else {
+                    throw ZwzV3Error.malformedArchive("overflowing split archive length")
+                }
+                logicalLength = end.partialValue
+            }
+            try requireWithinSizeLimit(logicalLength, limit: sizeLimit)
             guard let length = Int(exactly: logicalLength) else {
                 throw ZwzV3Error.malformedArchive("archive is too large")
             }
-            return try reader.read(offset: 0, length: length)
+            try cancellationToken?.checkCancellation()
+            var archive = Data()
+            archive.reserveCapacity(length)
+            for volume in volumes {
+                let handle = try FileHandle(forReadingFrom: volume.url)
+                defer { try? handle.close() }
+                try handle.seek(toOffset: UInt64(ZwzV2SplitEnvelope.encodedLength))
+                var remaining = volume.envelope.payloadLength
+                var checksum: UInt32 = 2_166_136_261
+                while remaining > 0 {
+                    try cancellationToken?.checkCancellation()
+                    let readLength = Int(min(UInt64(chunkSize), remaining))
+                    guard let chunk = try handle.read(upToCount: readLength),
+                          chunk.count == readLength else {
+                        throw ZwzV3Error.malformedArchive("truncated split payload")
+                    }
+                    for byte in chunk {
+                        checksum ^= UInt32(byte)
+                        checksum &*= 16_777_619
+                    }
+                    archive.append(chunk)
+                    onChunkRead?(readLength)
+                    remaining -= UInt64(readLength)
+                }
+                guard checksum == volume.envelope.payloadChecksum else {
+                    throw ZwzV3Error.malformedArchive("split payload checksum mismatch")
+                }
+            }
+            try cancellationToken?.checkCancellation()
+            return archive
         }
         guard Array(prefix) == [0x5A, 0x57, 0x5A, 0x33], urls.count == 1 else {
             throw ZwzV3Error.malformedArchive("invalid version 3 archive magic")
         }
-        return try Data(contentsOf: first, options: [.mappedIfSafe])
+        try requireWithinSizeLimit(try fileSize(of: first), limit: sizeLimit)
+        try cancellationToken?.checkCancellation()
+        let archive = try Data(contentsOf: first, options: [.mappedIfSafe])
+        onChunkRead?(archive.count)
+        try cancellationToken?.checkCancellation()
+        return archive
     }
 
     private func openArchive(
         archivePath: String,
-        keyProvider: ZwzPrivateKeyProvider
+        keyProvider: ZwzPrivateKeyProvider,
+        cancellationToken: CancellationToken?
     ) throws -> ZwzV3OpenedArchive {
+        try cancellationToken?.checkCancellation()
         let urls = try Self.archiveURLs(for: archivePath)
-        let archive = try Self.loadLogicalArchive(from: urls)
+        let archive = try Self.loadLogicalArchive(
+            from: urls,
+            cancellationToken: cancellationToken
+        )
+        try cancellationToken?.checkCancellation()
         let parsed: ZwzV3ParsedArchive
         do {
             parsed = try ZwzV3BinaryCodec.parse(archive)
@@ -120,7 +232,10 @@ public final class ZwzV3Extractor {
             ) else {
                 throw ZwzV3Error.invalidSignature
             }
-            signature = keyProvider.isKnownSigningKey(fingerprint: signer.fingerprint)
+            signature = keyProvider.isKnownSigningKey(
+                fingerprint: signer.fingerprint,
+                signingPublicKey: signer.signingPublicKey
+            )
                 ? .validKnownSigner(name: signer.name, fingerprint: signer.fingerprint)
                 : .validUnknownSigner(name: signer.name, fingerprint: signer.fingerprint)
         } else {
@@ -186,8 +301,10 @@ public final class ZwzV3Extractor {
                 )
             } catch ZwzV3Error.userAuthenticationCancelled {
                 throw ZwzV3Error.userAuthenticationCancelled
-            } catch {
+            } catch ZwzV3Error.noMatchingPrivateKey {
                 continue
+            } catch {
+                throw error
             }
             obtainedMatchingKey = true
             do {
@@ -219,7 +336,14 @@ public final class ZwzV3Extractor {
             throw ZwzV2Error.unsafePath(destination.path)
         }
         try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
-        let totalBytes = entries.reduce(UInt64(0)) { $0 + ($1.type == .file ? $1.originalSize : 0) }
+        var totalBytes: UInt64 = 0
+        for entry in entries where entry.type == .file {
+            totalBytes = try checkedAdd(
+                totalBytes,
+                entry.originalSize,
+                reason: "extraction progress size overflow"
+            )
+        }
         var completedBytes: UInt64 = 0
 
         for entry in entries where entry.type == .directory {
@@ -272,7 +396,11 @@ public final class ZwzV3Extractor {
                     }
                     try handle.seek(toOffset: descriptor.fileOffset)
                     try handle.write(contentsOf: decoded)
-                    completedBytes += UInt64(decoded.count)
+                    completedBytes = try checkedAdd(
+                        completedBytes,
+                        UInt64(decoded.count),
+                        reason: "extraction progress size overflow"
+                    )
                     if totalBytes > 0 {
                         progress?(min(1, Double(completedBytes) / Double(totalBytes)))
                     }
@@ -343,6 +471,20 @@ public final class ZwzV3Extractor {
         return data
     }
 
+    private static func fileSize(of url: URL) throws -> UInt64 {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard let size = attributes[.size] as? NSNumber else {
+            throw ZwzV3Error.malformedArchive("could not determine archive size")
+        }
+        return size.uint64Value
+    }
+
+    private static func requireWithinSizeLimit(_ size: UInt64, limit: UInt64) throws {
+        guard size <= limit else {
+            throw ZwzV3Error.malformedArchive("logical archive exceeds size limit")
+        }
+    }
+
     private func mapMalformed(_ error: ZwzV2Error) -> Error {
         switch error {
         case .unsafePath, .duplicatePath:
@@ -359,6 +501,12 @@ public final class ZwzV3Extractor {
             value &*= 16_777_619
         }
         return value
+    }
+
+    private func checkedAdd(_ lhs: UInt64, _ rhs: UInt64, reason: String) throws -> UInt64 {
+        let result = lhs.addingReportingOverflow(rhs)
+        guard !result.overflow else { throw ZwzV3Error.malformedArchive(reason) }
+        return result.partialValue
     }
 }
 

@@ -3,6 +3,32 @@ import XCTest
 @testable import ZwzCore
 
 final class ZwzV3RoundTripTests: XCTestCase {
+    func testExtremeSplitVolumeSizesThrowWithoutIntegerTrap() {
+        XCTAssertThrowsError(try ZwzV3Compressor.splitVolumeSize(.megaBytes(Int.max)))
+        XCTAssertThrowsError(try ZwzV3Compressor.splitVolumeSize(.kiloBytes(Int.max)))
+        XCTAssertThrowsError(try ZwzV3Compressor.splitVolumeSize(.kiloBytes(0)))
+        XCTAssertThrowsError(try ZwzV3Compressor.splitVolumeSize(.megaBytes(-1)))
+    }
+
+    func testLogicalArchiveLimitRejectsBeforeParsingOrReadingPayload() throws {
+        let directory = try ZwzV3TestSupport.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let invalid = directory.appendingPathComponent("oversized.zwz")
+        var oversized = Data([0x5A, 0x57, 0x5A, 0x33])
+        oversized.append(Data(repeating: 0xAA, count: 28))
+        try oversized.write(to: invalid)
+
+        XCTAssertThrowsError(try ZwzV3Extractor.loadLogicalArchive(
+            from: [invalid],
+            sizeLimit: 16
+        )) { error in
+            XCTAssertEqual(
+                error as? ZwzV3Error,
+                .malformedArchive("logical archive exceeds size limit")
+            )
+        }
+    }
+
     func testTwoRecipientsIndependentlyListAndExtractHiddenEmptyUnicodeAndMultiBlockFiles() throws {
         let directory = try ZwzV3TestSupport.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -89,7 +115,12 @@ final class ZwzV3RoundTripTests: XCTestCase {
             includingPropertiesForKeys: nil
         ).filter { $0.lastPathComponent.hasPrefix("split.") }
             .sorted { $0.pathExtension < $1.pathExtension }
-        XCTAssertThrowsError(try ZwzV3Extractor.loadLogicalArchive(from: Array(splitURLs.reversed())))
+        XCTAssertThrowsError(try ZwzV3Extractor.loadLogicalArchive(from: Array(splitURLs.reversed()))) { error in
+            XCTAssertEqual(
+                error as? ZwzV3Error,
+                .malformedArchive("reordered split volume URLs")
+            )
+        }
         let output = directory.appendingPathComponent("split-out")
         _ = try ZwzV3Extractor().extractAll(
             archivePath: archive.path,
@@ -102,6 +133,54 @@ final class ZwzV3RoundTripTests: XCTestCase {
 
         try FileManager.default.removeItem(at: directory.appendingPathComponent("split.z00"))
         XCTAssertThrowsError(try ZwzV3Extractor().listEntries(archivePath: archive.path, keyProvider: identity.provider))
+    }
+
+    func testSplitLoaderChecksCancellationBetweenReadChunks() throws {
+        let directory = try ZwzV3TestSupport.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = try ZwzV3TestSupport.makeSource(in: directory)
+        let identity = ZwzV3IdentityFixture.make(name: "Alice")
+        let archive = directory.appendingPathComponent("chunked.zwz")
+        try ZwzV3Compressor(blockSize: 2_048).compress(
+            sourcePath: source.path,
+            destinationPath: archive.path,
+            options: CompressionOptions(
+                level: .none,
+                encryption: .publicKey(recipients: [identity.recipient], signer: nil),
+                splitVolume: .kiloBytes(4),
+                format: .zwz
+            ),
+            keyProvider: nil,
+            progress: nil,
+            cancellationToken: nil
+        )
+        let urls = try splitURLs(for: archive)
+        let token = CancellationToken()
+        XCTAssertThrowsError(try ZwzV3Extractor.loadLogicalArchive(
+            from: urls,
+            cancellationToken: token,
+            chunkSize: 32,
+            onChunkRead: { _ in token.cancel() }
+        )) { error in
+            guard case ZwzError.operationCancelled = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testEntryExtractionChecksCancellationBeforeOpeningArchive() throws {
+        let token = CancellationToken()
+        token.cancel()
+        XCTAssertThrowsError(try ZwzV3Extractor().extractEntryToTemp(
+            archivePath: "/does/not/exist.zwz",
+            entryPath: "file.txt",
+            keyProvider: ZwzV3MemoryKeyProvider(),
+            cancellationToken: token
+        )) { error in
+            guard case ZwzError.operationCancelled = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        }
     }
 
     func testCancellationCleansStagingAndPreservesExistingDestination() throws {
@@ -185,5 +264,14 @@ final class ZwzV3RoundTripTests: XCTestCase {
             cancellationToken: nil
         )
         return (directory, archive, identity)
+    }
+
+    private func splitURLs(for archive: URL) throws -> [URL] {
+        let base = archive.deletingPathExtension().lastPathComponent
+        return try FileManager.default.contentsOfDirectory(
+            at: archive.deletingLastPathComponent(),
+            includingPropertiesForKeys: nil
+        ).filter { $0.deletingPathExtension().lastPathComponent == base }
+            .sorted { $0.pathExtension < $1.pathExtension }
     }
 }

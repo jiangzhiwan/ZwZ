@@ -19,9 +19,11 @@ public final class ZwzV3Compressor {
         guard options.format == .zwz,
               blockSize > 0,
               blockSize <= Int(UInt32.max),
+              UInt64(blockSize) <= ZwzV3Extractor.defaultLogicalArchiveSizeLimit,
               case .publicKey(let recipients, let signingIdentity) = try options.encryption.validated() else {
             throw ZwzV3Error.recipientRequired
         }
+        let splitSize = try options.splitVolume.map(Self.splitVolumeSize)
         progress?(0)
 
         let destination = URL(fileURLWithPath: destinationPath)
@@ -42,8 +44,21 @@ public final class ZwzV3Compressor {
             recipients: recipients,
             archiveID: archiveID
         )
-        let recipientRegion = try envelopes.reduce(into: Data()) {
-            $0.append(try ZwzV3BinaryCodec.encodeRecipient($1))
+        var recipientRegion = Data()
+        for envelope in envelopes {
+            let record = try ZwzV3BinaryCodec.encodeRecipient(envelope)
+            let current = try Self.checkedAdd(
+                UInt64(ZwzV3Header.encodedLength),
+                UInt64(recipientRegion.count),
+                reason: "recipient region size overflow"
+            )
+            let projected = try Self.checkedAdd(
+                current,
+                UInt64(record.count),
+                reason: "recipient region size overflow"
+            )
+            try Self.requireWithinArchiveBudget(projected)
+            recipientRegion.append(record)
         }
         let sourceItems = try ZwzV2SourceEnumerator().enumerate(root: URL(fileURLWithPath: sourcePath))
         var entries = sourceItems.map {
@@ -58,11 +73,18 @@ public final class ZwzV3Compressor {
         }
         try ZwzV2PathValidator.validateNoDuplicatePaths(entries)
         let entryPositions = Dictionary(uniqueKeysWithValues: entries.enumerated().map { ($1.path, $0) })
-        let totalBytes = sourceItems.reduce(UInt64(0)) { $0 + ($1.type == .file ? $1.size : 0) }
+        var totalBytes: UInt64 = 0
+        for item in sourceItems where item.type == .file {
+            totalBytes = try Self.checkedAdd(totalBytes, item.size, reason: "source size overflow")
+        }
         var processedBytes: UInt64 = 0
         var sequence: UInt64 = 0
         var dataRegion = Data()
-        let dataRegionOffset = UInt64(ZwzV3Header.encodedLength + recipientRegion.count)
+        let dataRegionOffset = try Self.checkedAdd(
+            UInt64(ZwzV3Header.encodedLength),
+            UInt64(recipientRegion.count),
+            reason: "data region offset overflow"
+        )
 
         for item in sourceItems where item.type == .file {
             try cancellationToken?.checkCancellation()
@@ -86,13 +108,24 @@ public final class ZwzV3Compressor {
                         originalLength: originalLength
                     )
                 )
-                let archiveOffset = try checkedAdd(dataRegionOffset, UInt64(dataRegion.count))
-                dataRegion.append(try ZwzV3PayloadCodec.encodeRecord(
+                let archiveOffset = try Self.checkedAdd(
+                    dataRegionOffset,
+                    UInt64(dataRegion.count),
+                    reason: "data region offset overflow"
+                )
+                let record = try ZwzV3PayloadCodec.encodeRecord(
                     sequence: sequence,
                     codec: encoded.codec,
                     originalLength: originalLength,
                     sealed: sealed
-                ))
+                )
+                let projectedSize = try Self.checkedAdd(
+                    archiveOffset,
+                    UInt64(record.count),
+                    reason: "logical archive size overflow"
+                )
+                try Self.requireWithinArchiveBudget(projectedSize)
+                dataRegion.append(record)
                 guard let entryIndex = entryPositions[item.archivePath],
                       let storedLength = UInt32(exactly: sealed.count) else {
                     throw ZwzV3Error.malformedArchive("invalid block descriptor")
@@ -111,8 +144,16 @@ public final class ZwzV3Compressor {
                     throw ZwzV3Error.malformedArchive("too many data blocks")
                 }
                 sequence += 1
-                fileOffset += UInt64(chunk.count)
-                processedBytes += UInt64(chunk.count)
+                fileOffset = try Self.checkedAdd(
+                    fileOffset,
+                    UInt64(chunk.count),
+                    reason: "file offset overflow"
+                )
+                processedBytes = try Self.checkedAdd(
+                    processedBytes,
+                    UInt64(chunk.count),
+                    reason: "progress size overflow"
+                )
                 if totalBytes > 0 {
                     progress?(min(0.9, Double(processedBytes) / Double(totalBytes) * 0.9))
                 }
@@ -121,6 +162,23 @@ public final class ZwzV3Compressor {
         }
 
         let index = ZwzV2Index(archiveID: archiveID, blockSize: blockSize, entries: entries)
+        let estimatedIndexLength = try Self.estimatedPlainIndexLength(entries: entries)
+        var projectedArchiveLength = try Self.checkedAdd(
+            dataRegionOffset,
+            UInt64(dataRegion.count),
+            reason: "logical archive size overflow"
+        )
+        projectedArchiveLength = try Self.checkedAdd(
+            projectedArchiveLength,
+            estimatedIndexLength,
+            reason: "logical archive size overflow"
+        )
+        projectedArchiveLength = try Self.checkedAdd(
+            projectedArchiveLength,
+            28,
+            reason: "logical archive size overflow"
+        )
+        try Self.requireWithinArchiveBudget(projectedArchiveLength)
         let plainIndex = try ZwzV2IndexCodec.encodePlain(index)
         let encryptedIndex = try ZwzV3Crypto.seal(
             plainIndex,
@@ -150,7 +208,6 @@ public final class ZwzV3Compressor {
         try cancellationToken?.checkCancellation()
 
         let stagedDestination = stagingDirectory.appendingPathComponent(destination.lastPathComponent)
-        let splitSize = options.splitVolume.flatMap { $0.bytes > 0 ? UInt64($0.bytes) : nil }
         let writer = try ZwzV2VolumeWriter(
             outputURL: stagedDestination,
             archiveID: archiveID,
@@ -159,7 +216,10 @@ public final class ZwzV3Compressor {
         _ = try writer.write(archive)
         archive.removeAll(keepingCapacity: false)
         let stagedURLs = try writer.finalize()
-        let stagedArchive = try ZwzV3Extractor.loadLogicalArchive(from: stagedURLs)
+        let stagedArchive = try ZwzV3Extractor.loadLogicalArchive(
+            from: stagedURLs,
+            cancellationToken: cancellationToken
+        )
         try ZwzV3PayloadCodec.verifyBuiltArchive(stagedArchive, contentKey: contentKey)
         try cancellationToken?.checkCancellation()
         try publish(stagedURLs: stagedURLs, destination: destination, stagingDirectory: stagingDirectory)
@@ -176,7 +236,20 @@ public final class ZwzV3Compressor {
         signingIdentity: ZwzSigningIdentity?,
         keyProvider: ZwzPrivateKeyProvider?
     ) throws -> Data {
+        let recipientRegionLength = try envelopes.reduce(into: 0) { length, envelope in
+            length = try Self.checkedIntAdd(
+                length,
+                ZwzV3BinaryCodec.encodeRecipient(envelope).count,
+                reason: "recipient region size overflow"
+            )
+        }
         guard let signingIdentity else {
+            try Self.requireEncodedArchiveWithinBudget(
+                recipientRegionLength: recipientRegionLength,
+                dataRegionLength: dataRegion.count,
+                encryptedIndexLength: encryptedIndex.count,
+                signerRegionLength: 0
+            )
             return try ZwzV3ArchiveCodec.encode(
                 recipients: envelopes,
                 dataRegion: dataRegion,
@@ -195,8 +268,10 @@ public final class ZwzV3Compressor {
             )
         } catch ZwzV3Error.userAuthenticationCancelled {
             throw ZwzV3Error.userAuthenticationCancelled
-        } catch {
+        } catch ZwzV3Error.noMatchingPrivateKey {
             throw ZwzV3Error.keyUnwrapFailed
+        } catch {
+            throw error
         }
         let privateKey: Curve25519.Signing.PrivateKey
         do {
@@ -218,6 +293,12 @@ public final class ZwzV3Compressor {
             fingerprint: signingIdentity.fingerprint,
             signingPublicKey: privateKey.publicKey.rawRepresentation,
             signature: Data(repeating: 0, count: 64)
+        )
+        try Self.requireEncodedArchiveWithinBudget(
+            recipientRegionLength: recipientRegionLength,
+            dataRegionLength: dataRegion.count,
+            encryptedIndexLength: encryptedIndex.count,
+            signerRegionLength: try ZwzV3BinaryCodec.encodeSigner(placeholder).count
         )
         var archive = try ZwzV3ArchiveCodec.encode(
             recipients: envelopes,
@@ -301,9 +382,87 @@ public final class ZwzV3Compressor {
         Date(timeIntervalSince1970: (date.timeIntervalSince1970 * 1_000).rounded() / 1_000)
     }
 
-    private func checkedAdd(_ lhs: UInt64, _ rhs: UInt64) throws -> UInt64 {
+    static func splitVolumeSize(_ splitVolume: SplitVolume) throws -> UInt64 {
+        let value: Int
+        let multiplier: Int64
+        switch splitVolume {
+        case .kiloBytes(let kilobytes):
+            value = kilobytes
+            multiplier = 1_024
+        case .megaBytes(let megabytes):
+            value = megabytes
+            multiplier = 1_024 * 1_024
+        }
+        guard value > 0, let signedValue = Int64(exactly: value) else {
+            throw ZwzV3Error.malformedArchive("invalid split volume size")
+        }
+        let result = signedValue.multipliedReportingOverflow(by: multiplier)
+        guard !result.overflow, let bytes = UInt64(exactly: result.partialValue), bytes > 0 else {
+            throw ZwzV3Error.malformedArchive("split volume size overflow")
+        }
+        return bytes
+    }
+
+    private static func requireEncodedArchiveWithinBudget(
+        recipientRegionLength: Int,
+        dataRegionLength: Int,
+        encryptedIndexLength: Int,
+        signerRegionLength: Int
+    ) throws {
+        var size = UInt64(ZwzV3Header.encodedLength)
+        for length in [recipientRegionLength, dataRegionLength, encryptedIndexLength, signerRegionLength] {
+            guard length >= 0 else {
+                throw ZwzV3Error.malformedArchive("logical archive size overflow")
+            }
+            size = try checkedAdd(size, UInt64(length), reason: "logical archive size overflow")
+        }
+        try requireWithinArchiveBudget(size)
+    }
+
+    private static func estimatedPlainIndexLength(entries: [ZwzV2Entry]) throws -> UInt64 {
+        var length: UInt64 = 30
+        for entry in entries {
+            let entryLength = try checkedAdd(
+                24,
+                UInt64(entry.path.utf8.count),
+                reason: "index size overflow"
+            )
+            length = try checkedAdd(
+                length,
+                entryLength,
+                reason: "index size overflow"
+            )
+            for block in entry.blocks {
+                let blockLength = try checkedAdd(
+                    38,
+                    UInt64(block.authenticationTag.count),
+                    reason: "index size overflow"
+                )
+                length = try checkedAdd(
+                    length,
+                    blockLength,
+                    reason: "index size overflow"
+                )
+            }
+        }
+        return length
+    }
+
+    private static func requireWithinArchiveBudget(_ size: UInt64) throws {
+        guard size <= ZwzV3Extractor.defaultLogicalArchiveSizeLimit else {
+            throw ZwzV3Error.malformedArchive("logical archive exceeds size limit")
+        }
+    }
+
+    private static func checkedIntAdd(_ lhs: Int, _ rhs: Int, reason: String) throws -> Int {
         let result = lhs.addingReportingOverflow(rhs)
-        guard !result.overflow else { throw ZwzV3Error.malformedArchive("archive too large") }
+        guard !result.overflow else { throw ZwzV3Error.malformedArchive(reason) }
+        return result.partialValue
+    }
+
+    private static func checkedAdd(_ lhs: UInt64, _ rhs: UInt64, reason: String) throws -> UInt64 {
+        let result = lhs.addingReportingOverflow(rhs)
+        guard !result.overflow else { throw ZwzV3Error.malformedArchive(reason) }
         return result.partialValue
     }
 }

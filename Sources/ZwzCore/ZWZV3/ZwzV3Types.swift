@@ -3,7 +3,7 @@ import Foundation
 public protocol ZwzPrivateKeyProvider: Sendable {
     func agreementPrivateKey(fingerprint: String, reason: String) throws -> Data
     func signingPrivateKey(fingerprint: String, reason: String) throws -> Data
-    func isKnownSigningKey(fingerprint: String) -> Bool
+    func isKnownSigningKey(fingerprint: String, signingPublicKey: Data) -> Bool
 }
 
 public enum ZwzEncryptionMode: Equatable, Sendable {

@@ -5,13 +5,14 @@ import Foundation
 final class ZwzV3MemoryKeyProvider: ZwzPrivateKeyProvider, @unchecked Sendable {
     var agreementKeys: [String: Data]
     var signingKeys: [String: Data]
-    var knownSigningKeys: Set<String>
+    var knownSigningKeys: [String: Data]
     var lookupError: Error?
+    var agreementKeyResponses: [String: [Result<Data, Error>]] = [:]
 
     init(
         agreementKeys: [String: Data] = [:],
         signingKeys: [String: Data] = [:],
-        knownSigningKeys: Set<String> = []
+        knownSigningKeys: [String: Data] = [:]
     ) {
         self.agreementKeys = agreementKeys
         self.signingKeys = signingKeys
@@ -20,21 +21,28 @@ final class ZwzV3MemoryKeyProvider: ZwzPrivateKeyProvider, @unchecked Sendable {
 
     func agreementPrivateKey(fingerprint: String, reason: String) throws -> Data {
         if let lookupError { throw lookupError }
-        guard let key = agreementKeys[fingerprint] else { throw MissingKey() }
+        if var responses = agreementKeyResponses[fingerprint], !responses.isEmpty {
+            let response = responses.removeFirst()
+            agreementKeyResponses[fingerprint] = responses
+            return try response.get()
+        }
+        guard let key = agreementKeys[fingerprint] else {
+            throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
+        }
         return key
     }
 
     func signingPrivateKey(fingerprint: String, reason: String) throws -> Data {
         if let lookupError { throw lookupError }
-        guard let key = signingKeys[fingerprint] else { throw MissingKey() }
+        guard let key = signingKeys[fingerprint] else {
+            throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
+        }
         return key
     }
 
-    func isKnownSigningKey(fingerprint: String) -> Bool {
-        knownSigningKeys.contains(fingerprint)
+    func isKnownSigningKey(fingerprint: String, signingPublicKey: Data) -> Bool {
+        knownSigningKeys[fingerprint] == signingPublicKey
     }
-
-    private struct MissingKey: Error {}
 }
 
 struct ZwzV3IdentityFixture {
