@@ -129,11 +129,20 @@ public final class InMemoryZwzIdentityStore: ZwzIdentityStore, @unchecked Sendab
     ) throws -> ZwzPublicIdentity {
         let identity = try ZwzKeyFileCodec.decodePublic(data)
         try lock.withLock {
-            if storedContacts[identity.fingerprint] != nil
-                || storedIdentities[identity.fingerprint] != nil {
+            if var stored = storedIdentities[identity.fingerprint] {
                 guard conflict == .replaceExisting else {
                     throw ZwzV3Error.identityConflict(identity.fingerprint)
                 }
+                try validateBinding(stored.metadata.publicIdentity, identity)
+                stored.metadata.name = identity.name
+                storedIdentities[identity.fingerprint] = stored
+                return
+            }
+            if let contact = storedContacts[identity.fingerprint] {
+                guard conflict == .replaceExisting else {
+                    throw ZwzV3Error.identityConflict(identity.fingerprint)
+                }
+                try validateBinding(contact, identity)
             }
             storedContacts[identity.fingerprint] = identity
         }
@@ -228,11 +237,20 @@ public final class InMemoryZwzIdentityStore: ZwzIdentityStore, @unchecked Sendab
             creationDate: Date()
         )
         return try lock.withLock {
-            if storedIdentities[identity.fingerprint] != nil
-                || storedContacts[identity.fingerprint] != nil {
+            if var existing = storedIdentities[identity.fingerprint] {
                 guard conflict == .replaceExisting else {
                     throw ZwzV3Error.identityConflict(identity.fingerprint)
                 }
+                try validateBinding(existing.metadata.publicIdentity, publicIdentity)
+                existing.metadata.name = metadata.name
+                storedIdentities[identity.fingerprint] = existing
+                return existing.metadata
+            }
+            if let contact = storedContacts[identity.fingerprint] {
+                guard conflict == .replaceExisting else {
+                    throw ZwzV3Error.identityConflict(identity.fingerprint)
+                }
+                try validateBinding(contact, publicIdentity)
             }
             let oldIdentity = storedIdentities[identity.fingerprint]
             let oldContact = storedContacts[identity.fingerprint]
@@ -271,9 +289,20 @@ public final class InMemoryZwzIdentityStore: ZwzIdentityStore, @unchecked Sendab
             signingPrivateKey: stored.signingPrivateKey
         )
     }
+
+    private func validateBinding(
+        _ existing: ZwzPublicIdentity,
+        _ incoming: ZwzPublicIdentity
+    ) throws {
+        guard existing.fingerprint == incoming.fingerprint,
+              existing.agreementPublicKey == incoming.agreementPublicKey,
+              existing.signingPublicKey == incoming.signingPublicKey else {
+            throw ZwzV3Error.identityConflict(incoming.fingerprint)
+        }
+    }
 }
 
-private func validateIdentityName(_ name: String) throws -> String {
+func validateIdentityName(_ name: String) throws -> String {
     guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
         throw ZwzV3Error.invalidIdentityName
     }
