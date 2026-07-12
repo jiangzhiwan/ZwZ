@@ -4,14 +4,14 @@
 
 **Goal:** Add multi-recipient X25519 encryption, optional Ed25519 signatures, protected identity management, and consistent ZwzCore/CLI/GUI workflows while preserving all existing ZWZ archives.
 
-**Architecture:** Introduce a version-3 ZWZ codec beside the existing version-1 reader and the ignored experimental version-2 sources. Version 3 encrypts blocks and the index with a random AES-256-GCM content key, wraps that key once per X25519 recipient, and optionally signs the complete canonical archive with Ed25519. ZwzCore owns the format, crypto, key-file, and Keychain abstractions; CLI and GUI only orchestrate those APIs.
+**Architecture:** Introduce a version-3 ZWZ codec beside the existing public version-1 and version-2 readers. Version 3 encrypts blocks and the index with a random AES-256-GCM content key, wraps that key once per X25519 recipient, and optionally signs the complete canonical archive with Ed25519. ZwzCore owns the format, crypto, key-file, and Keychain abstractions; CLI and GUI only orchestrate those APIs.
 
 **Tech Stack:** Swift 6.3, macOS 15+, Foundation, CryptoKit, Security, LocalAuthentication, CryptoSwift, XCTest, SwiftUI.
 
 ## Global Constraints
 
 - Continue using the `.zwz` extension and identify version 3 from the file header.
-- Preserve existing unencrypted and password-encrypted ZWZ preview/extraction without conversion.
+- Preserve existing V1 and V2 unencrypted and password-encrypted ZWZ preview/extraction without conversion.
 - Encryption modes are exactly `.none`, `.password`, and `.publicKey`; password and recipients cannot coexist.
 - Use X25519 for recipient agreement, HKDF-SHA-256 for wrapping-key derivation, AES-256-GCM for content and key wrapping, and Ed25519 for optional signatures.
 - A public-key archive has one or more recipients and zero or one signer.
@@ -464,8 +464,9 @@ git commit -m "feat: add protected ZWZ identity management"
 func testAPIWritesV3OnlyForPublicKeyMode() throws {
     XCTAssertEqual(try ZwzV3APITestSupport.createdArchiveVersion(encryption: .publicKeyFixture), 3)
 }
-func testAPIAutoDetectsV1AndV3() throws {
+func testAPIAutoDetectsV1V2AndV3() throws {
     XCTAssertEqual(try ZwzV3APITestSupport.list(version: 1).map(\.path), ["file.txt"])
+    XCTAssertEqual(try ZwzV3APITestSupport.list(version: 2).map(\.path), ["file.txt"])
     XCTAssertEqual(try ZwzV3APITestSupport.list(version: 3).map(\.path), ["file.txt"])
 }
 func testLegacyPasswordInitializerStillRoundTripsV1() throws {
@@ -496,13 +497,13 @@ public func extract(archivePath: String, destinationPath: String? = nil,
 
 Read only the magic/version prefix before selecting `ZwzExtractor` or `ZwzV3Extractor`. Map the old `[ArchiveEntry]` list API to `listing.entries` and the old string-returning extract API to `result.destinationPath` so source compatibility is retained.
 
-Implement `ZwzV3APITestSupport` with temporary version-1, version-3, and ZIP archives created through the corresponding public compressors.
+Implement `ZwzV3APITestSupport` with temporary version-1, version-2, version-3, and ZIP archives created through the corresponding public compressors.
 
 - [ ] **Step 4: Run API and legacy regression suites**
 
 Run: `swift test --filter ZwzV3APITests && swift test --filter ZwzCoreTests`
 
-Expected: version 1 and version 3 pass; ZIP/RAR/7Z/TAR/GZ tests remain green.
+Expected: versions 1, 2, and 3 pass; ZIP/RAR/7Z/TAR/GZ tests remain green.
 
 - [ ] **Step 5: Commit**
 
@@ -716,7 +717,7 @@ git commit -m "feat: integrate public-key archives in GUI"
 
 - [ ] **Step 1: Add committed compatibility fixtures and tests**
 
-Add small version-1 unencrypted/password fixtures and deterministic version-3 unsigned/signed/multi-recipient fixtures under `Tests/ZwzCoreTests/Fixtures/`. Test detection, listing, extraction, signature status, and refusal after one-byte mutation. Never commit fixture private keys except explicitly labeled test-only keys under the test target.
+Add small version-1 and version-2 unencrypted/password fixtures plus deterministic version-3 unsigned/signed/multi-recipient fixtures under `Tests/ZwzCoreTests/Fixtures/`. Test detection, listing, extraction, signature status, and refusal after one-byte mutation. Never commit fixture private keys except explicitly labeled test-only keys under the test target.
 
 - [ ] **Step 2: Run the entire suite before documentation changes**
 
