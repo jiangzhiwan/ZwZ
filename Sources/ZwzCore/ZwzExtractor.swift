@@ -242,7 +242,10 @@ public final class ZwzExtractor {
     private static func splitBaseName(for name: String) -> String {
         let nsName = name as NSString
         let ext = nsName.pathExtension.lowercased()
-        let isNumberedVolume = ext.count == 3 && ext.first == "z" && Int(ext.dropFirst()) != nil
+        let volumeDigits = ext.dropFirst()
+        let isNumberedVolume = ext.first == "z" &&
+            volumeDigits.count >= 2 &&
+            volumeDigits.unicodeScalars.allSatisfy { (48...57).contains($0.value) }
         return ext == "zwz" || isNumberedVolume ? nsName.deletingPathExtension : name
     }
 

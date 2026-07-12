@@ -256,6 +256,115 @@ final class ZwzV3APITests: XCTestCase {
         XCTAssertEqual(listing.entries.map(\.path), ["file.txt"])
     }
 
+    func testRenamedV3ArchiveRoutesThroughPublicListExtractAndPreview() throws {
+        let fixture = try ZwzV3APITestSupport.makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let renamed = fixture.directory.appendingPathComponent("renamed.bin")
+        try FileManager.default.moveItem(at: fixture.archive, to: renamed)
+
+        let listing = try ZwzAPI().list(
+            archivePath: renamed.path,
+            password: nil,
+            keyProvider: fixture.identity.provider
+        )
+        XCTAssertEqual(listing.version, 3)
+        XCTAssertEqual(listing.entries.map(\.path), ["file.txt"])
+        XCTAssertEqual(
+            try ArchivePreviewer().preview(
+                archivePath: renamed.path,
+                keyProvider: fixture.identity.provider
+            ).map(\.path),
+            ["file.txt"]
+        )
+
+        let destination = fixture.directory.appendingPathComponent("renamed-out")
+        let result = try ZwzAPI().extract(
+            archivePath: renamed.path,
+            destinationPath: destination.path,
+            keyProvider: fixture.identity.provider
+        )
+        XCTAssertEqual(result.version, 3)
+        XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent("file.txt")), Data("public api".utf8))
+    }
+
+    func testV3MoreThanOneHundredVolumesAreDiscoveredFromFinalVolume() throws {
+        let fixture = try ZwzV3APITestSupport.makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let payload = Data((0..<(112 * 1_024)).map { UInt8(truncatingIfNeeded: $0 &* 31) })
+        try payload.write(to: fixture.source.appendingPathComponent("many-volumes.bin"))
+        _ = try ZwzAPI().compress(
+            sourcePath: fixture.source.path,
+            destinationPath: fixture.archive.path,
+            options: CompressionOptions(
+                level: .none,
+                encryption: .publicKey(recipients: [fixture.identity.recipient], signer: nil),
+                splitVolume: .kiloBytes(1),
+                format: .zwz
+            ),
+            keyProvider: nil
+        )
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: fixture.directory.appendingPathComponent("archive.z100").path
+        ))
+        let generatedVolumes = try FileManager.default.contentsOfDirectory(atPath: fixture.directory.path)
+            .filter { $0 == "archive.zwz" || $0.hasPrefix("archive.z") }
+        XCTAssertGreaterThan(generatedVolumes.count, 101)
+        let firstVolume = fixture.directory.appendingPathComponent("archive.z00")
+        try FileManager.default.copyItem(
+            at: firstVolume,
+            to: fixture.directory.appendingPathComponent("archive.z1")
+        )
+        try FileManager.default.copyItem(
+            at: firstVolume,
+            to: fixture.directory.appendingPathComponent("archive.zxx")
+        )
+
+        let listing = try ZwzAPI().list(
+            archivePath: fixture.archive.path,
+            password: nil,
+            keyProvider: fixture.identity.provider
+        )
+        XCTAssertTrue(listing.entries.contains { $0.path == "many-volumes.bin" })
+        let destination = fixture.directory.appendingPathComponent("many-volumes-out")
+        _ = try ZwzAPI().extract(
+            archivePath: fixture.archive.path,
+            destinationPath: destination.path,
+            keyProvider: fixture.identity.provider
+        )
+        XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent("many-volumes.bin")), payload)
+    }
+
+    func testV2MoreThanOneHundredVolumesShareFinalVolumeDiscovery() throws {
+        let fixture = try ZwzV3APITestSupport.makeFixture(name: "v2-many.zwz")
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let payload = Data((0..<(112 * 1_024)).map { UInt8(truncatingIfNeeded: $0 &* 17) })
+        try payload.write(to: fixture.source.appendingPathComponent("v2-many.bin"))
+        _ = try ZwzAPI().compress(
+            sourcePath: fixture.source.path,
+            destinationPath: fixture.archive.path,
+            options: CompressionOptions(level: .none, splitVolume: .kiloBytes(1), format: .zwz)
+        )
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: fixture.directory.appendingPathComponent("v2-many.z100").path
+        ))
+
+        let listing = try ZwzAPI().list(
+            archivePath: fixture.archive.path,
+            password: nil,
+            keyProvider: nil
+        )
+        XCTAssertEqual(listing.version, 2)
+        XCTAssertTrue(listing.entries.contains { $0.path == "v2-many.bin" })
+        let destination = fixture.directory.appendingPathComponent("v2-many-out")
+        let result = try ZwzAPI().extract(
+            archivePath: fixture.archive.path,
+            destinationPath: destination.path,
+            keyProvider: nil
+        )
+        XCTAssertEqual(result.version, 2)
+        XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent("v2-many.bin")), payload)
+    }
+
     func testV3SingleEntryFailureLeavesNoAdapterTemporaryDirectory() throws {
         let fixture = try ZwzV3APITestSupport.makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.directory) }

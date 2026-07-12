@@ -455,7 +455,10 @@ public final class ZwzV3Extractor {
     private static func splitBaseName(_ name: String) -> String {
         let value = name as NSString
         let ext = value.pathExtension.lowercased()
-        let numbered = ext.first == "z" && ext.dropFirst().allSatisfy(\.isNumber)
+        let digits = ext.dropFirst()
+        let numbered = ext.first == "z" &&
+            digits.count >= 2 &&
+            digits.unicodeScalars.allSatisfy { (48...57).contains($0.value) }
         return ext == "zwz" || numbered ? value.deletingPathExtension : name
     }
 

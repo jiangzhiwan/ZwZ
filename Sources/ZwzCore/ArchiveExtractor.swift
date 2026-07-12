@@ -95,6 +95,7 @@ public class ArchiveExtractor {
             // ZWZ v1/v2 magic and ZWZ v2 split-volume magic
             if Array(magicBytes.prefix(4)) == ZwzFormat.magic ||
                Array(magicBytes.prefix(4)) == ZwzV2Format.magic ||
+               Array(magicBytes.prefix(4)) == [0x5A, 0x57, 0x5A, 0x33] ||
                Array(magicBytes.prefix(4)) == ZwzV2Format.splitMagic {
                 return .zwz
             }
