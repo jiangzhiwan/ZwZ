@@ -15,15 +15,42 @@ public class ArchiveExtractor {
         progress: ProgressHandler? = nil,
         cancellationToken: CancellationToken? = nil
     ) throws {
+        _ = try extract(
+            archivePath: archivePath,
+            destinationPath: destinationPath,
+            password: password,
+            keyProvider: nil,
+            progress: progress,
+            cancellationToken: cancellationToken
+        )
+    }
+
+    @discardableResult
+    public func extract(
+        archivePath: String,
+        destinationPath: String,
+        password: String? = nil,
+        keyProvider: ZwzPrivateKeyProvider?,
+        progress: ProgressHandler? = nil,
+        cancellationToken: CancellationToken? = nil
+    ) throws -> ZwzArchiveSecurityInfo? {
         try cancellationToken?.checkCancellation()
         let format = try detectFormat(archivePath: archivePath)
+        var securityInfo: ZwzArchiveSecurityInfo?
 
         switch format {
         case .zip:
             try extractZip(archivePath: archivePath, destinationPath: destinationPath, password: password, progress: progress)
         case .zwz:
             let zwzExtractor = ZwzExtractor()
-            try zwzExtractor.extract(archivePath: archivePath, destinationPath: destinationPath, password: password, progress: progress, cancellationToken: cancellationToken)
+            securityInfo = try zwzExtractor.extract(
+                archivePath: archivePath,
+                destinationPath: destinationPath,
+                password: password,
+                keyProvider: keyProvider,
+                progress: progress,
+                cancellationToken: cancellationToken
+            )
         case .tarGz, .tgz:
             try extractTarGz(archivePath: archivePath, destinationPath: destinationPath, progress: progress)
         case .gz:
@@ -34,6 +61,7 @@ public class ArchiveExtractor {
             try extract7z(archivePath: archivePath, destinationPath: destinationPath, password: password, progress: progress)
         }
         try cancellationToken?.checkCancellation()
+        return securityInfo
     }
 
     // MARK: - Format Detection
@@ -103,7 +131,8 @@ public class ArchiveExtractor {
     public func extractEntryToTemp(
         archivePath: String,
         entryPath: String,
-        password: String? = nil
+        password: String? = nil,
+        keyProvider: ZwzPrivateKeyProvider? = nil
     ) throws -> URL {
         let format = try detectFormat(archivePath: archivePath)
 
@@ -121,11 +150,11 @@ public class ArchiveExtractor {
                 password: password
             )
         case .zwz:
-            let zwzExtractor = ZwzExtractor()
-            return try zwzExtractor.extractEntryToTemp(
+            return try ZwzExtractor().extractEntryToTemp(
                 archivePath: archivePath,
                 entryPath: entryPath,
-                password: password
+                password: password,
+                keyProvider: keyProvider
             )
         case .tarGz, .tgz:
             return try extractTarGzEntryToTemp(

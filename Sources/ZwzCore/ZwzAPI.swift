@@ -32,6 +32,24 @@ public final class ZwzAPI {
         progress: ProgressHandler? = nil,
         cancellationToken: CancellationToken? = nil
     ) throws -> String {
+        try compress(
+            sourcePath: sourcePath,
+            destinationPath: destinationPath,
+            options: options,
+            keyProvider: nil,
+            progress: progress,
+            cancellationToken: cancellationToken
+        )
+    }
+
+    public func compress(
+        sourcePath: String,
+        destinationPath: String? = nil,
+        options: CompressionOptions = CompressionOptions(),
+        keyProvider: ZwzPrivateKeyProvider?,
+        progress: ProgressHandler? = nil,
+        cancellationToken: CancellationToken? = nil
+    ) throws -> String {
         let srcURL = URL(fileURLWithPath: sourcePath)
         guard FileManager.default.fileExists(atPath: sourcePath) else {
             throw ZwzError.fileNotFound(sourcePath)
@@ -83,6 +101,7 @@ public final class ZwzAPI {
                 sourcePath: sourcePath,
                 destinationPath: finalDestPath,
                 options: options,
+                keyProvider: keyProvider,
                 progress: progress,
                 cancellationToken: cancellationToken
             )
@@ -106,6 +125,24 @@ public final class ZwzAPI {
         progress: ProgressHandler? = nil,
         cancellationToken: CancellationToken? = nil
     ) throws -> String {
+        try extract(
+            archivePath: archivePath,
+            destinationPath: destinationPath,
+            password: password,
+            keyProvider: nil,
+            progress: progress,
+            cancellationToken: cancellationToken
+        ).destinationPath
+    }
+
+    public func extract(
+        archivePath: String,
+        destinationPath: String? = nil,
+        password: String? = nil,
+        keyProvider: ZwzPrivateKeyProvider?,
+        progress: ProgressHandler? = nil,
+        cancellationToken: CancellationToken? = nil
+    ) throws -> ZwzExtractionResult {
         guard FileManager.default.fileExists(atPath: archivePath) else {
             throw ZwzError.fileNotFound(archivePath)
         }
@@ -120,15 +157,21 @@ public final class ZwzAPI {
                 .appendingPathComponent(baseName).path
         }
 
-        try extractor.extract(
+        let securityInfo = try extractor.extract(
             archivePath: archivePath,
             destinationPath: destPath,
             password: password,
+            keyProvider: keyProvider,
             progress: progress,
             cancellationToken: cancellationToken
         )
-
-        return destPath
+        let version: UInt16? = try extractor.detectFormat(archivePath: archivePath) == .zwz ?
+            (securityInfo?.encryption == .publicKey ? 3 : 2) : nil
+        return ZwzExtractionResult(
+            destinationPath: destPath,
+            version: version,
+            securityInfo: securityInfo
+        )
     }
 
     // MARK: - List / Preview
@@ -141,6 +184,28 @@ public final class ZwzAPI {
             throw ZwzError.fileNotFound(archivePath)
         }
         return try previewer.preview(archivePath: archivePath)
+    }
+
+    public func list(
+        archivePath: String,
+        password: String? = nil,
+        keyProvider: ZwzPrivateKeyProvider?
+    ) throws -> ZwzArchiveListing {
+        guard FileManager.default.fileExists(atPath: archivePath) else {
+            throw ZwzError.fileNotFound(archivePath)
+        }
+        guard try extractor.detectFormat(archivePath: archivePath) == .zwz else {
+            return ZwzArchiveListing(
+                entries: try previewer.preview(archivePath: archivePath, password: password),
+                version: nil,
+                securityInfo: nil
+            )
+        }
+        return try ZwzExtractor().listEntries(
+            archivePath: archivePath,
+            password: password,
+            keyProvider: keyProvider
+        )
     }
 
     // MARK: - Detect Format
@@ -168,13 +233,28 @@ public final class ZwzAPI {
         entryPath: String,
         password: String? = nil
     ) throws -> URL {
+        try extractEntryToTemp(
+            archivePath: archivePath,
+            entryPath: entryPath,
+            password: password,
+            keyProvider: nil
+        )
+    }
+
+    public func extractEntryToTemp(
+        archivePath: String,
+        entryPath: String,
+        password: String? = nil,
+        keyProvider: ZwzPrivateKeyProvider?
+    ) throws -> URL {
         guard FileManager.default.fileExists(atPath: archivePath) else {
             throw ZwzError.fileNotFound(archivePath)
         }
         return try extractor.extractEntryToTemp(
             archivePath: archivePath,
             entryPath: entryPath,
-            password: password
+            password: password,
+            keyProvider: keyProvider
         )
     }
 }

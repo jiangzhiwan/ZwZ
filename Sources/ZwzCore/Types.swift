@@ -241,7 +241,7 @@ public enum ZwzError: LocalizedError {
 }
 
 /// 压缩包内的文件条目（用于预览）
-public struct ArchiveEntry: Identifiable, Sendable {
+public struct ArchiveEntry: Identifiable, Equatable, Sendable {
     public let id = UUID()
     public let name: String
     public let path: String
@@ -255,5 +255,37 @@ public struct ArchiveEntry: Identifiable, Sendable {
         self.size = size
         self.isDirectory = isDirectory
         self.modifiedDate = modifiedDate
+    }
+
+    public static func == (lhs: ArchiveEntry, rhs: ArchiveEntry) -> Bool {
+        lhs.name == rhs.name &&
+            lhs.path == rhs.path &&
+            lhs.size == rhs.size &&
+            lhs.isDirectory == rhs.isDirectory &&
+            lhs.modifiedDate == rhs.modifiedDate
+    }
+}
+
+public struct ZwzArchiveListing: Equatable, Sendable {
+    public let entries: [ArchiveEntry]
+    public let version: UInt16?
+    public let securityInfo: ZwzArchiveSecurityInfo?
+
+    public init(entries: [ArchiveEntry], version: UInt16?, securityInfo: ZwzArchiveSecurityInfo?) {
+        self.entries = entries
+        self.version = version
+        self.securityInfo = securityInfo
+    }
+}
+
+public struct ZwzExtractionResult: Equatable, Sendable {
+    public let destinationPath: String
+    public let version: UInt16?
+    public let securityInfo: ZwzArchiveSecurityInfo?
+
+    public init(destinationPath: String, version: UInt16?, securityInfo: ZwzArchiveSecurityInfo?) {
+        self.destinationPath = destinationPath
+        self.version = version
+        self.securityInfo = securityInfo
     }
 }

@@ -84,12 +84,42 @@ public final class ZwzCompressor {
         progress: ProgressHandler? = nil,
         cancellationToken: CancellationToken? = nil
     ) throws {
+        try compress(
+            sourcePath: sourcePath,
+            destinationPath: destinationPath,
+            options: options,
+            keyProvider: nil,
+            progress: progress,
+            cancellationToken: cancellationToken
+        )
+    }
+
+    public func compress(
+        sourcePath: String,
+        destinationPath: String,
+        options: CompressionOptions = CompressionOptions(format: .zwz),
+        keyProvider: ZwzPrivateKeyProvider?,
+        progress: ProgressHandler? = nil,
+        cancellationToken: CancellationToken? = nil
+    ) throws {
         let sourceURL = URL(fileURLWithPath: sourcePath)
         let outputURL = URL(fileURLWithPath: destinationPath)
         try FileManager.default.createDirectory(
             at: outputURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
+
+        if case .publicKey = options.encryption {
+            try ZwzV3Compressor().compress(
+                sourcePath: sourcePath,
+                destinationPath: destinationPath,
+                options: options,
+                keyProvider: keyProvider,
+                progress: progress,
+                cancellationToken: cancellationToken
+            )
+            return
+        }
 
         let v2Options = options.zwzV2Options
         let progressBox = ZwzProgressBox(progress)

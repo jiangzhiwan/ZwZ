@@ -8,7 +8,11 @@ public class ArchivePreviewer {
     public init() {}
 
     /// 预览压缩包内容（不解压）
-    public func preview(archivePath: String, password: String? = nil) throws -> [ArchiveEntry] {
+    public func preview(
+        archivePath: String,
+        password: String? = nil,
+        keyProvider: ZwzPrivateKeyProvider? = nil
+    ) throws -> [ArchiveEntry] {
         let extractor = ArchiveExtractor()
         let format = try extractor.detectFormat(archivePath: archivePath)
 
@@ -16,7 +20,7 @@ public class ArchivePreviewer {
         case .zip:
             return try previewZip(archivePath: archivePath)
         case .zwz:
-            return try previewZwz(archivePath: archivePath, password: password)
+            return try previewZwz(archivePath: archivePath, password: password, keyProvider: keyProvider)
         case .tarGz, .tgz:
             return try previewTarGz(archivePath: archivePath)
         case .gz:
@@ -85,9 +89,17 @@ public class ArchivePreviewer {
 
     // MARK: - ZWZ Preview
 
-    private func previewZwz(archivePath: String, password: String?) throws -> [ArchiveEntry] {
+    private func previewZwz(
+        archivePath: String,
+        password: String?,
+        keyProvider: ZwzPrivateKeyProvider?
+    ) throws -> [ArchiveEntry] {
         let zwzExtractor = ZwzExtractor()
-        return try zwzExtractor.listEntries(archivePath: archivePath, password: password)
+        return try zwzExtractor.listEntries(
+            archivePath: archivePath,
+            password: password,
+            keyProvider: keyProvider
+        ).entries
     }
 
     /// 检测字符串是否可能是乱码

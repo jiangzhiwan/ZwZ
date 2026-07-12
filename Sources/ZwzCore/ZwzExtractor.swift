@@ -1,6 +1,18 @@
 import Foundation
 
-/// Compatibility adapter that preserves the existing synchronous API while reading ZWZ v2 archives.
+private struct MissingZwzPrivateKeyProvider: ZwzPrivateKeyProvider {
+    func agreementPrivateKey(fingerprint: String, reason: String) throws -> Data {
+        throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
+    }
+
+    func signingPrivateKey(fingerprint: String, reason: String) throws -> Data {
+        throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
+    }
+
+    func isKnownSigningKey(fingerprint: String, signingPublicKey: Data) -> Bool { false }
+}
+
+/// Compatibility adapter that routes synchronous ZWZ APIs by logical archive magic.
 public final class ZwzExtractor {
     public init() {}
 
@@ -11,29 +23,81 @@ public final class ZwzExtractor {
         progress: ProgressHandler? = nil,
         cancellationToken: CancellationToken? = nil
     ) throws {
+        _ = try extract(
+            archivePath: archivePath,
+            destinationPath: destinationPath,
+            password: password,
+            keyProvider: nil,
+            progress: progress,
+            cancellationToken: cancellationToken
+        )
+    }
+
+    public func extract(
+        archivePath: String,
+        destinationPath: String,
+        password: String? = nil,
+        keyProvider: ZwzPrivateKeyProvider?,
+        progress: ProgressHandler? = nil,
+        cancellationToken: CancellationToken? = nil
+    ) throws -> ZwzArchiveSecurityInfo {
         try cancellationToken?.checkCancellation()
         let archiveURLs = try Self.archiveURLs(for: archivePath)
-        try Self.rejectV1Archive(at: archiveURLs[0])
-        let destinationURL = URL(fileURLWithPath: destinationPath)
-
-        _ = try waitForZwzAsync {
-            try await ZwzV2Extractor().extractAll(
-                archiveURLs: archiveURLs,
-                to: destinationURL,
-                password: password
+        switch try Self.codec(for: archiveURLs) {
+        case .v2(let header):
+            let destinationURL = URL(fileURLWithPath: destinationPath)
+            _ = try waitForZwzAsync {
+                try await ZwzV2Extractor().extractAll(
+                    archiveURLs: archiveURLs,
+                    to: destinationURL,
+                    password: password
+                )
+            }
+            try cancellationToken?.checkCancellation()
+            progress?(1.0)
+            return Self.v2SecurityInfo(header: header)
+        case .v3:
+            return try ZwzV3Extractor().extractAll(
+                archivePath: archivePath,
+                destinationPath: destinationPath,
+                keyProvider: keyProvider ?? MissingZwzPrivateKeyProvider(),
+                progress: progress,
+                cancellationToken: cancellationToken
             )
         }
-        try cancellationToken?.checkCancellation()
-        progress?(1.0)
     }
 
     public func listEntries(archivePath: String, password: String? = nil) throws -> [ArchiveEntry] {
+        try listEntries(archivePath: archivePath, password: password, keyProvider: nil).entries
+    }
+
+    public func listEntries(
+        archivePath: String,
+        password: String? = nil,
+        keyProvider: ZwzPrivateKeyProvider?
+    ) throws -> ZwzArchiveListing {
         let archiveURLs = try Self.archiveURLs(for: archivePath)
-        try Self.rejectV1Archive(at: archiveURLs[0])
-        let index = try waitForZwzAsync {
-            try await ZwzV2Extractor().preview(archiveURLs: archiveURLs, password: password)
+        switch try Self.codec(for: archiveURLs) {
+        case .v2(let header):
+            let index = try waitForZwzAsync {
+                try await ZwzV2Extractor().preview(archiveURLs: archiveURLs, password: password)
+            }
+            return ZwzArchiveListing(
+                entries: Self.archiveEntries(from: index.entries),
+                version: 2,
+                securityInfo: Self.v2SecurityInfo(header: header)
+            )
+        case .v3:
+            let listing = try ZwzV3Extractor().listEntries(
+                archivePath: archivePath,
+                keyProvider: keyProvider ?? MissingZwzPrivateKeyProvider()
+            )
+            return ZwzArchiveListing(
+                entries: Self.archiveEntries(from: listing.entries),
+                version: 3,
+                securityInfo: listing.securityInfo
+            )
         }
-        return Self.archiveEntries(from: index.entries)
     }
 
     public func extractEntryToTemp(
@@ -41,8 +105,28 @@ public final class ZwzExtractor {
         entryPath: String,
         password: String? = nil
     ) throws -> URL {
+        try extractEntryToTemp(
+            archivePath: archivePath,
+            entryPath: entryPath,
+            password: password,
+            keyProvider: nil
+        )
+    }
+
+    public func extractEntryToTemp(
+        archivePath: String,
+        entryPath: String,
+        password: String? = nil,
+        keyProvider: ZwzPrivateKeyProvider?
+    ) throws -> URL {
         let archiveURLs = try Self.archiveURLs(for: archivePath)
-        try Self.rejectV1Archive(at: archiveURLs[0])
+        if case .v3 = try Self.codec(for: archiveURLs) {
+            return try ZwzV3Extractor().extractEntryToTemp(
+                archivePath: archivePath,
+                entryPath: entryPath,
+                keyProvider: keyProvider ?? MissingZwzPrivateKeyProvider()
+            )
+        }
         let destination = FileManager.default.temporaryDirectory
             .appendingPathComponent("zwz-entry-\(UUID().uuidString)", isDirectory: true)
 
@@ -61,10 +145,13 @@ public final class ZwzExtractor {
         guard let data = try? Self.readPrefix(at: URL(fileURLWithPath: path), count: 4) else {
             return false
         }
-        return Array(data) == ZwzV2Format.magic || Array(data) == ZwzV2Format.splitMagic
+        return Array(data) == ZwzFormat.magic ||
+            Array(data) == ZwzV2Format.magic ||
+            Array(data) == [0x5A, 0x57, 0x5A, 0x33] ||
+            Array(data) == ZwzV2Format.splitMagic
     }
 
-    private static func archiveEntries(from entries: [ZwzV2Entry]) -> [ArchiveEntry] {
+    static func archiveEntries(from entries: [ZwzV2Entry]) -> [ArchiveEntry] {
         let directorySizes = entries
             .filter { $0.type == .directory }
             .reduce(into: [String: Int64]()) { result, directory in
@@ -87,11 +174,30 @@ public final class ZwzExtractor {
         }
     }
 
-    private static func rejectV1Archive(at url: URL) throws {
-        let prefix = try readPrefix(at: url, count: 4)
-        if Array(prefix) == ZwzFormat.magic {
-            throw ZwzV2Error.unsupportedVersion(1)
+    private enum Codec {
+        case v2(ZwzV2Header)
+        case v3
+    }
+
+    private static func codec(for archiveURLs: [URL]) throws -> Codec {
+        let reader = try ZwzV2VolumeReader(urls: archiveURLs)
+        let magic = Array(try reader.read(offset: 0, length: 4))
+        if magic == ZwzFormat.magic { throw ZwzV2Error.unsupportedVersion(1) }
+        if magic == ZwzV2Format.magic {
+            let header = try ZwzV2BinaryCodec.decodeHeader(
+                reader.read(offset: 0, length: ZwzV2Header.encodedLength)
+            )
+            return .v2(header)
         }
+        if magic == [0x5A, 0x57, 0x5A, 0x33] { return .v3 }
+        throw ZwzV3Error.malformedArchive("unsupported logical archive magic")
+    }
+
+    private static func v2SecurityInfo(header: ZwzV2Header) -> ZwzArchiveSecurityInfo {
+        ZwzArchiveSecurityInfo(
+            encryption: header.flags.contains(.encrypted) ? .password : .none,
+            signature: .unsigned
+        )
     }
 
     private static func archiveURLs(for path: String) throws -> [URL] {
