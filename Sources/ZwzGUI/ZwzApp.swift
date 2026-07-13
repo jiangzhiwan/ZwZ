@@ -2057,12 +2057,13 @@ struct ZWZSettingsView: View {
     @ObservedObject private var languageManager = LanguageManager.shared
 
     enum SettingsTab: String, CaseIterable {
-        case workspace, compression, preview, passwords, threading, history, fileAssociations, appearance
+        case workspace, compression, preview, keys, passwords, threading, history, fileAssociations, appearance
         var icon: String {
             switch self {
             case .workspace:   "rectangle.3.group"
             case .compression: "doc.badge.plus"
             case .preview:     "eye"
+            case .keys:        "key.horizontal"
             case .passwords:   "key.fill"
             case .threading:   "cpu"
             case .history:     "clock.arrow.circlepath"
@@ -2075,6 +2076,7 @@ struct ZWZSettingsView: View {
             case .workspace:   SettingsStrings.text("工作区", "Workspace")
             case .compression: SettingsStrings.text("压缩默认", "Compression")
             case .preview:     SettingsStrings.text("预览", "Preview")
+            case .keys:        SettingsStrings.text("公私钥", "Keys")
             case .passwords:   SettingsStrings.text("密码管理", "Passwords")
             case .threading:   SettingsStrings.text("多线程", "Threads")
             case .history:     SettingsStrings.text("历史记录", "History")
@@ -2144,6 +2146,7 @@ struct ZWZSettingsView: View {
                     case .workspace:   WorkspaceSettingsView()
                     case .compression: CompressionSettingsView()
                     case .preview:     PreviewSettingsView()
+                    case .keys:        IdentityManagerView()
                     case .passwords:   PasswordManagerSettingsView()
                     case .threading:   ThreadingSettingsView()
                     case .history:     HistorySettingsView()
