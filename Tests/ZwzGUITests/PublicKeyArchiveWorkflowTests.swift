@@ -5,6 +5,41 @@ import ZwzCore
 
 @MainActor
 final class PublicKeyArchiveWorkflowTests: XCTestCase {
+    func testCompressionCompletionCallbackRunsAfterSuccessfulHistoryEntry() async throws {
+        let fixture = try await ArchiveViewModelTestSupport.fixture()
+        let model = fixture.model
+        model.sourcePath = "/tmp/compression-success-source"
+        var historyCountWhenNotified: Int?
+        model.onCompressionSucceeded = {
+            historyCountWhenNotified = model.history.count
+        }
+
+        model.performCompress()
+        try await ArchiveViewModelTestSupport.waitUntil { !model.isProcessing }
+
+        XCTAssertEqual(historyCountWhenNotified, 1)
+        XCTAssertEqual(model.history.last?.isSuccess, true)
+    }
+
+    func testCompressionFailureRetainsSourceAndDoesNotNotifySuccess() async throws {
+        let fixture = try await ArchiveViewModelTestSupport.fixture()
+        let model = fixture.model
+        let sourcePath = "/tmp/compression-failure-source"
+        fixture.archive.enqueueCompression(.failure(PublicKeyArchiveWorkflowTestError.stoppedAfterRecording))
+        model.sourcePath = sourcePath
+        var successNotificationCount = 0
+        model.onCompressionSucceeded = {
+            successNotificationCount += 1
+        }
+
+        model.performCompress()
+        try await ArchiveViewModelTestSupport.waitUntil { !model.isProcessing }
+
+        XCTAssertEqual(successNotificationCount, 0)
+        XCTAssertEqual(model.sourcePath, sourcePath)
+        XCTAssertEqual(model.history.last?.isSuccess, false)
+    }
+
     func testPublicKeyModeRequiresAtLeastOneRecipient() async throws {
         let fixture = try await ArchiveViewModelTestSupport.fixture()
         let model = fixture.model

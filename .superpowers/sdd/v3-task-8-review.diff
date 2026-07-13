@@ -1,0 +1,2349 @@
+diff --git a/Sources/ZwzGUI/IdentityManagerView.swift b/Sources/ZwzGUI/IdentityManagerView.swift
+new file mode 100644
+index 0000000..7a9794f
+--- /dev/null
++++ b/Sources/ZwzGUI/IdentityManagerView.swift
+@@ -0,0 +1,978 @@
++import AppKit
++import SwiftUI
++import UniformTypeIdentifiers
++import ZwzCore
++
++enum IdentityManagerKeyFileIO {
++    static let maximumKeyFileBytes = 16 * 1_024 * 1_024
++
++    static func readData(from url: URL) throws -> Data {
++        let values = try url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
++        guard values.isRegularFile == true, let fileSize = values.fileSize else {
++            throw IdentityManagerFileError.invalidFileSize
++        }
++        try validateFileSize(fileSize)
++        let data = try Data(contentsOf: url)
++        try validateFileSize(data.count)
++        return data
++    }
++
++    static func validateFileSize(_ fileSize: Int) throws {
++        guard let checkedSize = UInt64(exactly: fileSize) else {
++            throw IdentityManagerFileError.invalidFileSize
++        }
++        guard checkedSize <= UInt64(maximumKeyFileBytes) else {
++            throw IdentityManagerFileError.fileTooLarge(maximumBytes: maximumKeyFileBytes)
++        }
++    }
++
++    static func writeAtomically(_ data: Data, to url: URL) throws {
++        try data.write(to: url, options: .atomic)
++    }
++}
++
++private enum IdentityManagerSubmissionKind: Equatable {
++    case create
++    case rename
++    case backup
++    case restore
++    case publicImport
++    case delete
++}
++
++private struct IdentityManagerPendingPublicImport {
++    let fingerprint: String
++    let data: Data
++}
++
++@MainActor
++struct IdentityManagerView: View {
++    @StateObject private var model: IdentityManagerViewModel
++
++    @State private var showCreateSheet = false
++    @State private var createName = ""
++    @State private var showRenameSheet = false
++    @State private var renameName = ""
++    @State private var showBackupSheet = false
++    @State private var backupPassword = ""
++    @State private var backupConfirmation = ""
++    @State private var showRestoreSheet = false
++    @State private var restorePassword = ""
++    @State private var restoreData: Data?
++    @State private var pendingPublicImport: IdentityManagerPendingPublicImport?
++    @State private var submission: IdentityManagerSubmissionKind?
++    @State private var fileOperationID: UUID?
++
++    init(onPrivateRestore: (@MainActor @Sendable () -> Void)? = nil) {
++        _model = StateObject(wrappedValue: IdentityManagerViewModel(
++            store: MacKeychainIdentityStore(),
++            onPrivateRestore: onPrivateRestore
++        ))
++    }
++
++    init(model: IdentityManagerViewModel) {
++        _model = StateObject(wrappedValue: model)
++    }
++
++    var body: some View {
++        VStack(alignment: .leading, spacing: 14) {
++            header
++            status
++            identityList
++            selectedActions
++        }
++        .task {
++            do {
++                try await model.refresh()
++            } catch {
++                // The model publishes a localized error for the page.
++            }
++        }
++        .onDisappear {
++            clearSensitiveState()
++            pendingPublicImport = nil
++            fileOperationID = nil
++            model.clearTransientState()
++        }
++        .sheet(isPresented: $showCreateSheet, onDismiss: { createName = "" }) {
++            IdentityManagerNameSheet(
++                title: SettingsStrings.text("创建身份", "Create Identity"),
++                prompt: SettingsStrings.text("身份名称", "Identity Name"),
++                confirmTitle: SettingsStrings.text("创建", "Create"),
++                name: $createName,
++                isBusy: model.isBusy || submission == .create,
++                errorMessage: model.errorMessage,
++                onCancel: cancelCreate,
++                onConfirm: createIdentity
++            )
++        }
++        .sheet(isPresented: $showRenameSheet, onDismiss: { renameName = "" }) {
++            IdentityManagerNameSheet(
++                title: SettingsStrings.text("重命名", "Rename"),
++                prompt: SettingsStrings.text("新名称", "New Name"),
++                confirmTitle: SettingsStrings.text("保存", "Save"),
++                name: $renameName,
++                isBusy: model.isBusy || submission == .rename,
++                errorMessage: model.errorMessage,
++                onCancel: cancelRename,
++                onConfirm: renameSelection
++            )
++        }
++        .sheet(isPresented: $showBackupSheet, onDismiss: clearBackupState) {
++            IdentityManagerBackupSheet(
++                password: $backupPassword,
++                confirmation: $backupConfirmation,
++                isBusy: model.isBusy || submission == .backup,
++                errorMessage: model.errorMessage,
++                onCancel: cancelBackup,
++                onConfirm: exportPrivateBackup
++            )
++        }
++        .sheet(isPresented: $showRestoreSheet, onDismiss: handleRestoreDismiss) {
++            IdentityManagerRestoreSheet(
++                model: model,
++                password: $restorePassword,
++                isBusy: model.isBusy || submission == .restore,
++                errorMessage: model.errorMessage,
++                onCancel: cancelRestore,
++                onConfirm: { restorePrivateBackup(conflict: .requireConfirmation) },
++                onCancelConflict: cancelRestore,
++                onReplaceConflict: { restorePrivateBackup(conflict: .replaceExisting) }
++            )
++        }
++        .alert(
++            SettingsStrings.text("公钥已存在", "Public Key Already Exists"),
++            isPresented: Binding(
++                get: {
++                    guard let pendingPublicImport else { return false }
++                    return model.pendingConflict?.kind == .publicImport
++                        && model.pendingConflict?.fingerprint == pendingPublicImport.fingerprint
++                },
++                set: { _ in }
++            )
++        ) {
++            Button(SettingsStrings.text("取消", "Cancel"), role: .cancel) {
++                cancelPublicImportConflict()
++            }
++            .disabled(submission == .publicImport)
++            Button(SettingsStrings.text("替换", "Replace"), role: .destructive) {
++                retryPublicImport()
++            }
++            .disabled(submission == .publicImport)
++        } message: {
++            Text(conflictMessage)
++        }
++    }
++
++    private var isFileOperationPending: Bool { fileOperationID != nil }
++
++    private var header: some View {
++        HStack(spacing: 10) {
++            VStack(alignment: .leading, spacing: 2) {
++                Text(SettingsStrings.text("公私钥", "Public & Private Keys"))
++                    .font(.system(size: 18, weight: .semibold, design: .rounded))
++                Text(SettingsStrings.text(
++                    "私钥由 macOS 钥匙串保护",
++                    "Private keys are protected by macOS Keychain"
++                ))
++                .font(.system(size: 11, design: .rounded))
++                .foregroundColor(.secondary)
++            }
++
++            Spacer(minLength: 8)
++
++            commandButton(
++                icon: "plus",
++                label: SettingsStrings.text("创建身份", "Create Identity")
++            ) {
++                model.clearTransientState()
++                createName = ""
++                showCreateSheet = true
++            }
++            commandButton(
++                icon: "person.crop.circle.badge.plus",
++                label: SettingsStrings.text("导入公钥", "Import Public Key")
++            ) {
++                model.clearTransientState()
++                choosePublicKey()
++            }
++            commandButton(
++                icon: "key.horizontal",
++                label: SettingsStrings.text("恢复私钥备份", "Restore Private Backup")
++            ) {
++                model.clearTransientState()
++                choosePrivateBackup()
++            }
++        }
++    }
++
++    @ViewBuilder
++    private var status: some View {
++        if isFileOperationPending && !model.isBusy {
++            HStack(spacing: 8) {
++                ProgressView().controlSize(.small)
++                Text(SettingsStrings.text("正在处理密钥文件…", "Working with key file…"))
++            }
++            .font(.system(size: 11, design: .rounded))
++            .foregroundColor(.secondary)
++        } else if model.isBusy {
++            HStack(spacing: 8) {
++                ProgressView().controlSize(.small)
++                Text(SettingsStrings.text("正在处理密钥…", "Working with keys…"))
++            }
++            .font(.system(size: 11, design: .rounded))
++            .foregroundColor(.secondary)
++        } else if let errorMessage = model.errorMessage {
++            Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
++                .font(.system(size: 11, design: .rounded))
++                .foregroundColor(.red)
++                .fixedSize(horizontal: false, vertical: true)
++        } else if let successMessage = model.successMessage {
++            Label(successMessage, systemImage: "checkmark.circle.fill")
++                .font(.system(size: 11, design: .rounded))
++                .foregroundColor(.green)
++                .fixedSize(horizontal: false, vertical: true)
++        }
++    }
++
++    private var identityList: some View {
++        Group {
++            if model.isLoading && model.identities.isEmpty && model.contacts.isEmpty {
++                VStack(spacing: 10) {
++                    ProgressView()
++                    Text(SettingsStrings.text("正在载入密钥…", "Loading keys…"))
++                        .font(.system(size: 12, design: .rounded))
++                        .foregroundColor(.secondary)
++                }
++                .frame(maxWidth: .infinity, maxHeight: .infinity)
++            } else if model.identities.isEmpty && model.contacts.isEmpty {
++                VStack(spacing: 8) {
++                    Image(systemName: "key.horizontal")
++                        .font(.system(size: 28, weight: .light))
++                        .foregroundColor(.secondary)
++                    Text(SettingsStrings.text("尚无身份或联系人", "No Identities or Contacts"))
++                        .font(.system(size: 13, weight: .medium, design: .rounded))
++                        .foregroundColor(.secondary)
++                }
++                .frame(maxWidth: .infinity, maxHeight: .infinity)
++            } else {
++                List(selection: $model.selection) {
++                    if !model.identities.isEmpty {
++                        Section(SettingsStrings.text("本机身份", "Local Identities")) {
++                            ForEach(model.identities, id: \.fingerprint) { identity in
++                                IdentityManagerRow(
++                                    name: identity.name,
++                                    fingerprint: identity.fingerprint,
++                                    icon: "person.badge.key.fill"
++                                )
++                                .tag(IdentityManagerSelection.localIdentity(identity.fingerprint))
++                            }
++                        }
++                    }
++
++                    if !model.contacts.isEmpty {
++                        Section(SettingsStrings.text("联系人", "Contacts")) {
++                            ForEach(model.contacts, id: \.fingerprint) { contact in
++                                IdentityManagerRow(
++                                    name: contact.name,
++                                    fingerprint: contact.fingerprint,
++                                    icon: "person.crop.circle"
++                                )
++                                .tag(IdentityManagerSelection.contact(contact.fingerprint))
++                            }
++                        }
++                    }
++                }
++                .listStyle(.inset)
++            }
++        }
++        .frame(maxWidth: .infinity, minHeight: 260, maxHeight: .infinity)
++        .alert(
++            deleteTitle,
++            isPresented: Binding(
++                get: { model.pendingDeletion != nil },
++                set: { _ in }
++            )
++        ) {
++            Button(SettingsStrings.text("取消", "Cancel"), role: .cancel) {
++                cancelDelete()
++            }
++            .disabled(submission == .delete)
++            Button(SettingsStrings.text("删除", "Delete"), role: .destructive) {
++                confirmDelete()
++            }
++            .disabled(submission == .delete)
++        } message: {
++            Text(deleteMessage)
++        }
++    }
++
++    private var selectedActions: some View {
++        HStack(spacing: 8) {
++            actionButton(
++                icon: "pencil",
++                label: SettingsStrings.text("重命名", "Rename")
++            ) {
++                model.clearTransientState()
++                renameName = model.selectedName ?? ""
++                showRenameSheet = true
++            }
++            actionButton(
++                icon: "doc.on.doc",
++                label: SettingsStrings.text("复制指纹", "Copy Fingerprint")
++            ) {
++                copyFingerprint()
++            }
++            actionButton(
++                icon: "square.and.arrow.up",
++                label: SettingsStrings.text("导出公钥", "Export Public Key")
++            ) {
++                exportPublicKey()
++            }
++
++            if model.selectedIsLocalIdentity {
++                actionButton(
++                    icon: "lock.doc",
++                    label: SettingsStrings.text("备份私钥", "Back Up Private Key")
++                ) {
++                    model.clearTransientState()
++                    backupPassword = ""
++                    backupConfirmation = ""
++                    showBackupSheet = true
++                }
++            }
++
++            Spacer()
++
++            actionButton(
++                icon: "trash",
++                label: SettingsStrings.text("删除", "Delete"),
++                role: .destructive
++            ) {
++                model.requestDeleteSelection()
++            }
++        }
++        .disabled(
++            model.selection == nil || model.isBusy || model.isLoading
++                || isFileOperationPending || submission != nil
++        )
++    }
++
++    private func commandButton(
++        icon: String,
++        label: String,
++        action: @escaping () -> Void
++    ) -> some View {
++        Button(action: action) {
++            Image(systemName: icon)
++                .font(.system(size: 14, weight: .medium))
++                .frame(width: 28, height: 28)
++        }
++        .buttonStyle(.borderless)
++        .contentShape(Rectangle())
++        .help(label)
++        .accessibilityLabel(label)
++        .disabled(
++            model.isBusy || model.isLoading || isFileOperationPending || submission != nil
++        )
++    }
++
++    private func actionButton(
++        icon: String,
++        label: String,
++        role: ButtonRole? = nil,
++        action: @escaping () -> Void
++    ) -> some View {
++        Button(role: role, action: action) {
++            Image(systemName: icon)
++                .font(.system(size: 13, weight: .medium))
++                .frame(width: 26, height: 26)
++        }
++        .buttonStyle(.borderless)
++        .contentShape(Rectangle())
++        .help(label)
++        .accessibilityLabel(label)
++    }
++
++    private var conflictMessage: String {
++        let fingerprint = pendingPublicImport?.fingerprint ?? ""
++        return SettingsStrings.text(
++            "已存在相同指纹的密钥记录。确认来源可信后才能替换。\n\(groupedFingerprint(fingerprint))",
++            "A key record with this fingerprint already exists. Replace it only after confirming the source.\n\(groupedFingerprint(fingerprint))"
++        )
++    }
++
++    private var deleteTitle: String {
++        SettingsStrings.text("确认删除？", "Delete This Key Record?")
++    }
++
++    private var deleteMessage: String {
++        guard let deletion = model.pendingDeletion else { return "" }
++        if deletion.requiresPermanentLossWarning {
++            return SettingsStrings.text(
++                "删除“\(deletion.name)”会移除本机私钥。如果这是最后一份私钥，使用它加密的压缩包可能永久无法恢复。",
++                "Deleting “\(deletion.name)” removes its private keys from this Mac. If this is the last copy, archives encrypted for it may become permanently unrecoverable."
++            )
++        }
++        return SettingsStrings.text(
++            "将从联系人中删除“\(deletion.name)”。",
++            "“\(deletion.name)” will be removed from contacts."
++        )
++    }
++
++    private func createIdentity() {
++        guard beginSubmission(.create) else { return }
++        Task {
++            defer { endSubmission(.create) }
++            do {
++                _ = try await model.createIdentity(named: createName)
++                showCreateSheet = false
++            } catch {
++                // Validation and store errors remain visible in the sheet's parent page.
++            }
++        }
++    }
++
++    private func cancelCreate() {
++        guard submission == nil else { return }
++        model.clearTransientState()
++        showCreateSheet = false
++    }
++
++    private func renameSelection() {
++        guard let fingerprint = model.selectedFingerprint,
++              beginSubmission(.rename) else { return }
++        Task {
++            defer { endSubmission(.rename) }
++            do {
++                try await model.rename(fingerprint: fingerprint, to: renameName)
++                showRenameSheet = false
++            } catch {
++                // The model publishes the exact failure.
++            }
++        }
++    }
++
++    private func cancelRename() {
++        guard submission == nil else { return }
++        model.clearTransientState()
++        showRenameSheet = false
++    }
++
++    private func cancelBackup() {
++        guard submission == nil else { return }
++        model.clearTransientState()
++        clearBackupState()
++        showBackupSheet = false
++    }
++
++    private func confirmDelete() {
++        guard beginSubmission(.delete) else { return }
++        Task {
++            defer { endSubmission(.delete) }
++            do {
++                try await model.confirmDelete()
++            } catch {
++                // The model keeps the confirmation available and publishes the error.
++            }
++        }
++    }
++
++    private func cancelDelete() {
++        guard submission == nil else { return }
++        model.cancelDelete()
++    }
++
++    private func choosePublicKey() {
++        guard !isFileOperationPending else { return }
++        let panel = NSOpenPanel()
++        panel.title = SettingsStrings.text("导入 ZWZ 公钥", "Import ZWZ Public Key")
++        panel.allowedContentTypes = keyTypes(extension: "zwzpub")
++        panel.allowsMultipleSelection = false
++        panel.canChooseDirectories = false
++        guard panel.runModal() == .OK, let url = panel.url else { return }
++        let operationID = beginFileOperation()
++
++        Task {
++            let data: Data
++            do {
++                data = try await readData(from: url)
++            } catch {
++                guard fileOperationID == operationID else { return }
++                finishFileOperation(operationID)
++                model.reportExternalError(error)
++                return
++            }
++            guard fileOperationID == operationID else { return }
++
++            do {
++                _ = try await model.importPublicIdentity(data)
++                guard fileOperationID == operationID else { return }
++                pendingPublicImport = nil
++                finishFileOperation(operationID)
++            } catch let error as ZwzV3Error {
++                guard fileOperationID == operationID else { return }
++                if case .identityConflict(let fingerprint) = error {
++                    do {
++                        let identity = try ZwzKeyFileCodec.decodePublic(data)
++                        guard identity.fingerprint == fingerprint else {
++                            throw ZwzV3Error.invalidKeyFile
++                        }
++                        pendingPublicImport = IdentityManagerPendingPublicImport(
++                            fingerprint: fingerprint,
++                            data: data
++                        )
++                    } catch {
++                        model.cancelConflict()
++                        finishFileOperation(operationID)
++                        model.reportExternalError(error)
++                    }
++                    return
++                }
++                pendingPublicImport = nil
++                finishFileOperation(operationID)
++            } catch {
++                guard fileOperationID == operationID else { return }
++                pendingPublicImport = nil
++                finishFileOperation(operationID)
++                model.reportExternalError(error)
++            }
++        }
++    }
++
++    private func retryPublicImport() {
++        guard let pendingPublicImport,
++              model.pendingConflict?.kind == .publicImport,
++              model.pendingConflict?.fingerprint == pendingPublicImport.fingerprint,
++              isFileOperationPending else {
++            cancelPublicImportConflict()
++            model.reportExternalError(ZwzV3Error.invalidKeyFile)
++            return
++        }
++        guard beginSubmission(.publicImport) else { return }
++        Task {
++            defer { endSubmission(.publicImport) }
++            do {
++                let decoded = try ZwzKeyFileCodec.decodePublic(pendingPublicImport.data)
++                guard decoded.fingerprint == pendingPublicImport.fingerprint else {
++                    throw ZwzV3Error.invalidKeyFile
++                }
++                _ = try await model.importPublicIdentity(
++                    pendingPublicImport.data,
++                    conflict: .replaceExisting
++                )
++                self.pendingPublicImport = nil
++                finishFileOperation()
++            } catch {
++                if case .identityConflict(let fingerprint) = error as? ZwzV3Error,
++                   fingerprint == pendingPublicImport.fingerprint {
++                    return
++                }
++                self.pendingPublicImport = nil
++                finishFileOperation()
++                model.reportExternalError(error)
++            }
++        }
++    }
++
++    private func cancelPublicImportConflict() {
++        guard submission == nil else { return }
++        pendingPublicImport = nil
++        model.cancelConflict()
++        finishFileOperation()
++    }
++
++    private func exportPublicKey() {
++        guard let fingerprint = model.selectedFingerprint else { return }
++        let suggestedName = safeFileName(model.selectedName ?? "identity") + ".zwzpub"
++        Task {
++            do {
++                let data = try await model.exportPublicIdentity(fingerprint: fingerprint)
++                guard let url = saveURL(
++                    title: SettingsStrings.text("导出 ZWZ 公钥", "Export ZWZ Public Key"),
++                    suggestedName: suggestedName,
++                    extension: "zwzpub"
++                ) else { return }
++                try await writeAtomically(data, to: url)
++                model.reportSuccess(SettingsStrings.text("公钥已导出。", "Public key exported."))
++            } catch {
++                model.reportExternalError(error)
++            }
++        }
++    }
++
++    private func exportPrivateBackup() {
++        guard let fingerprint = model.selectedFingerprint,
++              beginSubmission(.backup) else { return }
++        let suggestedName = safeFileName(model.selectedName ?? "identity") + ".zwzkey"
++        guard let url = saveURL(
++            title: SettingsStrings.text("保存加密私钥备份", "Save Encrypted Private Backup"),
++            suggestedName: suggestedName,
++            extension: "zwzkey"
++        ) else {
++            clearBackupState()
++            showBackupSheet = false
++            endSubmission(.backup)
++            return
++        }
++        Task {
++            defer { endSubmission(.backup) }
++            do {
++                let data = try await model.exportPrivateBackup(
++                    fingerprint: fingerprint,
++                    password: backupPassword,
++                    confirmation: backupConfirmation
++                )
++                try await writeAtomically(data, to: url)
++                clearBackupState()
++                showBackupSheet = false
++                model.reportSuccess(SettingsStrings.text(
++                    "加密私钥备份已保存。",
++                    "Encrypted private backup saved."
++                ))
++            } catch {
++                clearBackupState()
++                showBackupSheet = false
++                model.reportExternalError(error)
++            }
++        }
++    }
++
++    private func choosePrivateBackup() {
++        guard !isFileOperationPending else { return }
++        let panel = NSOpenPanel()
++        panel.title = SettingsStrings.text("恢复 ZWZ 私钥备份", "Restore ZWZ Private Backup")
++        panel.allowedContentTypes = keyTypes(extension: "zwzkey")
++        panel.allowsMultipleSelection = false
++        panel.canChooseDirectories = false
++        guard panel.runModal() == .OK, let url = panel.url else { return }
++        let operationID = beginFileOperation()
++
++        Task {
++            do {
++                let data = try await readData(from: url)
++                guard fileOperationID == operationID else { return }
++                restoreData = data
++                restorePassword = ""
++                showRestoreSheet = true
++            } catch {
++                guard fileOperationID == operationID else { return }
++                finishFileOperation(operationID)
++                model.reportExternalError(error)
++            }
++        }
++    }
++
++    private func restorePrivateBackup(conflict: ZwzIdentityConflictPolicy) {
++        guard let restoreData, beginSubmission(.restore) else { return }
++        Task {
++            defer { endSubmission(.restore) }
++            do {
++                _ = try await model.restorePrivateBackup(
++                    restoreData,
++                    password: restorePassword,
++                    conflict: conflict
++                )
++                clearRestoreState()
++                showRestoreSheet = false
++                finishFileOperation()
++            } catch let error as ZwzV3Error {
++                if case .identityConflict = error { return }
++                clearRestoreState()
++                showRestoreSheet = false
++                finishFileOperation()
++            } catch {
++                clearRestoreState()
++                showRestoreSheet = false
++                finishFileOperation()
++            }
++        }
++    }
++
++    private func cancelRestore() {
++        guard submission == nil else { return }
++        model.clearTransientState()
++        clearRestoreState()
++        showRestoreSheet = false
++        finishFileOperation()
++    }
++
++    private func copyFingerprint() {
++        guard let fingerprint = model.selectedFingerprint else { return }
++        NSPasteboard.general.clearContents()
++        NSPasteboard.general.setString(fingerprint, forType: .string)
++        model.reportSuccess(SettingsStrings.text("指纹已复制。", "Fingerprint copied."))
++    }
++
++    private func beginSubmission(_ kind: IdentityManagerSubmissionKind) -> Bool {
++        guard submission == nil else { return false }
++        submission = kind
++        return true
++    }
++
++    private func endSubmission(_ kind: IdentityManagerSubmissionKind) {
++        guard submission == kind else { return }
++        submission = nil
++    }
++
++    private func beginFileOperation() -> UUID {
++        let operationID = UUID()
++        fileOperationID = operationID
++        return operationID
++    }
++
++    private func finishFileOperation(_ operationID: UUID? = nil) {
++        if let operationID, fileOperationID != operationID { return }
++        fileOperationID = nil
++    }
++
++    private func handleRestoreDismiss() {
++        guard submission != .restore else { return }
++        if model.pendingConflict?.kind == .privateRestore {
++            model.cancelConflict()
++        }
++        clearRestoreState()
++        finishFileOperation()
++    }
++
++    private func clearSensitiveState() {
++        clearBackupState()
++        clearRestoreState()
++    }
++
++    private func clearBackupState() {
++        backupPassword = ""
++        backupConfirmation = ""
++    }
++
++    private func clearRestoreState() {
++        restorePassword = ""
++        restoreData = nil
++    }
++
++    private func keyTypes(extension fileExtension: String) -> [UTType] {
++        if let type = UTType(filenameExtension: fileExtension) { return [type] }
++        return [.data]
++    }
++
++    private func saveURL(
++        title: String,
++        suggestedName: String,
++        extension fileExtension: String
++    ) -> URL? {
++        let panel = NSSavePanel()
++        panel.title = title
++        panel.allowedContentTypes = keyTypes(extension: fileExtension)
++        panel.nameFieldStringValue = suggestedName
++        panel.isExtensionHidden = false
++        panel.canCreateDirectories = true
++        guard panel.runModal() == .OK else { return nil }
++        return panel.url
++    }
++
++    private func readData(from url: URL) async throws -> Data {
++        try await Task.detached(priority: .userInitiated) {
++            try IdentityManagerKeyFileIO.readData(from: url)
++        }.value
++    }
++
++    private func writeAtomically(_ data: Data, to url: URL) async throws {
++        try await Task.detached(priority: .userInitiated) {
++            try IdentityManagerKeyFileIO.writeAtomically(data, to: url)
++        }.value
++    }
++
++    private func safeFileName(_ name: String) -> String {
++        let invalid = CharacterSet(charactersIn: "/:")
++        let components = name.components(separatedBy: invalid)
++        let result = components.joined(separator: "-").trimmingCharacters(in: .whitespaces)
++        return result.isEmpty ? "identity" : result
++    }
++}
++
++@MainActor
++private struct IdentityManagerRow: View {
++    let name: String
++    let fingerprint: String
++    let icon: String
++
++    var body: some View {
++        HStack(alignment: .top, spacing: 10) {
++            Image(systemName: icon)
++                .font(.system(size: 15))
++                .foregroundColor(.accentColor)
++                .frame(width: 20, height: 20)
++            VStack(alignment: .leading, spacing: 3) {
++                Text(name)
++                    .font(.system(size: 13, weight: .medium, design: .rounded))
++                    .lineLimit(2)
++                Text(groupedFingerprint(fingerprint))
++                    .font(.system(size: 10, design: .monospaced))
++                    .foregroundColor(.secondary)
++                    .fixedSize(horizontal: false, vertical: true)
++                    .textSelection(.enabled)
++            }
++            Spacer(minLength: 0)
++        }
++        .padding(.vertical, 3)
++    }
++}
++
++@MainActor
++private struct IdentityManagerNameSheet: View {
++    let title: String
++    let prompt: String
++    let confirmTitle: String
++    @Binding var name: String
++    let isBusy: Bool
++    let errorMessage: String?
++    let onCancel: () -> Void
++    let onConfirm: () -> Void
++
++    private var isValid: Bool {
++        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
++    }
++
++    var body: some View {
++        VStack(alignment: .leading, spacing: 16) {
++            Text(title)
++                .font(.system(size: 17, weight: .semibold, design: .rounded))
++            TextField(prompt, text: $name)
++                .textFieldStyle(.roundedBorder)
++                .onSubmit { if isValid && !isBusy { onConfirm() } }
++            if let errorMessage {
++                Text(errorMessage)
++                    .font(.system(size: 11, design: .rounded))
++                    .foregroundColor(.red)
++                    .fixedSize(horizontal: false, vertical: true)
++            }
++            HStack {
++                Spacer()
++                Button(SettingsStrings.text("取消", "Cancel"), role: .cancel, action: onCancel)
++                    .disabled(isBusy)
++                Button(confirmTitle, action: onConfirm)
++                    .keyboardShortcut(.defaultAction)
++                    .disabled(!isValid || isBusy)
++            }
++        }
++        .padding(22)
++        .frame(width: 360)
++        .interactiveDismissDisabled(isBusy)
++    }
++}
++
++@MainActor
++private struct IdentityManagerBackupSheet: View {
++    @Binding var password: String
++    @Binding var confirmation: String
++    let isBusy: Bool
++    let errorMessage: String?
++    let onCancel: () -> Void
++    let onConfirm: () -> Void
++
++    private var isValid: Bool { !password.isEmpty && password == confirmation }
++
++    var body: some View {
++        VStack(alignment: .leading, spacing: 14) {
++            Text(SettingsStrings.text("加密私钥备份", "Encrypted Private Backup"))
++                .font(.system(size: 17, weight: .semibold, design: .rounded))
++            Text(SettingsStrings.text(
++                "备份密码无法找回。请将备份和密码分别保管。",
++                "This password cannot be recovered. Store the backup and password separately."
++            ))
++            .font(.system(size: 11, design: .rounded))
++            .foregroundColor(.secondary)
++            .fixedSize(horizontal: false, vertical: true)
++            SecureField(SettingsStrings.text("备份密码", "Backup Password"), text: $password)
++                .textFieldStyle(.roundedBorder)
++            SecureField(SettingsStrings.text("确认密码", "Confirm Password"), text: $confirmation)
++                .textFieldStyle(.roundedBorder)
++            if let errorMessage {
++                Text(errorMessage)
++                    .font(.system(size: 11, design: .rounded))
++                    .foregroundColor(.red)
++                    .fixedSize(horizontal: false, vertical: true)
++            }
++            HStack {
++                Spacer()
++                Button(SettingsStrings.text("取消", "Cancel"), role: .cancel, action: onCancel)
++                    .disabled(isBusy)
++                Button(SettingsStrings.text("继续", "Continue"), action: onConfirm)
++                    .keyboardShortcut(.defaultAction)
++                    .disabled(!isValid || isBusy)
++            }
++        }
++        .padding(22)
++        .frame(width: 390)
++        .interactiveDismissDisabled(isBusy)
++    }
++}
++
++@MainActor
++private struct IdentityManagerRestoreSheet: View {
++    @ObservedObject var model: IdentityManagerViewModel
++    @Binding var password: String
++    let isBusy: Bool
++    let errorMessage: String?
++    let onCancel: () -> Void
++    let onConfirm: () -> Void
++    let onCancelConflict: () -> Void
++    let onReplaceConflict: () -> Void
++
++    var body: some View {
++        VStack(alignment: .leading, spacing: 14) {
++            Text(SettingsStrings.text("恢复私钥备份", "Restore Private Backup"))
++                .font(.system(size: 17, weight: .semibold, design: .rounded))
++            SecureField(SettingsStrings.text("备份密码", "Backup Password"), text: $password)
++                .textFieldStyle(.roundedBorder)
++                .onSubmit { if !password.isEmpty && !isBusy { onConfirm() } }
++            if let errorMessage {
++                Text(errorMessage)
++                    .font(.system(size: 11, design: .rounded))
++                    .foregroundColor(.red)
++                    .fixedSize(horizontal: false, vertical: true)
++            }
++            HStack {
++                Spacer()
++                Button(SettingsStrings.text("取消", "Cancel"), role: .cancel, action: onCancel)
++                    .disabled(isBusy)
++                Button(SettingsStrings.text("恢复", "Restore"), action: onConfirm)
++                    .keyboardShortcut(.defaultAction)
++                    .disabled(password.isEmpty || isBusy)
++            }
++        }
++        .padding(22)
++        .frame(width: 390)
++        .interactiveDismissDisabled(isBusy || model.pendingConflict?.kind == .privateRestore)
++        .alert(
++            SettingsStrings.text("身份已存在", "Identity Already Exists"),
++            isPresented: Binding(
++                get: { model.pendingConflict?.kind == .privateRestore },
++                set: { _ in }
++            )
++        ) {
++            Button(SettingsStrings.text("取消", "Cancel"), role: .cancel, action: onCancelConflict)
++                .disabled(isBusy)
++            Button(SettingsStrings.text("替换", "Replace"), role: .destructive, action: onReplaceConflict)
++                .disabled(isBusy)
++        } message: {
++            let fingerprint = model.pendingConflict?.fingerprint ?? ""
++            Text(SettingsStrings.text(
++                "将替换相同指纹的身份记录。\n\(groupedFingerprint(fingerprint))",
++                "The identity record with this fingerprint will be replaced.\n\(groupedFingerprint(fingerprint))"
++            ))
++        }
++    }
++}
++
++private func groupedFingerprint(_ fingerprint: String) -> String {
++    var groups: [String] = []
++    var start = fingerprint.startIndex
++    while start < fingerprint.endIndex {
++        let end = fingerprint.index(start, offsetBy: 4, limitedBy: fingerprint.endIndex)
++            ?? fingerprint.endIndex
++        groups.append(String(fingerprint[start..<end]))
++        start = end
++    }
++    return groups.joined(separator: " ")
++}
+diff --git a/Sources/ZwzGUI/IdentityManagerViewModel.swift b/Sources/ZwzGUI/IdentityManagerViewModel.swift
+new file mode 100644
+index 0000000..2a1035b
+--- /dev/null
++++ b/Sources/ZwzGUI/IdentityManagerViewModel.swift
+@@ -0,0 +1,569 @@
++import Combine
++import Foundation
++import ZwzCore
++
++enum IdentityManagerViewModelError: LocalizedError, Equatable, Sendable {
++    case invalidName
++    case emptyPassword
++    case passwordConfirmationMismatch
++    case operationInProgress
++    case noPendingDeletion
++
++    var errorDescription: String? {
++        switch self {
++        case .invalidName:
++            "The identity name must not be empty."
++        case .emptyPassword:
++            "The backup password must not be empty."
++        case .passwordConfirmationMismatch:
++            "The backup passwords do not match."
++        case .operationInProgress:
++            "Another key operation is already in progress."
++        case .noPendingDeletion:
++            "No key is waiting to be deleted."
++        }
++    }
++}
++
++enum IdentityManagerFileError: LocalizedError, Equatable, Sendable {
++    case invalidFileSize
++    case fileTooLarge(maximumBytes: Int)
++
++    var errorDescription: String? {
++        switch self {
++        case .invalidFileSize:
++            "The selected key file size could not be verified."
++        case .fileTooLarge(let maximumBytes):
++            "The selected key file exceeds the \(maximumBytes)-byte limit."
++        }
++    }
++}
++
++enum IdentityManagerSelection: Hashable, Sendable {
++    case localIdentity(String)
++    case contact(String)
++
++    var fingerprint: String {
++        switch self {
++        case .localIdentity(let fingerprint), .contact(let fingerprint): fingerprint
++        }
++    }
++
++    var isLocalIdentity: Bool {
++        if case .localIdentity = self { return true }
++        return false
++    }
++}
++
++enum IdentityManagerItemKind: Equatable, Sendable {
++    case localIdentity
++    case contact
++}
++
++struct IdentityManagerDeletion: Equatable, Sendable, Identifiable {
++    let kind: IdentityManagerItemKind
++    let name: String
++    let fingerprint: String
++
++    var id: String { fingerprint }
++    var requiresPermanentLossWarning: Bool { kind == .localIdentity }
++}
++
++enum IdentityManagerConflictKind: Equatable, Sendable {
++    case publicImport
++    case privateRestore
++}
++
++struct IdentityManagerConflict: Equatable, Sendable, Identifiable {
++    let kind: IdentityManagerConflictKind
++    let fingerprint: String
++
++    var id: String { "\(kind)-\(fingerprint)" }
++}
++
++@MainActor
++final class IdentityManagerViewModel: ObservableObject {
++    @Published private(set) var identities: [ZwzIdentityMetadata] = []
++    @Published private(set) var contacts: [ZwzPublicIdentity] = []
++    @Published var selection: IdentityManagerSelection?
++    @Published private(set) var isLoading = false
++    @Published private(set) var isBusy = false
++    @Published private(set) var pendingDeletion: IdentityManagerDeletion?
++    @Published private(set) var pendingConflict: IdentityManagerConflict?
++    @Published private(set) var errorMessage: String?
++    @Published private(set) var successMessage: String?
++
++    let store: any ZwzIdentityStore
++
++    private var onPrivateRestore: (@MainActor @Sendable () -> Void)?
++
++    init(
++        store: any ZwzIdentityStore,
++        onPrivateRestore: (@MainActor @Sendable () -> Void)? = nil
++    ) {
++        self.store = store
++        self.onPrivateRestore = onPrivateRestore
++    }
++
++    var selectedName: String? {
++        switch selection {
++        case .localIdentity(let fingerprint):
++            identities.first { $0.fingerprint == fingerprint }?.name
++        case .contact(let fingerprint):
++            contacts.first { $0.fingerprint == fingerprint }?.name
++        case nil:
++            nil
++        }
++    }
++
++    var selectedFingerprint: String? { selection?.fingerprint }
++    var selectedIsLocalIdentity: Bool { selection?.isLocalIdentity == true }
++
++    func refresh() async throws {
++        guard !isLoading else { return }
++        guard !isBusy else {
++            let error = IdentityManagerViewModelError.operationInProgress
++            present(error)
++            throw error
++        }
++        isLoading = true
++        errorMessage = nil
++        defer { isLoading = false }
++
++        do {
++            let snapshot = try await Self.loadSnapshot(from: store)
++            try Task.checkCancellation()
++            apply(snapshot)
++        } catch {
++            if error is CancellationError { throw error }
++            present(error)
++            throw error
++        }
++    }
++
++    @discardableResult
++    func createIdentity(named name: String) async throws -> ZwzIdentityMetadata {
++        let name = try validatedName(name)
++        let identity = try await performMutation(success: SettingsStrings.text(
++            "已创建身份“\(name)”。",
++            "Created identity “\(name)”."
++        )) { store in
++            try store.createIdentity(named: name)
++        }
++        upsert(identity)
++        selection = .localIdentity(identity.fingerprint)
++        return identity
++    }
++
++    func rename(fingerprint: String, to name: String) async throws {
++        let name = try validatedName(name)
++        let previousSelection = selection
++        try await performMutation(success: SettingsStrings.text(
++            "名称已更新。",
++            "Name updated."
++        )) { store in
++            try store.rename(fingerprint: fingerprint, to: name)
++        }
++        renameLocalRecord(fingerprint: fingerprint, to: name)
++        if previousSelection?.fingerprint == fingerprint {
++            selection = previousSelection
++        }
++    }
++
++    func requestDelete(_ identity: ZwzIdentityMetadata) {
++        pendingDeletion = IdentityManagerDeletion(
++            kind: .localIdentity,
++            name: identity.name,
++            fingerprint: identity.fingerprint
++        )
++        errorMessage = nil
++        successMessage = nil
++    }
++
++    func requestDelete(_ contact: ZwzPublicIdentity) {
++        pendingDeletion = IdentityManagerDeletion(
++            kind: .contact,
++            name: contact.name,
++            fingerprint: contact.fingerprint
++        )
++        errorMessage = nil
++        successMessage = nil
++    }
++
++    func requestDeleteSelection() {
++        switch selection {
++        case .localIdentity(let fingerprint):
++            guard let identity = identities.first(where: { $0.fingerprint == fingerprint }) else {
++                return
++            }
++            requestDelete(identity)
++        case .contact(let fingerprint):
++            guard let contact = contacts.first(where: { $0.fingerprint == fingerprint }) else {
++                return
++            }
++            requestDelete(contact)
++        case nil:
++            return
++        }
++    }
++
++    func cancelDelete() {
++        pendingDeletion = nil
++    }
++
++    func confirmDelete() async throws {
++        guard let pendingDeletion else {
++            let error = IdentityManagerViewModelError.noPendingDeletion
++            present(error)
++            throw error
++        }
++        try await performMutation(success: SettingsStrings.text(
++            "密钥记录已删除。",
++            "Key record deleted."
++        )) { store in
++            try store.delete(fingerprint: pendingDeletion.fingerprint)
++        }
++        removeLocalRecord(fingerprint: pendingDeletion.fingerprint)
++        self.pendingDeletion = nil
++        if selection?.fingerprint == pendingDeletion.fingerprint {
++            selection = nil
++        }
++    }
++
++    @discardableResult
++    func importPublicIdentity(
++        _ data: Data,
++        conflict: ZwzIdentityConflictPolicy = .requireConfirmation
++    ) async throws -> ZwzPublicIdentity {
++        let identity = try await performMutation(
++            conflictKind: .publicImport,
++            success: SettingsStrings.text("公钥已导入。", "Public key imported.")
++        ) { store in
++            try store.importPublicIdentity(data, conflict: conflict)
++        }
++        pendingConflict = nil
++        upsert(identity)
++        if identities.contains(where: { $0.fingerprint == identity.fingerprint }) {
++            selection = .localIdentity(identity.fingerprint)
++        } else {
++            selection = .contact(identity.fingerprint)
++        }
++        return identity
++    }
++
++    func exportPublicIdentity(fingerprint: String) async throws -> Data {
++        try await performRead { store in
++            try store.exportPublicIdentity(fingerprint: fingerprint)
++        }
++    }
++
++    func exportPrivateBackup(
++        fingerprint: String,
++        password: String,
++        confirmation: String
++    ) async throws -> Data {
++        try validatePassword(password, confirmation: confirmation)
++        return try await performRead { store in
++            try store.exportPrivateBackup(fingerprint: fingerprint, password: password)
++        }
++    }
++
++    @discardableResult
++    func restorePrivateBackup(
++        _ data: Data,
++        password: String,
++        conflict: ZwzIdentityConflictPolicy = .requireConfirmation
++    ) async throws -> ZwzIdentityMetadata {
++        guard !password.isEmpty else {
++            let error = IdentityManagerViewModelError.emptyPassword
++            present(error)
++            throw error
++        }
++        let identity = try await performMutation(
++            conflictKind: .privateRestore,
++            success: SettingsStrings.text("私钥备份已恢复。", "Private key backup restored.")
++        ) { store in
++            try store.importPrivateBackup(data, password: password, conflict: conflict)
++        }
++        pendingConflict = nil
++        upsert(identity)
++        selection = .localIdentity(identity.fingerprint)
++        if let callback = onPrivateRestore {
++            onPrivateRestore = nil
++            callback()
++        }
++        return identity
++    }
++
++    func cancelConflict() {
++        pendingConflict = nil
++    }
++
++    func clearTransientState() {
++        errorMessage = nil
++        successMessage = nil
++        pendingConflict = nil
++    }
++
++    func reportExternalError(_ error: Error) {
++        present(error)
++    }
++
++    func reportSuccess(_ message: String) {
++        errorMessage = nil
++        successMessage = message
++    }
++
++    private func validatedName(_ name: String) throws -> String {
++        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
++        guard !name.isEmpty else {
++            let error = IdentityManagerViewModelError.invalidName
++            present(error)
++            throw error
++        }
++        return name
++    }
++
++    private func validatePassword(_ password: String, confirmation: String) throws {
++        guard !password.isEmpty else {
++            let error = IdentityManagerViewModelError.emptyPassword
++            present(error)
++            throw error
++        }
++        guard password == confirmation else {
++            let error = IdentityManagerViewModelError.passwordConfirmationMismatch
++            present(error)
++            throw error
++        }
++    }
++
++    private func performRead<Value: Sendable>(
++        _ operation: @escaping @Sendable (any ZwzIdentityStore) throws -> Value
++    ) async throws -> Value {
++        guard !isBusy, !isLoading else {
++            let error = IdentityManagerViewModelError.operationInProgress
++            present(error)
++            throw error
++        }
++        isBusy = true
++        errorMessage = nil
++        successMessage = nil
++        defer { isBusy = false }
++
++        let store = store
++        do {
++            return try await Task.detached(priority: .userInitiated) {
++                try operation(store)
++            }.value
++        } catch {
++            present(error)
++            throw error
++        }
++    }
++
++    private func performMutation<Value: Sendable>(
++        conflictKind: IdentityManagerConflictKind? = nil,
++        success: String,
++        _ operation: @escaping @Sendable (any ZwzIdentityStore) throws -> Value
++    ) async throws -> Value {
++        guard !isBusy, !isLoading else {
++            let error = IdentityManagerViewModelError.operationInProgress
++            present(error)
++            throw error
++        }
++        isBusy = true
++        errorMessage = nil
++        successMessage = nil
++        defer { isBusy = false }
++
++        let store = store
++        let value: Value
++        do {
++            value = try await Task.detached(priority: .userInitiated) {
++                try operation(store)
++            }.value
++        } catch {
++            if let conflictKind,
++               case .identityConflict(let fingerprint) = error as? ZwzV3Error {
++                pendingConflict = IdentityManagerConflict(
++                    kind: conflictKind,
++                    fingerprint: fingerprint
++                )
++                errorMessage = nil
++            } else {
++                present(error)
++            }
++            throw error
++        }
++
++        do {
++            apply(try await Self.loadSnapshot(from: store))
++            errorMessage = nil
++        } catch {
++            let detail = localizedMessage(for: error)
++            errorMessage = SettingsStrings.text(
++                "操作已完成，但无法刷新密钥列表：\(detail)",
++                "The operation completed, but the key list could not be refreshed: \(detail)"
++            )
++        }
++        successMessage = success
++        return value
++    }
++
++    private static func loadSnapshot(
++        from store: any ZwzIdentityStore
++    ) async throws -> IdentityManagerStoreSnapshot {
++        try await Task.detached(priority: .userInitiated) {
++            try IdentityManagerStoreSnapshot(
++                identities: store.identities(),
++                contacts: store.contacts()
++            )
++        }.value
++    }
++
++    private func apply(_ snapshot: IdentityManagerStoreSnapshot) {
++        identities = snapshot.identities
++        contacts = snapshot.contacts
++        guard let selection else { return }
++        switch selection {
++        case .localIdentity(let fingerprint):
++            if !identities.contains(where: { $0.fingerprint == fingerprint }) {
++                self.selection = nil
++            }
++        case .contact(let fingerprint):
++            if !contacts.contains(where: { $0.fingerprint == fingerprint }) {
++                self.selection = nil
++            }
++        }
++    }
++
++    private func upsert(_ identity: ZwzIdentityMetadata) {
++        contacts.removeAll { $0.fingerprint == identity.fingerprint }
++        if let index = identities.firstIndex(where: {
++            $0.fingerprint == identity.fingerprint
++        }) {
++            identities[index] = identity
++        } else {
++            identities.append(identity)
++        }
++        identities.sort { $0.creationDate < $1.creationDate }
++    }
++
++    private func upsert(_ identity: ZwzPublicIdentity) {
++        if let index = identities.firstIndex(where: {
++            $0.fingerprint == identity.fingerprint
++        }) {
++            let existing = identities[index]
++            identities[index] = ZwzIdentityMetadata(
++                name: identity.name,
++                fingerprint: existing.fingerprint,
++                agreementPublicKey: existing.agreementPublicKey,
++                signingPublicKey: existing.signingPublicKey,
++                creationDate: existing.creationDate
++            )
++            contacts.removeAll { $0.fingerprint == identity.fingerprint }
++            return
++        }
++        if let index = contacts.firstIndex(where: {
++            $0.fingerprint == identity.fingerprint
++        }) {
++            contacts[index] = identity
++        } else {
++            contacts.append(identity)
++        }
++        contacts.sort { $0.name < $1.name }
++    }
++
++    private func renameLocalRecord(fingerprint: String, to name: String) {
++        if let index = identities.firstIndex(where: { $0.fingerprint == fingerprint }) {
++            identities[index].name = name
++        }
++        if let index = contacts.firstIndex(where: { $0.fingerprint == fingerprint }) {
++            contacts[index].name = name
++            contacts.sort { $0.name < $1.name }
++        }
++    }
++
++    private func removeLocalRecord(fingerprint: String) {
++        identities.removeAll { $0.fingerprint == fingerprint }
++        contacts.removeAll { $0.fingerprint == fingerprint }
++    }
++
++    private func present(_ error: Error) {
++        successMessage = nil
++        errorMessage = localizedMessage(for: error)
++    }
++
++    private func localizedMessage(for error: Error) -> String {
++        if let fileError = error as? IdentityManagerFileError {
++            switch fileError {
++            case .invalidFileSize:
++                return SettingsStrings.text(
++                    "无法验证所选密钥文件的大小。",
++                    "The selected key file size could not be verified."
++                )
++            case .fileTooLarge:
++                return SettingsStrings.text(
++                    "所选密钥文件超过 16 MiB 大小限制。",
++                    "The selected key file exceeds the 16 MiB size limit."
++                )
++            }
++        }
++        if let modelError = error as? IdentityManagerViewModelError {
++            return message(for: modelError)
++        }
++        guard let v3Error = error as? ZwzV3Error else {
++            return error.localizedDescription
++        }
++        switch v3Error {
++        case .userAuthenticationCancelled:
++            return SettingsStrings.text(
++                "已取消系统身份验证。",
++                "System authentication was cancelled."
++            )
++        case .keychainFailure(let status):
++            return SettingsStrings.text(
++                "钥匙串操作失败（状态码 \(status)）。",
++                "Keychain operation failed (status \(status))."
++            )
++        case .invalidBackup:
++            return SettingsStrings.text(
++                "私钥备份无效或密码不正确。",
++                "The private key backup is invalid or the password is incorrect."
++            )
++        case .invalidKeyFile:
++            return SettingsStrings.text(
++                "公钥文件无效。",
++                "The public key file is invalid."
++            )
++        case .identityConflict:
++            return SettingsStrings.text("检测到身份冲突。", "An identity conflict was detected.")
++        case .invalidIdentityName:
++            return SettingsStrings.text("身份名称不能为空。", "Identity name cannot be empty.")
++        case .noMatchingPrivateKey:
++            return SettingsStrings.text("找不到匹配的私钥。", "No matching private key is available.")
++        default:
++            return v3Error.localizedDescription
++        }
++    }
++
++    private func message(for error: IdentityManagerViewModelError) -> String {
++        switch error {
++        case .invalidName:
++            SettingsStrings.text("名称不能为空。", "Name cannot be empty.")
++        case .emptyPassword:
++            SettingsStrings.text("备份密码不能为空。", "Backup password cannot be empty.")
++        case .passwordConfirmationMismatch:
++            SettingsStrings.text("两次输入的备份密码不一致。", "Backup passwords do not match.")
++        case .operationInProgress:
++            SettingsStrings.text("另一项密钥操作正在进行。", "Another key operation is in progress.")
++        case .noPendingDeletion:
++            SettingsStrings.text("没有等待删除的密钥。", "No key is waiting to be deleted.")
++        }
++    }
++}
++
++private struct IdentityManagerStoreSnapshot: Sendable {
++    let identities: [ZwzIdentityMetadata]
++    let contacts: [ZwzPublicIdentity]
++}
+diff --git a/Sources/ZwzGUI/ZwzApp.swift b/Sources/ZwzGUI/ZwzApp.swift
+index 7186d84..5ae8c8e 100644
+--- a/Sources/ZwzGUI/ZwzApp.swift
++++ b/Sources/ZwzGUI/ZwzApp.swift
+@@ -2057,12 +2057,13 @@ struct ZWZSettingsView: View {
+     @ObservedObject private var languageManager = LanguageManager.shared
+ 
+     enum SettingsTab: String, CaseIterable {
+-        case workspace, compression, preview, passwords, threading, history, fileAssociations, appearance
++        case workspace, compression, preview, keys, passwords, threading, history, fileAssociations, appearance
+         var icon: String {
+             switch self {
+             case .workspace:   "rectangle.3.group"
+             case .compression: "doc.badge.plus"
+             case .preview:     "eye"
++            case .keys:        "key.horizontal"
+             case .passwords:   "key.fill"
+             case .threading:   "cpu"
+             case .history:     "clock.arrow.circlepath"
+@@ -2075,6 +2076,7 @@ struct ZWZSettingsView: View {
+             case .workspace:   SettingsStrings.text("工作区", "Workspace")
+             case .compression: SettingsStrings.text("压缩默认", "Compression")
+             case .preview:     SettingsStrings.text("预览", "Preview")
++            case .keys:        SettingsStrings.text("公私钥", "Keys")
+             case .passwords:   SettingsStrings.text("密码管理", "Passwords")
+             case .threading:   SettingsStrings.text("多线程", "Threads")
+             case .history:     SettingsStrings.text("历史记录", "History")
+@@ -2144,6 +2146,7 @@ struct ZWZSettingsView: View {
+                     case .workspace:   WorkspaceSettingsView()
+                     case .compression: CompressionSettingsView()
+                     case .preview:     PreviewSettingsView()
++                    case .keys:        IdentityManagerView()
+                     case .passwords:   PasswordManagerSettingsView()
+                     case .threading:   ThreadingSettingsView()
+                     case .history:     HistorySettingsView()
+diff --git a/Tests/ZwzGUITests/IdentityManagerTestSupport.swift b/Tests/ZwzGUITests/IdentityManagerTestSupport.swift
+new file mode 100644
+index 0000000..189a794
+--- /dev/null
++++ b/Tests/ZwzGUITests/IdentityManagerTestSupport.swift
+@@ -0,0 +1,274 @@
++import CryptoKit
++import Foundation
++import ZwzCore
++@testable import ZwzGUI
++
++final class IdentityManagerControlledStore: ZwzIdentityStore, @unchecked Sendable {
++    enum Operation: Hashable, Sendable {
++        case create
++        case identities
++        case contacts
++        case importPublic
++        case exportPublic
++        case exportBackup
++        case restoreBackup
++        case rename
++        case delete
++    }
++
++    private let lock = NSLock()
++    private var storedIdentities: [String: ZwzIdentityMetadata]
++    private var storedContacts: [String: ZwzPublicIdentity]
++    private var failures: [Operation: ZwzV3Error] = [:]
++    private var calls: [Operation: Int] = [:]
++    private var mainThreadCalls: Set<Operation> = []
++    private var nextIdentityIndex = 30
++    private var delay: TimeInterval = 0
++    private var listingDelay: TimeInterval = 0
++
++    let rawAgreementPrivateKey = Data((1...32).map(UInt8.init))
++    let rawSigningPrivateKey = Data((65...96).map(UInt8.init))
++    let encryptedBackup = Data("ZWZK-encrypted-test-backup".utf8)
++    let restorableIdentity: ZwzIdentityMetadata
++
++    init(
++        identities: [ZwzIdentityMetadata] = [],
++        contacts: [ZwzPublicIdentity] = [],
++        restorableIdentity: ZwzIdentityMetadata = IdentityManagerTestSupport.identity(
++            name: "Restored Mac", seed: 12
++        )
++    ) {
++        storedIdentities = Dictionary(uniqueKeysWithValues: identities.map { ($0.fingerprint, $0) })
++        storedContacts = Dictionary(uniqueKeysWithValues: contacts.map { ($0.fingerprint, $0) })
++        self.restorableIdentity = restorableIdentity
++    }
++
++    func fail(_ operation: Operation, with error: ZwzV3Error) {
++        lock.withLock { failures[operation] = error }
++    }
++
++    func clearFailure(_ operation: Operation) {
++        _ = lock.withLock { failures.removeValue(forKey: operation) }
++    }
++
++    func setOperationDelay(_ delay: TimeInterval) {
++        lock.withLock { self.delay = delay }
++    }
++
++    func setListingDelay(_ delay: TimeInterval) {
++        lock.withLock { listingDelay = delay }
++    }
++
++    func callCount(_ operation: Operation) -> Int {
++        lock.withLock { calls[operation, default: 0] }
++    }
++
++    func wasCalledOnMainThread(_ operation: Operation) -> Bool {
++        lock.withLock { mainThreadCalls.contains(operation) }
++    }
++
++    func contains(fingerprint: String) -> Bool {
++        lock.withLock {
++            storedIdentities[fingerprint] != nil || storedContacts[fingerprint] != nil
++        }
++    }
++
++    func createIdentity(named name: String) throws -> ZwzIdentityMetadata {
++        try begin(.create)
++        let seed = lock.withLock { () -> UInt8 in
++            defer { nextIdentityIndex += 1 }
++            return UInt8(nextIdentityIndex)
++        }
++        let identity = IdentityManagerTestSupport.identity(name: name, seed: seed)
++        lock.withLock { storedIdentities[identity.fingerprint] = identity }
++        return identity
++    }
++
++    func identities() throws -> [ZwzIdentityMetadata] {
++        try begin(.identities, shouldDelay: false)
++        return lock.withLock {
++            storedIdentities.values.sorted { $0.creationDate < $1.creationDate }
++        }
++    }
++
++    func contacts() throws -> [ZwzPublicIdentity] {
++        try begin(.contacts, shouldDelay: false)
++        return lock.withLock { storedContacts.values.sorted { $0.name < $1.name } }
++    }
++
++    func importPublicIdentity(
++        _ data: Data,
++        conflict: ZwzIdentityConflictPolicy
++    ) throws -> ZwzPublicIdentity {
++        try begin(.importPublic)
++        let incoming = try ZwzKeyFileCodec.decodePublic(data)
++        return try lock.withLock {
++            if let local = storedIdentities[incoming.fingerprint] {
++                guard conflict == .replaceExisting else {
++                    throw ZwzV3Error.identityConflict(incoming.fingerprint)
++                }
++                storedIdentities[incoming.fingerprint] = ZwzIdentityMetadata(
++                    name: incoming.name,
++                    fingerprint: local.fingerprint,
++                    agreementPublicKey: local.agreementPublicKey,
++                    signingPublicKey: local.signingPublicKey,
++                    creationDate: local.creationDate
++                )
++                return incoming
++            }
++            if storedContacts[incoming.fingerprint] != nil,
++               conflict == .requireConfirmation {
++                throw ZwzV3Error.identityConflict(incoming.fingerprint)
++            }
++            storedContacts[incoming.fingerprint] = incoming
++            return incoming
++        }
++    }
++
++    func exportPublicIdentity(fingerprint: String) throws -> Data {
++        try begin(.exportPublic)
++        let identity = try lock.withLock { () throws -> ZwzPublicIdentity in
++            if let local = storedIdentities[fingerprint] { return local.publicIdentity }
++            if let contact = storedContacts[fingerprint] { return contact }
++            throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++        }
++        return try ZwzKeyFileCodec.encodePublic(identity)
++    }
++
++    func exportPrivateBackup(fingerprint: String, password: String) throws -> Data {
++        try begin(.exportBackup)
++        return try lock.withLock {
++            guard storedIdentities[fingerprint] != nil else {
++                throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++            }
++            return encryptedBackup
++        }
++    }
++
++    func importPrivateBackup(
++        _ data: Data,
++        password: String,
++        conflict: ZwzIdentityConflictPolicy
++    ) throws -> ZwzIdentityMetadata {
++        try begin(.restoreBackup)
++        guard data == encryptedBackup, password == "correct horse battery staple" else {
++            throw ZwzV3Error.invalidBackup
++        }
++        return try lock.withLock {
++            if storedIdentities[restorableIdentity.fingerprint] != nil,
++               conflict == .requireConfirmation {
++                throw ZwzV3Error.identityConflict(restorableIdentity.fingerprint)
++            }
++            storedContacts.removeValue(forKey: restorableIdentity.fingerprint)
++            storedIdentities[restorableIdentity.fingerprint] = restorableIdentity
++            return restorableIdentity
++        }
++    }
++
++    func rename(fingerprint: String, to name: String) throws {
++        try begin(.rename)
++        try lock.withLock {
++            if let identity = storedIdentities[fingerprint] {
++                storedIdentities[fingerprint] = ZwzIdentityMetadata(
++                    name: name,
++                    fingerprint: identity.fingerprint,
++                    agreementPublicKey: identity.agreementPublicKey,
++                    signingPublicKey: identity.signingPublicKey,
++                    creationDate: identity.creationDate
++                )
++                return
++            }
++            if var contact = storedContacts[fingerprint] {
++                contact.name = name
++                storedContacts[fingerprint] = contact
++                return
++            }
++            throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++        }
++    }
++
++    func delete(fingerprint: String) throws {
++        try begin(.delete)
++        lock.withLock {
++            storedIdentities.removeValue(forKey: fingerprint)
++            storedContacts.removeValue(forKey: fingerprint)
++        }
++    }
++
++    func agreementPrivateKey(fingerprint: String, reason: String) throws -> Data {
++        rawAgreementPrivateKey
++    }
++
++    func signingPrivateKey(fingerprint: String, reason: String) throws -> Data {
++        rawSigningPrivateKey
++    }
++
++    func isKnownSigningKey(fingerprint: String, signingPublicKey: Data) -> Bool {
++        lock.withLock {
++            storedIdentities[fingerprint]?.signingPublicKey == signingPublicKey
++                || storedContacts[fingerprint]?.signingPublicKey == signingPublicKey
++        }
++    }
++
++    private func begin(_ operation: Operation, shouldDelay: Bool = true) throws {
++        let state = lock.withLock { () -> (ZwzV3Error?, TimeInterval) in
++            calls[operation, default: 0] += 1
++            if Thread.isMainThread { mainThreadCalls.insert(operation) }
++            return (failures[operation], shouldDelay ? delay : listingDelay)
++        }
++        if state.1 > 0 {
++            Thread.sleep(forTimeInterval: state.1)
++        }
++        if let error = state.0 { throw error }
++    }
++}
++
++enum IdentityManagerTestSupport {
++    static func identity(name: String, seed: UInt8) -> ZwzIdentityMetadata {
++        let agreementBytes = Data((0..<32).map { seed &+ UInt8($0) &+ 1 })
++        let signingBytes = Data((0..<32).map { seed &+ UInt8($0) &+ 65 })
++        let agreement = try! Curve25519.KeyAgreement.PrivateKey(
++            rawRepresentation: agreementBytes
++        )
++        let signing = try! Curve25519.Signing.PrivateKey(rawRepresentation: signingBytes)
++        let agreementPublic = agreement.publicKey.rawRepresentation
++        let signingPublic = signing.publicKey.rawRepresentation
++        return ZwzIdentityMetadata(
++            name: name,
++            fingerprint: ZwzV3Crypto.fingerprint(
++                agreement: agreementPublic,
++                signing: signingPublic
++            ),
++            agreementPublicKey: agreementPublic,
++            signingPublicKey: signingPublic,
++            creationDate: Date(timeIntervalSince1970: TimeInterval(seed))
++        )
++    }
++
++    static func contact(name: String, seed: UInt8) -> ZwzPublicIdentity {
++        identity(name: name, seed: seed).publicIdentity
++    }
++
++    @MainActor
++    static func modelWithIdentity(
++        onRestore: (@MainActor @Sendable () -> Void)? = nil
++    ) async throws -> (IdentityManagerViewModel, IdentityManagerControlledStore) {
++        let identity = identity(name: "Alice", seed: 1)
++        let store = IdentityManagerControlledStore(identities: [identity])
++        let model = IdentityManagerViewModel(store: store, onPrivateRestore: onRestore)
++        try await model.refresh()
++        return (model, store)
++    }
++
++    @MainActor
++    static func capturedError<T>(
++        _ operation: @MainActor () async throws -> T
++    ) async -> Error? {
++        do {
++            _ = try await operation()
++            return nil
++        } catch {
++            return error
++        }
++    }
++}
+diff --git a/Tests/ZwzGUITests/IdentityManagerViewModelTests.swift b/Tests/ZwzGUITests/IdentityManagerViewModelTests.swift
+new file mode 100644
+index 0000000..8e3f517
+--- /dev/null
++++ b/Tests/ZwzGUITests/IdentityManagerViewModelTests.swift
+@@ -0,0 +1,469 @@
++import Foundation
++import XCTest
++import ZwzCore
++@testable import ZwzGUI
++
++@MainActor
++final class IdentityManagerViewModelTests: XCTestCase {
++    func testSettingsSidebarIncludesKeysWithoutTouchingStoreOnConstruction() {
++        let store = IdentityManagerControlledStore()
++        let model = IdentityManagerViewModel(store: store)
++
++        XCTAssertTrue(ZWZSettingsView.SettingsTab.allCases.contains(.keys))
++        _ = IdentityManagerView(model: model)
++
++        XCTAssertEqual(store.callCount(.identities), 0)
++        XCTAssertEqual(store.callCount(.contacts), 0)
++    }
++
++    func testInitialRefreshManualNonblankCreateAndSeparation() async throws {
++        let local = IdentityManagerTestSupport.identity(name: "Alice", seed: 1)
++        let contact = IdentityManagerTestSupport.contact(name: "Bob", seed: 2)
++        let store = IdentityManagerControlledStore(identities: [local], contacts: [contact])
++        let model = IdentityManagerViewModel(store: store)
++
++        try await model.refresh()
++
++        XCTAssertEqual(model.identities, [local])
++        XCTAssertEqual(model.contacts, [contact])
++        XCTAssertNil(model.selection)
++
++        let blankError = await IdentityManagerTestSupport.capturedError {
++            try await model.createIdentity(named: "   \n")
++        }
++        XCTAssertEqual(blankError as? IdentityManagerViewModelError, .invalidName)
++        XCTAssertEqual(store.callCount(.create), 0)
++
++        try await model.createIdentity(named: "New Mac")
++
++        XCTAssertEqual(model.identities.count, 2)
++        XCTAssertEqual(model.contacts, [contact])
++        XCTAssertEqual(model.selectedName, "New Mac")
++        XCTAssertTrue(model.selectedIsLocalIdentity)
++    }
++
++    func testRenamePreservesFingerprintAndPublicKeys() async throws {
++        let (model, _) = try await IdentityManagerTestSupport.modelWithIdentity()
++        let original = try XCTUnwrap(model.identities.first)
++
++        try await model.rename(fingerprint: original.fingerprint, to: "Work Mac")
++
++        let renamed = try XCTUnwrap(model.identities.first)
++        XCTAssertEqual(renamed.name, "Work Mac")
++        XCTAssertEqual(renamed.fingerprint, original.fingerprint)
++        XCTAssertEqual(renamed.agreementPublicKey, original.agreementPublicKey)
++        XCTAssertEqual(renamed.signingPublicKey, original.signingPublicKey)
++        XCTAssertEqual(renamed.creationDate, original.creationDate)
++    }
++
++    func testDeleteRequiresRequestAndConfirmationAndCanBeCancelled() async throws {
++        let (model, store) = try await IdentityManagerTestSupport.modelWithIdentity()
++        let identity = try XCTUnwrap(model.identities.first)
++
++        model.requestDelete(identity)
++
++        XCTAssertTrue(store.contains(fingerprint: identity.fingerprint))
++        XCTAssertEqual(model.pendingDeletion?.kind, .localIdentity)
++        XCTAssertTrue(model.pendingDeletion?.requiresPermanentLossWarning == true)
++
++        model.cancelDelete()
++        XCTAssertNil(model.pendingDeletion)
++        XCTAssertTrue(store.contains(fingerprint: identity.fingerprint))
++
++        let contact = IdentityManagerTestSupport.contact(name: "Bob", seed: 2)
++        model.requestDelete(contact)
++        XCTAssertEqual(model.pendingDeletion?.kind, .contact)
++        XCTAssertFalse(model.pendingDeletion?.requiresPermanentLossWarning == true)
++        model.cancelDelete()
++
++        model.requestDelete(identity)
++        try await model.confirmDelete()
++
++        XCTAssertFalse(store.contains(fingerprint: identity.fingerprint))
++        XCTAssertTrue(model.identities.isEmpty)
++        XCTAssertNil(model.pendingDeletion)
++    }
++
++    func testPublicImportExportConflictAndExplicitReplacement() async throws {
++        let contact = IdentityManagerTestSupport.contact(name: "Bob", seed: 2)
++        let store = IdentityManagerControlledStore(contacts: [contact])
++        let model = IdentityManagerViewModel(store: store)
++        try await model.refresh()
++        var renamed = contact
++        renamed.name = "Bob Updated"
++        let data = try ZwzKeyFileCodec.encodePublic(renamed)
++
++        let conflictError = await IdentityManagerTestSupport.capturedError {
++            try await model.importPublicIdentity(data)
++        }
++
++        XCTAssertEqual(
++            conflictError as? ZwzV3Error,
++            .identityConflict(contact.fingerprint)
++        )
++        XCTAssertEqual(
++            model.pendingConflict,
++            IdentityManagerConflict(kind: .publicImport, fingerprint: contact.fingerprint)
++        )
++
++        try await model.importPublicIdentity(data, conflict: .replaceExisting)
++
++        XCTAssertNil(model.pendingConflict)
++        XCTAssertEqual(model.contacts.first?.name, "Bob Updated")
++        let exported = try await model.exportPublicIdentity(fingerprint: contact.fingerprint)
++        XCTAssertEqual(try ZwzKeyFileCodec.decodePublic(exported), renamed)
++    }
++
++    func testBackupValidationPrecedesStoreAndOutputContainsNoRawPrivateKeys() async throws {
++        let (model, store) = try await IdentityManagerTestSupport.modelWithIdentity()
++        let fingerprint = try XCTUnwrap(model.identities.first?.fingerprint)
++
++        let emptyError = await IdentityManagerTestSupport.capturedError {
++            try await model.exportPrivateBackup(
++                fingerprint: fingerprint,
++                password: "",
++                confirmation: ""
++            )
++        }
++        XCTAssertEqual(emptyError as? IdentityManagerViewModelError, .emptyPassword)
++
++        let mismatchError = await IdentityManagerTestSupport.capturedError {
++            try await model.exportPrivateBackup(
++                fingerprint: fingerprint,
++                password: "one",
++                confirmation: "two"
++            )
++        }
++        XCTAssertEqual(
++            mismatchError as? IdentityManagerViewModelError,
++            .passwordConfirmationMismatch
++        )
++        XCTAssertEqual(store.callCount(.exportBackup), 0)
++
++        let backup = try await model.exportPrivateBackup(
++            fingerprint: fingerprint,
++            password: "matching password",
++            confirmation: "matching password"
++        )
++
++        XCTAssertNil(backup.range(of: store.rawAgreementPrivateKey))
++        XCTAssertNil(backup.range(of: store.rawSigningPrivateKey))
++        XCTAssertEqual(store.callCount(.exportBackup), 1)
++        XCTAssertFalse(store.wasCalledOnMainThread(.exportBackup))
++    }
++
++    func testRestoreFailuresAndCancellationNeverResumePendingAction() async throws {
++        var resumeCount = 0
++        let restorable = IdentityManagerTestSupport.identity(name: "Restored Mac", seed: 12)
++        let store = IdentityManagerControlledStore(
++            identities: [restorable],
++            restorableIdentity: restorable
++        )
++        let model = IdentityManagerViewModel(store: store) { resumeCount += 1 }
++
++        let wrongPassword = await IdentityManagerTestSupport.capturedError {
++            try await model.restorePrivateBackup(
++                store.encryptedBackup,
++                password: "wrong password"
++            )
++        }
++        XCTAssertEqual(wrongPassword as? ZwzV3Error, .invalidBackup)
++        XCTAssertEqual(resumeCount, 0)
++
++        store.fail(.restoreBackup, with: .userAuthenticationCancelled)
++        let cancellation = await IdentityManagerTestSupport.capturedError {
++            try await model.restorePrivateBackup(
++                store.encryptedBackup,
++                password: "correct horse battery staple"
++            )
++        }
++        XCTAssertEqual(cancellation as? ZwzV3Error, .userAuthenticationCancelled)
++        XCTAssertEqual(resumeCount, 0)
++
++        store.clearFailure(.restoreBackup)
++        let conflict = await IdentityManagerTestSupport.capturedError {
++            try await model.restorePrivateBackup(
++                store.encryptedBackup,
++                password: "correct horse battery staple"
++            )
++        }
++        XCTAssertEqual(
++            conflict as? ZwzV3Error,
++            .identityConflict(store.restorableIdentity.fingerprint)
++        )
++        XCTAssertEqual(resumeCount, 0)
++        XCTAssertNotNil(model.pendingConflict)
++        model.cancelConflict()
++        XCTAssertNil(model.pendingConflict)
++        XCTAssertEqual(resumeCount, 0)
++    }
++
++    func testSuccessfulRestoreResumesExactlyOnceAndRefreshes() async throws {
++        var resumeCount = 0
++        let store = IdentityManagerControlledStore()
++        let model = IdentityManagerViewModel(store: store) { resumeCount += 1 }
++        try await model.refresh()
++
++        let restored = try await model.restorePrivateBackup(
++            store.encryptedBackup,
++            password: "correct horse battery staple"
++        )
++
++        XCTAssertEqual(restored, store.restorableIdentity)
++        XCTAssertEqual(model.identities, [store.restorableIdentity])
++        XCTAssertEqual(model.selection, .localIdentity(store.restorableIdentity.fingerprint))
++        XCTAssertEqual(resumeCount, 1)
++
++        _ = try await model.restorePrivateBackup(
++            store.encryptedBackup,
++            password: "correct horse battery staple",
++            conflict: .replaceExisting
++        )
++        XCTAssertEqual(resumeCount, 1)
++    }
++
++    func testAuthenticationCancellationAndKeychainFailureMessagesStayDistinct() async throws {
++        let (model, store) = try await IdentityManagerTestSupport.modelWithIdentity()
++        let fingerprint = try XCTUnwrap(model.identities.first?.fingerprint)
++        store.fail(.exportBackup, with: .userAuthenticationCancelled)
++
++        _ = await IdentityManagerTestSupport.capturedError {
++            try await model.exportPrivateBackup(
++                fingerprint: fingerprint,
++                password: "password",
++                confirmation: "password"
++            )
++        }
++        let cancellationMessage = try XCTUnwrap(model.errorMessage)
++        XCTAssertFalse(cancellationMessage.isEmpty)
++
++        store.fail(.exportBackup, with: .keychainFailure(-25308))
++        _ = await IdentityManagerTestSupport.capturedError {
++            try await model.exportPrivateBackup(
++                fingerprint: fingerprint,
++                password: "password",
++                confirmation: "password"
++            )
++        }
++        let keychainMessage = try XCTUnwrap(model.errorMessage)
++        XCTAssertTrue(keychainMessage.contains("-25308"))
++        XCTAssertNotEqual(keychainMessage, cancellationMessage)
++    }
++
++    func testBusyRejectsOverlappingMutationAndStoreWorkRunsOffMainThread() async throws {
++        let identity = IdentityManagerTestSupport.identity(name: "Alice", seed: 1)
++        let store = IdentityManagerControlledStore(identities: [identity])
++        store.setOperationDelay(0.15)
++        let model = IdentityManagerViewModel(store: store)
++        try await model.refresh()
++
++        let createTask = Task { @MainActor in
++            try await model.createIdentity(named: "Second Mac")
++        }
++        while store.callCount(.create) == 0 { await Task.yield() }
++
++        let overlap = await IdentityManagerTestSupport.capturedError {
++            try await model.rename(fingerprint: identity.fingerprint, to: "Renamed")
++        }
++        XCTAssertEqual(overlap as? IdentityManagerViewModelError, .operationInProgress)
++        _ = try await createTask.value
++
++        XCTAssertFalse(store.wasCalledOnMainThread(.create))
++        XCTAssertFalse(store.wasCalledOnMainThread(.identities))
++        XCTAssertEqual(store.callCount(.rename), 0)
++        XCTAssertFalse(model.isBusy)
++    }
++
++    func testLoadingRejectsMutationSoRefreshCannotOverwriteNewState() async throws {
++        let identity = IdentityManagerTestSupport.identity(name: "Alice", seed: 1)
++        let store = IdentityManagerControlledStore(identities: [identity])
++        store.setListingDelay(0.15)
++        let model = IdentityManagerViewModel(store: store)
++
++        let refreshTask = Task { @MainActor in
++            try await model.refresh()
++        }
++        while store.callCount(.identities) == 0 { await Task.yield() }
++
++        XCTAssertTrue(model.isLoading)
++        let overlap = await IdentityManagerTestSupport.capturedError {
++            try await model.createIdentity(named: "Second Mac")
++        }
++        XCTAssertEqual(overlap as? IdentityManagerViewModelError, .operationInProgress)
++        XCTAssertEqual(store.callCount(.create), 0)
++
++        try await refreshTask.value
++        XCTAssertEqual(model.identities, [identity])
++        XCTAssertFalse(model.isLoading)
++    }
++
++    func testCancelledRefreshDoesNotPublishLateSnapshotOrError() async {
++        let identity = IdentityManagerTestSupport.identity(name: "Alice", seed: 1)
++        let store = IdentityManagerControlledStore(identities: [identity])
++        store.setListingDelay(0.1)
++        let model = IdentityManagerViewModel(store: store)
++
++        let refreshTask = Task { @MainActor in
++            try await model.refresh()
++        }
++        while store.callCount(.identities) == 0 { await Task.yield() }
++        refreshTask.cancel()
++        _ = await refreshTask.result
++
++        XCTAssertTrue(model.identities.isEmpty)
++        XCTAssertTrue(model.contacts.isEmpty)
++        XCTAssertNil(model.errorMessage)
++        XCTAssertFalse(model.isLoading)
++    }
++
++    func testSuccessfulCreateIsCommittedWhenFollowingListingFails() async throws {
++        let store = IdentityManagerControlledStore()
++        store.fail(.identities, with: .keychainFailure(-50))
++        let model = IdentityManagerViewModel(store: store)
++
++        let created = try await model.createIdentity(named: "Offline List Mac")
++
++        XCTAssertTrue(store.contains(fingerprint: created.fingerprint))
++        XCTAssertEqual(model.identities, [created])
++        XCTAssertEqual(model.selection, .localIdentity(created.fingerprint))
++        XCTAssertNotNil(model.successMessage)
++        XCTAssertNotNil(model.errorMessage)
++        XCTAssertEqual(store.callCount(.create), 1)
++    }
++
++    func testSuccessfulRestoreResumesOnceWhenFollowingListingFails() async throws {
++        var resumeCount = 0
++        let store = IdentityManagerControlledStore()
++        store.fail(.identities, with: .keychainFailure(-50))
++        let model = IdentityManagerViewModel(store: store) { resumeCount += 1 }
++
++        let restored = try await model.restorePrivateBackup(
++            store.encryptedBackup,
++            password: "correct horse battery staple"
++        )
++
++        XCTAssertEqual(restored, store.restorableIdentity)
++        XCTAssertEqual(model.identities, [store.restorableIdentity])
++        XCTAssertEqual(resumeCount, 1)
++        XCTAssertNotNil(model.successMessage)
++        XCTAssertNotNil(model.errorMessage)
++        XCTAssertFalse(store.wasCalledOnMainThread(.restoreBackup))
++
++        _ = try await model.restorePrivateBackup(
++            store.encryptedBackup,
++            password: "correct horse battery staple",
++            conflict: .replaceExisting
++        )
++        XCTAssertEqual(resumeCount, 1)
++    }
++
++    func testKeyFileSizeValidationUsesCheckedSixteenMiBBoundary() throws {
++        XCTAssertNoThrow(try IdentityManagerKeyFileIO.validateFileSize(
++            IdentityManagerKeyFileIO.maximumKeyFileBytes
++        ))
++        XCTAssertThrowsError(try IdentityManagerKeyFileIO.validateFileSize(
++            IdentityManagerKeyFileIO.maximumKeyFileBytes + 1
++        )) {
++            XCTAssertEqual(
++                $0 as? IdentityManagerFileError,
++                .fileTooLarge(maximumBytes: IdentityManagerKeyFileIO.maximumKeyFileBytes)
++            )
++        }
++        XCTAssertThrowsError(try IdentityManagerKeyFileIO.validateFileSize(-1)) {
++            XCTAssertEqual($0 as? IdentityManagerFileError, .invalidFileSize)
++        }
++    }
++
++    func testReadKeyFileDataIsUnaffectedByLaterSourceMutation() throws {
++        let url = FileManager.default.temporaryDirectory.appendingPathComponent(
++            "IdentityManager-owned-data-\(UUID().uuidString).zwzpub"
++        )
++        defer { try? FileManager.default.removeItem(at: url) }
++        let original = Data("original-key-file".utf8)
++        try original.write(to: url)
++
++        let loaded = try IdentityManagerKeyFileIO.readData(from: url)
++        try Data("modified-source!!".utf8).write(to: url)
++
++        XCTAssertEqual(loaded, original)
++    }
++
++    func testSlowRestoreRejectsRepeatedConfirmationAndResumesOnce() async throws {
++        var resumeCount = 0
++        let store = IdentityManagerControlledStore()
++        store.setOperationDelay(0.15)
++        let model = IdentityManagerViewModel(store: store) { resumeCount += 1 }
++
++        let restoreTask = Task { @MainActor in
++            try await model.restorePrivateBackup(
++                store.encryptedBackup,
++                password: "correct horse battery staple"
++            )
++        }
++        while store.callCount(.restoreBackup) == 0 { await Task.yield() }
++
++        XCTAssertTrue(model.isBusy)
++        let overlap = await IdentityManagerTestSupport.capturedError {
++            try await model.restorePrivateBackup(
++                store.encryptedBackup,
++                password: "correct horse battery staple"
++            )
++        }
++        XCTAssertEqual(overlap as? IdentityManagerViewModelError, .operationInProgress)
++        _ = try await restoreTask.value
++
++        XCTAssertEqual(store.callCount(.restoreBackup), 1)
++        XCTAssertEqual(resumeCount, 1)
++        XCTAssertFalse(store.wasCalledOnMainThread(.restoreBackup))
++    }
++
++    func testSlowDeleteRejectsRepeatedConfirmation() async throws {
++        let identity = IdentityManagerTestSupport.identity(name: "Alice", seed: 1)
++        let store = IdentityManagerControlledStore(identities: [identity])
++        let model = IdentityManagerViewModel(store: store)
++        try await model.refresh()
++        model.requestDelete(identity)
++        store.setOperationDelay(0.15)
++
++        let deleteTask = Task { @MainActor in
++            try await model.confirmDelete()
++        }
++        while store.callCount(.delete) == 0 { await Task.yield() }
++
++        XCTAssertTrue(model.isBusy)
++        let overlap = await IdentityManagerTestSupport.capturedError {
++            try await model.confirmDelete()
++        }
++        XCTAssertEqual(overlap as? IdentityManagerViewModelError, .operationInProgress)
++        try await deleteTask.value
++
++        XCTAssertEqual(store.callCount(.delete), 1)
++        XCTAssertFalse(store.contains(fingerprint: identity.fingerprint))
++        XCTAssertNil(model.pendingDeletion)
++    }
++
++    func testCancelAndDismissClearConflictErrorsAndMessages() async throws {
++        let contact = IdentityManagerTestSupport.contact(name: "Bob", seed: 2)
++        let store = IdentityManagerControlledStore(contacts: [contact])
++        let model = IdentityManagerViewModel(store: store)
++        try await model.refresh()
++        let data = try ZwzKeyFileCodec.encodePublic(contact)
++
++        _ = await IdentityManagerTestSupport.capturedError {
++            try await model.importPublicIdentity(data)
++        }
++        XCTAssertNotNil(model.pendingConflict)
++        model.cancelConflict()
++        XCTAssertNil(model.pendingConflict)
++
++        store.fail(.create, with: .keychainFailure(-50))
++        _ = await IdentityManagerTestSupport.capturedError {
++            try await model.createIdentity(named: "Failing Mac")
++        }
++        XCTAssertNotNil(model.errorMessage)
++        model.clearTransientState()
++        XCTAssertNil(model.errorMessage)
++        XCTAssertNil(model.successMessage)
++        XCTAssertNil(model.pendingConflict)
++    }
++}

@@ -11,6 +11,37 @@ final class WorkspaceViewModelTests: XCTestCase {
         XCTAssertEqual(workspace.tabs[0].kind, .empty)
     }
 
+    func testSuccessfulCompressionRestoresSameTabAndAcceptsNextItemWithoutPrompt() throws {
+        let workspace = WorkspaceViewModel()
+        let tab = workspace.selectedTab
+        let originalID = tab.id
+        tab.kind = .compressionSource
+        tab.viewModel.sourcePath = "/tmp/first-source"
+        tab.viewModel.history.append(ZWZHistoryItem(
+            type: .compress,
+            fileName: "first-source",
+            statusText: "成功",
+            isSuccess: true
+        ))
+
+        let completion = try XCTUnwrap(tab.viewModel.onCompressionSucceeded)
+        completion()
+
+        XCTAssertEqual(tab.id, originalID)
+        XCTAssertEqual(tab.kind, .empty)
+        XCTAssertNil(tab.viewModel.sourcePath)
+        XCTAssertEqual(tab.title, L.string("new_tab"))
+        XCTAssertEqual(tab.viewModel.history.count, 1)
+
+        workspace.requestOpen(
+            url: URL(fileURLWithPath: "/tmp/next-source"),
+            intent: .automatic
+        )
+
+        XCTAssertNil(workspace.pendingOpenRequest)
+        XCTAssertEqual(tab.viewModel.sourcePath, "/tmp/next-source")
+    }
+
     func testNewTabIsIndependentAndSelected() {
         let workspace = WorkspaceViewModel()
         let first = workspace.tabs[0]

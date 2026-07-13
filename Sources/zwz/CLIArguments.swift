@@ -17,11 +17,12 @@ enum CLIArguments: Equatable {
     case extract(ExtractArguments)
     case list(ListArguments)
     case key(KeyArguments)
+    case rename(RenameArguments)
 
     static func parse(_ arguments: [String]) throws -> CLIArguments {
         guard let first = arguments.first else { return .help }
         let rest = Array(arguments.dropFirst())
-        if ["c", "compress", "x", "extract", "l", "list"].contains(first.lowercased()),
+        if ["c", "compress", "x", "extract", "l", "list", "rename"].contains(first.lowercased()),
            rest == ["-h"] || rest == ["--help"] {
             return .help
         }
@@ -33,6 +34,7 @@ enum CLIArguments: Equatable {
         case "x", "extract": return .extract(try ExtractArguments.parse(rest))
         case "l", "list": return .list(try ListArguments.parse(rest))
         case "key": return .key(try KeyArguments.parse(rest))
+        case "rename": return .rename(try RenameArguments.parse(rest))
         default: throw CLIParseError.invalid("Unknown command '\(first)'")
         }
     }
@@ -420,7 +422,201 @@ enum ZwzCLI {
             }
             dependencies.output("Total: \(listing.entries.count)")
             printSignature(listing.securityInfo?.signature, output: dependencies.output)
+        case .rename(let arguments):
+            try executeRename(arguments, dependencies: dependencies)
         }
+    }
+
+    private static func executeRename(_ arguments: RenameArguments, dependencies: ZwzCLIDependencies) throws {
+        // 1. List archive contents
+        let listing = try dependencies.archives.list(
+            archive: arguments.archive, password: arguments.password,
+            keyProvider: dependencies.identityStore
+        )
+
+        // 2. Filter entries (only top-level items, or apply filter)
+        var entries = listing.entries.filter { entry in
+            // Only rename top-level items (no "/" in path after root)
+            let path = entry.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            return !path.contains("/")
+        }.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        if let filterPattern = arguments.filter {
+            let filter = globRegex(pattern: filterPattern)
+            entries = entries.filter { entry in
+                matchesGlob(entry.name, regex: filter)
+            }
+        }
+
+        guard !entries.isEmpty else {
+            dependencies.output("No items to rename.")
+            return
+        }
+
+        // 3. Compute batch rename results
+        let config = BatchRenameConfig(rule: arguments.rule, includeExtension: arguments.includeExtension)
+        let inputEntries = entries.map { (name: $0.name, isDirectory: $0.isDirectory) }
+        let results = try BatchRenameEngine.compute(entries: inputEntries, config: config)
+
+        // 4. Print preview
+        dependencies.output("Batch rename preview (\(results.count) items):")
+        for (index, item) in results.enumerated() {
+            let original = entries[index].path
+            if item.originalName == item.finalName {
+                dependencies.output("  \(original)  →  \(item.finalName)  (no change)")
+            } else if item.hasConflict {
+                dependencies.output("  \(original)  →  \(item.finalName)  (conflict auto-numbered)")
+            } else {
+                dependencies.output("  \(original)  →  \(item.finalName)")
+            }
+        }
+
+        if arguments.dryRun {
+            dependencies.output("\nDry run — no changes made.")
+            return
+        }
+
+        // 5. Extract to temp, rename files, repack
+        let tempDir = dependencies.fileManager.temporaryDirectory
+            .appendingPathComponent("zwz-rename-\(UUID().uuidString)", isDirectory: true)
+        try dependencies.fileManager.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? dependencies.fileManager.removeItem(at: tempDir) }
+
+        // Extract
+        _ = try dependencies.archives.extract(
+            archive: arguments.archive, destination: tempDir.path,
+            password: arguments.password, keyProvider: dependencies.identityStore
+        )
+
+        let renames = zip(entries, results).compactMap { entry, item -> (source: URL, destination: URL)? in
+            guard item.originalName != item.finalName else { return nil }
+            let source = tempDir.appendingPathComponent(entry.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")))
+            return (source, source.deletingLastPathComponent().appendingPathComponent(item.finalName))
+        }
+        try applyFileRenames(renames, fileManager: dependencies.fileManager)
+
+        // 6. Repack - detect format and compress back
+        let archiveURL = URL(fileURLWithPath: arguments.archive)
+        let ext = archiveURL.pathExtension.lowercased()
+        let format: CompressionFormat = ext == "zwz" ? .zwz : .zip
+        let encryption = try renameEncryption(
+            securityInfo: listing.securityInfo,
+            password: arguments.password,
+            identityStore: dependencies.identityStore
+        )
+        let options = CompressionOptions(level: .normal, encryption: encryption, aes256: true, format: format)
+        _ = try dependencies.archives.compress(
+            source: tempDir.path, destination: arguments.archive,
+            options: options, keyProvider: dependencies.identityStore
+        )
+
+        dependencies.output("\nApplied \(results.filter { $0.originalName != $0.finalName }.count) renames to \(archiveURL.lastPathComponent).")
+    }
+
+    private static func renameEncryption(
+        securityInfo: ZwzArchiveSecurityInfo?,
+        password: String?,
+        identityStore: any ZwzIdentityStore
+    ) throws -> ZwzEncryptionMode {
+        guard let securityInfo else {
+            return password.map(ZwzEncryptionMode.password) ?? .none
+        }
+        switch securityInfo.encryption {
+        case .none:
+            return .none
+        case .password:
+            guard let password, !password.isEmpty else {
+                throw CLIParseError.invalid("The original archive password is required to preserve encryption")
+            }
+            return .password(password)
+        case .publicKey:
+            let recipients = try securityInfo.recipientFingerprints.map { fingerprint in
+                let identity = try resolveAny(fingerprint, store: identityStore)
+                return ZwzRecipient(
+                    name: identity.name,
+                    fingerprint: identity.fingerprint,
+                    agreementPublicKey: identity.agreementPublicKey
+                )
+            }
+            let signerFingerprint: String?
+            switch securityInfo.signature {
+            case .unsigned:
+                signerFingerprint = nil
+            case .validKnownSigner(_, let fingerprint), .validUnknownSigner(_, let fingerprint):
+                signerFingerprint = fingerprint
+            case .invalid:
+                throw ZwzV3Error.invalidSignature
+            }
+            let signer: ZwzSigningIdentity?
+            if let signerFingerprint {
+                let identity = try resolveLocal(signerFingerprint, store: identityStore)
+                signer = ZwzSigningIdentity(
+                    name: identity.name,
+                    fingerprint: identity.fingerprint,
+                    agreementPublicKey: identity.agreementPublicKey,
+                    signingPublicKey: identity.signingPublicKey
+                )
+            } else {
+                signer = nil
+            }
+            return .publicKey(recipients: recipients, signer: signer)
+        }
+    }
+
+    private static func applyFileRenames(
+        _ renames: [(source: URL, destination: URL)],
+        fileManager: FileManager
+    ) throws {
+        let staged = renames.map { item in
+            (
+                source: item.source,
+                temporary: item.source.deletingLastPathComponent()
+                    .appendingPathComponent(".zwz-batch-rename-\(UUID().uuidString)"),
+                destination: item.destination
+            )
+        }
+        var stagedCount = 0
+        do {
+            for item in staged {
+                try fileManager.moveItem(at: item.source, to: item.temporary)
+                stagedCount += 1
+            }
+        } catch {
+            for item in staged.prefix(stagedCount).reversed() {
+                try? fileManager.moveItem(at: item.temporary, to: item.source)
+            }
+            throw error
+        }
+
+        var completedCount = 0
+        do {
+            for item in staged {
+                try fileManager.moveItem(at: item.temporary, to: item.destination)
+                completedCount += 1
+            }
+        } catch {
+            for item in staged.prefix(completedCount).reversed() {
+                try? fileManager.moveItem(at: item.destination, to: item.source)
+            }
+            for item in staged.dropFirst(completedCount).reversed() {
+                try? fileManager.moveItem(at: item.temporary, to: item.source)
+            }
+            throw error
+        }
+    }
+
+    private static func globRegex(pattern: String) -> NSRegularExpression? {
+        // Simple glob: * matches any, ? matches single char
+        let expression = pattern
+            .replacingOccurrences(of: ".", with: "\\.")
+            .replacingOccurrences(of: "*", with: ".*")
+            .replacingOccurrences(of: "?", with: ".")
+        return try? NSRegularExpression(pattern: "^\(expression)$")
+    }
+
+    private static func matchesGlob(_ name: String, regex: NSRegularExpression?) -> Bool {
+        guard let regex else { return false }
+        let range = NSRange(name.startIndex..<name.endIndex, in: name)
+        return regex.firstMatch(in: name, range: range) != nil
     }
 
     private static func executeCompress(_ arguments: CompressArguments, dependencies: ZwzCLIDependencies) throws {
@@ -622,12 +818,14 @@ enum ZwzCLI {
       zwz compress [options] <source-path> [output-path]
       zwz extract [options] <archive-path> [output-directory]
       zwz list [options] <archive-path>
+      zwz rename [options] <archive-path>
       zwz key <operation> [options]
 
     Commands:
       c, compress    Create an archive
       x, extract     Extract an archive
       l, list        List archive contents
+      rename         Batch rename archive entries
       h, help        Show this help
 
     Compression options:
@@ -644,6 +842,21 @@ enum ZwzCLI {
 
     Extract and list options:
       -p, --password <password>                 Password for a password-encrypted archive
+
+    Batch rename options:
+      --rule <find-replace|prefix-suffix|numbering|regex-replace|case-conversion>
+                                                Rename rule (required)
+      --find <text> --replace <text>             Find-and-replace parameters
+      --prefix <text> --suffix <text>            Prefix/suffix parameters
+      --start <n> --step <n> --digits <n>        Numbering parameters
+      --numbering-prefix <text>                  Prefix for simple numbering
+      --numbering-template <template>            Numbering template, such as {seq:3}_photo
+      --pattern <regex> --template <template>    Regular-expression parameters
+      --case-mode <upper|lower|title|camel|snake>
+      --include-extension                        Include the extension in rule matching
+      --filter <glob>                            Rename matching top-level entries only
+      --dry-run                                  Preview without modifying the archive
+      -p, --password <password>                  Password for a password-encrypted archive
 
     Key commands:
       key create <name>

@@ -67,6 +67,16 @@ final class ArchiveViewModelSearchTests: XCTestCase {
         XCTAssertTrue(viewModel.previewEntries.isEmpty)
     }
 
+    func testDirectoryDisplaySizeCacheRefreshesWithArchiveEntries() {
+        let viewModel = makeViewModel()
+        let docs = entries[0]
+        viewModel.setArchiveEntries(entries)
+        XCTAssertEqual(viewModel.displaySize(for: docs), 1_152)
+
+        viewModel.setArchiveEntries([docs])
+        XCTAssertEqual(viewModel.displaySize(for: docs), 0)
+    }
+
     func testClearingSearchRestoresPreservedDirectory() {
         let viewModel = makeViewModel()
         viewModel.currentDir = "Docs/"

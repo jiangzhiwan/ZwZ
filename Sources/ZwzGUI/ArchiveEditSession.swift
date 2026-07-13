@@ -168,6 +168,68 @@ final class ArchiveEditSession {
         hasChanges = true
     }
 
+    func batchRename(items: [(sourcePath: String, newName: String)]) throws {
+        guard !items.isEmpty else { return }
+        var validated: [(source: URL, destination: URL)] = []
+        for item in items {
+            guard !item.newName.isEmpty, !item.newName.contains("/"),
+                  item.newName != ".", item.newName != ".." else {
+                throw ArchiveEditorError.invalidPath
+            }
+            let source = try safeURL(for: item.sourcePath)
+            let destination = source.deletingLastPathComponent().appendingPathComponent(item.newName)
+            guard source.standardizedFileURL != destination.standardizedFileURL else { continue }
+            validated.append((source.standardizedFileURL, destination.standardizedFileURL))
+        }
+
+        guard !validated.isEmpty else { return }
+        let sourcePaths = Set(validated.map { $0.source.path })
+        guard sourcePaths.count == validated.count,
+              Set(validated.map { $0.destination.path }).count == validated.count else {
+            throw CocoaError(.fileWriteFileExists)
+        }
+        for item in validated where fileManager.fileExists(atPath: item.destination.path) {
+            guard sourcePaths.contains(item.destination.path) else {
+                throw CocoaError(.fileWriteFileExists)
+            }
+        }
+
+        let staged = validated.map { item in
+            let temporary = item.source.deletingLastPathComponent()
+                .appendingPathComponent(".zwz-batch-rename-\(UUID().uuidString)")
+            return (source: item.source, temporary: temporary, destination: item.destination)
+        }
+        var stagedCount = 0
+        do {
+            for item in staged {
+                try fileManager.moveItem(at: item.source, to: item.temporary)
+                stagedCount += 1
+            }
+        } catch {
+            for item in staged.prefix(stagedCount).reversed() {
+                try? fileManager.moveItem(at: item.temporary, to: item.source)
+            }
+            throw error
+        }
+
+        var completedCount = 0
+        do {
+            for item in staged {
+                try fileManager.moveItem(at: item.temporary, to: item.destination)
+                completedCount += 1
+            }
+        } catch {
+            for item in staged.prefix(completedCount).reversed() {
+                try? fileManager.moveItem(at: item.destination, to: item.source)
+            }
+            for item in staged.dropFirst(completedCount).reversed() {
+                try? fileManager.moveItem(at: item.temporary, to: item.source)
+            }
+            throw error
+        }
+        hasChanges = true
+    }
+
     func replace(path: String, with sourceURL: URL) throws {
         let destination = try safeURL(for: path)
         if fileManager.contentsEqual(atPath: sourceURL.path, andPath: destination.path) { return }
@@ -357,6 +419,10 @@ final class DefaultArchiveEditWorkflowClient: ArchiveEditWorkflowClient, @unchec
 
     func rename(path: String, to newName: String) throws {
         try currentSession().rename(path: path, to: newName)
+    }
+
+    func batchRename(items: [(sourcePath: String, newName: String)]) throws {
+        try currentSession().batchRename(items: items)
     }
 
     func replace(path: String, with sourceURL: URL) throws {

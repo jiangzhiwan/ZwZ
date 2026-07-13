@@ -5,6 +5,18 @@ import XCTest
 
 @MainActor
 final class ArchiveEditorWindowPresenterTests: XCTestCase {
+    func testPresenterDoesNotBlockMainQueueWithApplicationModalLoop() throws {
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/ZwzGUI/ArchiveEditorWindowPresenter.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+
+        XCTAssertFalse(source.contains("NSApp.runModal"))
+        XCTAssertFalse(source.contains("NSApp.stopModal"))
+    }
+
     func testPresenterCreatesMovableTitledWindowAndDismissesIt() throws {
         var isPresented = true
         let binding = Binding(

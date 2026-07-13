@@ -183,14 +183,20 @@ public final class ZwzExtractor {
     }
 
     static func archiveEntries(from entries: [ZwzV2Entry]) -> [ArchiveEntry] {
-        let directorySizes = entries
-            .filter { $0.type == .directory }
-            .reduce(into: [String: Int64]()) { result, directory in
-                let prefix = directory.path + "/"
-                result[directory.path] = entries
-                    .filter { $0.type == .file && $0.path.hasPrefix(prefix) }
-                    .reduce(0) { $0 + Int64(clamping: $1.originalSize) }
+        let directoryPaths = Set(entries.lazy.filter { $0.type == .directory }.map(\.path))
+        var directorySizes = Dictionary(
+            uniqueKeysWithValues: directoryPaths.map { ($0, Int64(0)) }
+        )
+        for entry in entries where entry.type == .file {
+            var searchStart = entry.path.startIndex
+            while let separator = entry.path[searchStart...].firstIndex(of: "/") {
+                let directoryPath = String(entry.path[..<separator])
+                if directoryPaths.contains(directoryPath) {
+                    directorySizes[directoryPath, default: 0] += Int64(clamping: entry.originalSize)
+                }
+                searchStart = entry.path.index(after: separator)
             }
+        }
 
         return entries.map { entry in
             ArchiveEntry(

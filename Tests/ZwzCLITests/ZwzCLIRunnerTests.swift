@@ -135,6 +135,7 @@ final class ZwzCLIRunnerTests: XCTestCase {
         for expected in [
             "compress [options] <source-path> [output-path]",
             "extract [options] <archive-path> [output-directory]",
+            "rename [options] <archive-path>",
             "c, compress", "x, extract", "l, list", "h, help",
             "-f, --format <zip|zwz>",
             "-l, --level <none|fastest|normal|max>",
@@ -146,6 +147,8 @@ final class ZwzCLIRunnerTests: XCTestCase {
             "--recipient <name-or-fingerprint>", "Repeat for multiple recipients; requires -f zwz",
             "--sign <local-identity-or-fingerprint>",
             "Requires -f zwz and at least one --recipient",
+            "--rule <find-replace|prefix-suffix|numbering|regex-replace|case-conversion>",
+            "--dry-run", "--include-extension", "--filter <glob>",
             "mutually exclusive", "read from stdin", "On a TTY, input is hidden",
             "never accepted as command arguments or environment options",
             "zwz c -f zwz --recipient Alice --recipient Bob --sign Me Source shared.zwz"
@@ -193,6 +196,71 @@ final class ZwzCLIRunnerTests: XCTestCase {
             XCTAssertEqual(harness.run(["x", archive.path, destination.path]), 0, harness.errors.text)
             XCTAssertEqual(try String(contentsOf: destination.appendingPathComponent("file.txt"), encoding: .utf8), "legacy")
         }
+    }
+
+    func testBatchRenameHandlesDestinationOccupiedByAnotherSelectedEntry() throws {
+        let harness = Harness(archives: ZwzAPIArchiveOperations())
+        let source = harness.root.appendingPathComponent("rename-source", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try "from-a".write(to: source.appendingPathComponent("A.txt"), atomically: true, encoding: .utf8)
+        try "from-b".write(to: source.appendingPathComponent("B.txt"), atomically: true, encoding: .utf8)
+        let archive = harness.root.appendingPathComponent("rename.zip")
+        XCTAssertEqual(harness.run(["compress", source.path, archive.path]), 0, harness.errors.text)
+
+        XCTAssertEqual(harness.run([
+            "rename", "--archive", archive.path,
+            "--rule", "find-replace", "--find", "A", "--replace", "B"
+        ]), 0, harness.errors.text)
+
+        let extracted = harness.root.appendingPathComponent("rename-output", isDirectory: true)
+        XCTAssertEqual(harness.run(["extract", archive.path, extracted.path]), 0, harness.errors.text)
+        XCTAssertEqual(try String(contentsOf: extracted.appendingPathComponent("B.txt"), encoding: .utf8), "from-a")
+        XCTAssertEqual(try String(contentsOf: extracted.appendingPathComponent("B_2.txt"), encoding: .utf8), "from-b")
+    }
+
+    func testBatchRenamePreservesPasswordEncryption() throws {
+        let harness = Harness(archives: ZwzAPIArchiveOperations())
+        let source = harness.root.appendingPathComponent("protected-source", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try "secret body".write(
+            to: source.appendingPathComponent("draft.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let archive = harness.root.appendingPathComponent("protected.zwz")
+        XCTAssertEqual(harness.run([
+            "compress", "-f", "zwz", "-p", "strong-password", source.path, archive.path
+        ]), 0, harness.errors.text)
+
+        XCTAssertEqual(harness.run([
+            "rename", "--archive", archive.path, "-p", "strong-password",
+            "--rule", "find-replace", "--find", "draft", "--replace", "final"
+        ]), 0, harness.errors.text)
+
+        XCTAssertEqual(harness.run(["list", archive.path]), 1)
+        XCTAssertEqual(harness.run(["list", "-p", "strong-password", archive.path]), 0, harness.errors.text)
+        XCTAssertTrue(harness.output.text.contains("final.txt"))
+    }
+
+    func testBatchRenameGlobFilterPreservesMatchingAndOutputOrder() {
+        let archives = FakeArchiveOperations()
+        archives.listingEntries = [
+            ArchiveEntry(name: "alpha.txt", path: "alpha.txt", size: 1, isDirectory: false, modifiedDate: nil),
+            ArchiveEntry(name: "beta.md", path: "beta.md", size: 1, isDirectory: false, modifiedDate: nil),
+            ArchiveEntry(name: "gamma.txt", path: "gamma.txt", size: 1, isDirectory: false, modifiedDate: nil),
+        ]
+        let harness = Harness(archives: archives)
+
+        XCTAssertEqual(harness.run([
+            "rename", "--archive", "fixture.zip", "--dry-run", "--filter", "*.txt",
+            "--rule", "prefix-suffix", "--prefix", "new_"
+        ]), 0)
+        XCTAssertEqual(harness.output.values, [
+            "Batch rename preview (2 items):",
+            "  alpha.txt  →  new_alpha.txt",
+            "  gamma.txt  →  new_gamma.txt",
+            "\nDry run — no changes made.",
+        ])
     }
 }
 
@@ -275,6 +343,7 @@ private final class FakeArchiveOperations: ZwzCLIArchiveOperations {
     var recipientLabels: [ZwzRecipientInfo] = []
     var lastOptions: CompressionOptions?
     var compressCalls = 0
+    var listingEntries: [ArchiveEntry] = []
 
     func compress(source: String, destination: String?, options: CompressionOptions, keyProvider: ZwzPrivateKeyProvider?) throws -> String {
         if let failure { throw failure }
@@ -290,7 +359,7 @@ private final class FakeArchiveOperations: ZwzCLIArchiveOperations {
 
     func list(archive: String, password: String?, keyProvider: ZwzPrivateKeyProvider?) throws -> ZwzArchiveListing {
         if let failure { throw failure }
-        return ZwzArchiveListing(entries: [], version: nil, securityInfo: nil)
+        return ZwzArchiveListing(entries: listingEntries, version: nil, securityInfo: nil)
     }
 
     func recipientInfo(archive: String) throws -> [ZwzRecipientInfo] { recipientLabels }

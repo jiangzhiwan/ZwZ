@@ -39,6 +39,7 @@ final class WorkspaceViewModel: ObservableObject {
         let tab = WorkspaceTab()
         tabs = [tab]
         selectedTabID = tab.id
+        configurePersistence(for: tab)
         if restoreTabs { self.restoreTabs() }
     }
 
@@ -49,6 +50,7 @@ final class WorkspaceViewModel: ObservableObject {
     @discardableResult
     func newTab() -> WorkspaceTab {
         let tab = WorkspaceTab()
+        configurePersistence(for: tab)
         tabs.append(tab)
         selectedTabID = tab.id
         saveSnapshot()
@@ -98,6 +100,7 @@ final class WorkspaceViewModel: ObservableObject {
 
         if tabs.isEmpty {
             let replacement = WorkspaceTab()
+            configurePersistence(for: replacement)
             tabs = [replacement]
             selectedTabID = replacement.id
         } else if wasSelected {
@@ -276,6 +279,9 @@ final class WorkspaceViewModel: ObservableObject {
             }
             return WorkspaceTab(id: saved.id, kind: kind, viewModel: viewModel)
         }
+        for tab in tabs {
+            configurePersistence(for: tab)
+        }
         selectedTabID = tabs.contains(where: { $0.id == snapshot.selectedTabID })
             ? snapshot.selectedTabID
             : tabs[0].id
@@ -304,5 +310,11 @@ final class WorkspaceViewModel: ObservableObject {
 
     private static func canonicalPath(for url: URL) -> String {
         url.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    private func configurePersistence(for tab: WorkspaceTab) {
+        tab.onPersistentStateChanged = { [weak self] in
+            self?.saveSnapshot()
+        }
     }
 }

@@ -179,7 +179,7 @@ final class VirtualDiskManager: ObservableObject {
                 keyProvider: identityStore
             )
         } catch {
-            try? runHdiutil(["detach", mountURL.path])
+            _ = try? runHdiutil(["detach", mountURL.path])
             try? fileManager.removeItem(at: imageURL)
             try? fileManager.removeItem(at: mountURL)
             throw error

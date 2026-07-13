@@ -116,6 +116,25 @@ final class ArchiveEditSessionTests: XCTestCase {
         XCTAssertTrue(addSession.hasChanges)
     }
 
+    func testBatchRenameSupportsChainedDestinationsWithoutLosingFiles() throws {
+        let source = root.appendingPathComponent("batch-chain-source", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try Data("from-a".utf8).write(to: source.appendingPathComponent("A.txt"))
+        try Data("from-b".utf8).write(to: source.appendingPathComponent("B.txt"))
+        let archive = root.appendingPathComponent("batch-chain.zip")
+        try makeZip(from: source, at: archive)
+        let session = try ArchiveEditSession.create(archiveURL: archive, password: nil)
+
+        try session.batchRename(items: [
+            (sourcePath: "A.txt", newName: "B.txt"),
+            (sourcePath: "B.txt", newName: "C.txt")
+        ])
+
+        XCTAssertEqual(try session.text(for: "B.txt"), "from-a")
+        XCTAssertEqual(try session.text(for: "C.txt"), "from-b")
+        XCTAssertTrue(session.hasChanges)
+    }
+
     func testFailedReplacementKeepsOriginalAndDoesNotMarkSessionAsChanged() throws {
         let archive = try makeSimpleArchive(named: "failed-replace.zip", contents: "original")
         let session = try ArchiveEditSession.create(archiveURL: archive, password: nil)

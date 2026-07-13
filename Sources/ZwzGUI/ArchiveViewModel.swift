@@ -47,6 +47,38 @@ enum ThreadMode: String, CaseIterable {
     }
 }
 
+/// GUI 专用的批量重命名规则类型（用于 UI 选择器）
+enum BatchRenameRuleType: String, CaseIterable {
+    case findReplace
+    case prefixSuffix
+    case numbering
+    case regex
+    case caseConversion
+
+    @MainActor var displayName: String {
+        switch self {
+        case .findReplace: return L.string("batch_rename_find_replace")
+        case .prefixSuffix: return L.string("batch_rename_prefix_suffix")
+        case .numbering: return L.string("batch_rename_numbering")
+        case .regex: return L.string("batch_rename_regex")
+        case .caseConversion: return L.string("batch_rename_case")
+        }
+    }
+}
+
+/// GUI 专用的序号编号模式（用于 UI 切换）
+enum BatchNumberingMode: String, CaseIterable {
+    case simple
+    case template
+
+    @MainActor var displayName: String {
+        switch self {
+        case .simple: return L.string("batch_rename_numbering_simple")
+        case .template: return L.string("batch_rename_numbering_template")
+        }
+    }
+}
+
 enum EncryptionModeSelection: String, CaseIterable, Sendable {
     case none
     case password
@@ -65,6 +97,10 @@ private enum ArchiveViewModelSecurityError: LocalizedError {
             return "The archive signature is invalid. Content cannot be opened."
         }
     }
+}
+
+private struct SendableValue<Value>: @unchecked Sendable {
+    let value: Value
 }
 
 // MARK: - View Model
@@ -122,6 +158,31 @@ class ArchiveViewModel: ObservableObject {
     @Published var showMissingPrivateKeyPrompt = false
     @Published private(set) var missingPrivateKeyRecipients: [ZwzRecipientInfo] = []
 
+    // 批量重命名状态
+    @Published var showBatchRenamePanel = false
+    @Published var batchRenameRuleType: BatchRenameRuleType = .findReplace
+    @Published var batchRenameIncludeExtension = false
+    @Published var batchRenameScopeAll = false
+    @Published var batchSelectedPaths: Set<String> = []
+    // find-replace
+    @Published var batchFindText = ""
+    @Published var batchReplaceText = ""
+    // prefix-suffix
+    @Published var batchPrefixText = ""
+    @Published var batchSuffixText = ""
+    // numbering
+    @Published var batchNumberingMode = BatchNumberingMode.simple
+    @Published var batchNumberingStart = 1
+    @Published var batchNumberingStep = 1
+    @Published var batchNumberingDigits = 3
+    @Published var batchNumberingPrefix = ""
+    @Published var batchNumberingTemplate = ""
+    // regex
+    @Published var batchRegexPattern = ""
+    @Published var batchRegexTemplate = ""
+    // case conversion
+    @Published var batchCaseMode: CaseMode = .upper
+
     // 压缩包内容（内联显示）
     @Published var previewEntries: [ArchiveEntry] = []
     @Published var archiveName: String = ""
@@ -142,6 +203,7 @@ class ArchiveViewModel: ObservableObject {
 
     // 全量条目（不过滤）
     private var allEntries: [ArchiveEntry] = []
+    private var directoryDisplaySizes: [String: Int64] = [:]
 
     var isSearching: Bool {
         !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -176,6 +238,7 @@ class ArchiveViewModel: ObservableObject {
     private var pendingAction: PendingAction = .none
     private var passwordWasAutoFilled = false
     private var inspectedRecipients: [ZwzRecipientInfo] = []
+    var onCompressionSucceeded: (@MainActor () -> Void)?
 
     let identityStore: any ZwzIdentityStore
     private let archiveClient: any ArchiveWorkflowClient
@@ -409,6 +472,7 @@ class ArchiveViewModel: ObservableObject {
         searchQuery = ""
         previewEntries = []
         allEntries = []
+        directoryDisplaySizes = [:]
         archiveName = ""
         currentDir = ""
         selectedEntryId = nil
@@ -502,6 +566,69 @@ class ArchiveViewModel: ObservableObject {
         hasUnsavedArchiveEdits = editClient.hasChanges
     }
 
+    func batchRenameInArchive(items: [(sourcePath: String, newName: String)]) {
+        do {
+            try editClient.batchRename(items: items)
+            refreshEditEntries()
+        } catch { editErrorMessage = error.localizedDescription }
+        hasUnsavedArchiveEdits = editClient.hasChanges
+    }
+
+    // MARK: - Batch Rename Preview
+
+    /// 根据当前 UI 状态构建 BatchRenameConfig
+    func buildBatchRenameConfig() -> BatchRenameConfig? {
+        let rule: BatchRenameRule
+        switch batchRenameRuleType {
+        case .findReplace:
+            rule = .findReplace(find: batchFindText, replace: batchReplaceText)
+        case .prefixSuffix:
+            rule = .prefixSuffix(prefix: batchPrefixText, suffix: batchSuffixText)
+        case .numbering:
+            switch batchNumberingMode {
+            case .simple:
+                rule = .numbering(mode: .simple(
+                    start: batchNumberingStart,
+                    step: batchNumberingStep,
+                    digits: batchNumberingDigits,
+                    prefix: batchNumberingPrefix
+                ))
+            case .template:
+                rule = .numbering(mode: .template(
+                    template: batchNumberingTemplate,
+                    start: batchNumberingStart,
+                    step: batchNumberingStep
+                ))
+            }
+        case .regex:
+            rule = .regexReplace(pattern: batchRegexPattern, template: batchRegexTemplate)
+        case .caseConversion:
+            rule = .caseConversion(mode: batchCaseMode)
+        }
+        return BatchRenameConfig(rule: rule, includeExtension: batchRenameIncludeExtension)
+    }
+
+    /// 计算批量重命名预览结果
+    /// - Parameters:
+    ///   - entries: 选中的条目列表
+    ///   - allEntriesInDir: 当前目录所有条目（用于冲突检测中的 existingNames）
+    /// - Returns: 预览结果项列表
+    func computeBatchRenamePreview(
+        selectedEntries: [ArchiveEntry],
+        allEntriesInDir: [ArchiveEntry]
+    ) -> [BatchRenameItem]? {
+        guard let config = buildBatchRenameConfig() else { return nil }
+        let inputEntries = selectedEntries.map { (name: $0.name, isDirectory: $0.isDirectory) }
+        let selectedPaths = Set(selectedEntries.map(\.path))
+        let existingNames = Set(allEntriesInDir.filter { !selectedPaths.contains($0.path) }.map(\.name))
+        do {
+            return try BatchRenameEngine.compute(entries: inputEntries, config: config, existingNames: existingNames)
+        } catch {
+            editErrorMessage = error.localizedDescription
+            return nil
+        }
+    }
+
     func replaceInArchive(path: String, with url: URL) {
         do {
             try editClient.replace(path: path, with: url)
@@ -589,13 +716,15 @@ class ArchiveViewModel: ObservableObject {
         processingTitle = "正在压缩…"
         currentStatus = .compressing
         let generation = beginOperation()
+        let optionsBox = SendableValue(value: options)
+        let cancellationToken = self.cancellationToken
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 _ = try self.archiveClient.compress(
                     sourcePath: srcPath,
                     destinationPath: destPath,
-                    options: options,
+                    options: optionsBox.value,
                     identityStore: self.identityStore,
                     progress: { prog in
                         DispatchQueue.main.async {
@@ -603,7 +732,7 @@ class ArchiveViewModel: ObservableObject {
                             self.progress = prog
                         }
                     },
-                    cancellationToken: self.cancellationToken
+                    cancellationToken: cancellationToken
                 )
 
                 DispatchQueue.main.async {
@@ -617,6 +746,7 @@ class ArchiveViewModel: ObservableObject {
                         statusText: "成功",
                         isSuccess: true
                     ))
+                    self.onCompressionSucceeded?()
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -662,6 +792,7 @@ class ArchiveViewModel: ObservableObject {
         processingTitle = L.string("smart_extracting")
         currentStatus = .extracting
         let generation = beginOperation()
+        let cancellationToken = self.cancellationToken
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
@@ -680,7 +811,7 @@ class ArchiveViewModel: ObservableObject {
                             self.progress = prog
                         }
                     },
-                    cancellationToken: self.cancellationToken
+                    cancellationToken: cancellationToken
                 )
                 try SmartExtractionPlanner.finalize(plan)
 
@@ -743,6 +874,7 @@ class ArchiveViewModel: ObservableObject {
         processingTitle = "正在解压…"
         currentStatus = .extracting
         let generation = beginOperation()
+        let cancellationToken = self.cancellationToken
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
@@ -756,7 +888,7 @@ class ArchiveViewModel: ObservableObject {
                         guard self.acceptsCallback(generation: generation) else { return }
                         self.progress = prog
                     }
-                }, cancellationToken: self.cancellationToken)
+                }, cancellationToken: cancellationToken)
 
                 DispatchQueue.main.async {
                     guard self.acceptsCallback(generation: generation) else { return }
@@ -1121,6 +1253,11 @@ class ArchiveViewModel: ObservableObject {
 
     func setArchiveEntries(_ entries: [ArchiveEntry]) {
         allEntries = entries
+        directoryDisplaySizes = entries.lazy
+            .filter(\.isDirectory)
+            .reduce(into: [:]) { sizes, entry in
+                sizes[entry.path] = ArchiveEntryPresentation.displaySize(for: entry, in: entries)
+            }
         updateFilteredEntries()
     }
 
@@ -1489,7 +1626,7 @@ class ArchiveViewModel: ObservableObject {
     }
 
     func displaySize(for entry: ArchiveEntry) -> Int64 {
-        ArchiveEntryPresentation.displaySize(for: entry, in: allEntries)
+        entry.isDirectory ? directoryDisplaySizes[entry.path, default: entry.size] : entry.size
     }
 
     func formatDate(_ date: Date) -> String {

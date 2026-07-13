@@ -1,0 +1,480 @@
+# Review package: 7d5079af7a5a63479d6c28404492459a7c54d48b..86067f0
+
+## Commits
+86067f0 feat: add ZWZ recipient wrapping and signatures
+
+## Files changed
+ .superpowers/sdd/v3-task-2-report.md               |  46 +++++
+ Sources/ZwzCore/ZWZV3/ZwzV3Crypto.swift            | 213 +++++++++++++++++++++
+ .../ZWZV3/ZwzV3CryptoTestSupport.swift             |  41 ++++
+ Tests/ZwzCoreTests/ZWZV3/ZwzV3CryptoTests.swift    | 143 ++++++++++++++
+ 4 files changed, 443 insertions(+)
+
+## Diff
+diff --git a/.superpowers/sdd/v3-task-2-report.md b/.superpowers/sdd/v3-task-2-report.md
+new file mode 100644
+index 0000000..2ff5966
+--- /dev/null
++++ b/.superpowers/sdd/v3-task-2-report.md
+@@ -0,0 +1,46 @@
++# ZWZ V3 Task 2 Report
++
++## Status
++
++Implemented crypto primitives, recipient content-key wrapping, and Ed25519 signing/verification for ZWZ V3.
++
++## Implementation
++
++- Added public recipient-envelope and signer-record value types.
++- Added SHA-256 fingerprints using unambiguous length-prefixed canonical input.
++- Added one ephemeral X25519 key per `wrap` call and a distinct random AES-GCM nonce per recipient.
++- Derived 256-bit wrapping keys with HKDF-SHA-256, the archive UUID bytes as salt, and `ZWZ3 key wrap` shared info.
++- Bound `ZWZ3 recipient envelope`, archive UUID bytes, length-prefixed recipient fingerprint, and ephemeral public key into AES-GCM AAD.
++- Added AES-256-GCM seal/open and Ed25519 sign/verify primitives.
++- Collapsed unwrap/authentication failures to `ZwzV3Error` values without logging or embedding key material.
++
++## Files
++
++- `Sources/ZwzCore/ZWZV3/ZwzV3Crypto.swift`
++- `Tests/ZwzCoreTests/ZWZV3/ZwzV3CryptoTests.swift`
++- `Tests/ZwzCoreTests/ZWZV3/ZwzV3CryptoTestSupport.swift`
++
++## RED Evidence
++
++`swift test --filter ZwzV3CryptoTests` failed during test compilation because `ZwzV3Crypto` and `ZwzV3RecipientEnvelope` did not exist. The initial sandboxed invocation was blocked by SwiftPM/Clang cache permissions; the approved unsandboxed invocation produced the expected missing-API compiler failures.
++
++## GREEN Evidence
++
++`swift test --filter ZwzV3CryptoTests` completed with 6 tests, 0 failures. Coverage includes multi-recipient unwrap, shared per-package ephemeral key, per-recipient nonce separation, wrong-key failure, every-byte nonce/ciphertext/tag mutation, AAD metadata mutation, generic AES-GCM AAD authentication, and Ed25519 changed-byte rejection.
++
++## Full Test Result
++
++The single final `swift test` invocation completed with exit code 0 and no test failures, covering the full package including existing V1/V2 and GUI suites.
++
++## Self-review
++
++- Confirmed envelope field mutability matches the requested shape.
++- Confirmed AAD uses the specified domain and canonical length prefix for the variable-length fingerprint.
++- Confirmed all envelopes from one call share exactly one ephemeral public key while using independently generated nonces.
++- Confirmed no logging calls or error payloads expose private keys, shared secrets, content keys, or derived keys.
++- Confirmed only Task 2 files are staged for the commit; unrelated pre-existing worktree changes remain untouched.
++
++## Concerns
++
++- The full build emits pre-existing Swift concurrency/deprecation warnings in unrelated V1/V2/GUI files; they do not fail the suite and were not modified for this task.
++- `wrap` is intentionally callable with an empty array and returns an empty array; the public encryption-mode validator from Task 1 remains responsible for enforcing at least one recipient.
+diff --git a/Sources/ZwzCore/ZWZV3/ZwzV3Crypto.swift b/Sources/ZwzCore/ZWZV3/ZwzV3Crypto.swift
+new file mode 100644
+index 0000000..428e1ba
+--- /dev/null
++++ b/Sources/ZwzCore/ZWZV3/ZwzV3Crypto.swift
+@@ -0,0 +1,213 @@
++import CryptoKit
++import Foundation
++
++public struct ZwzV3RecipientEnvelope: Equatable, Sendable {
++    public let recipientName: String
++    public let recipientFingerprint: String
++    public let ephemeralPublicKey: Data
++    public var nonce: Data
++    public var encryptedContentKey: Data
++    public var authenticationTag: Data
++
++    public init(
++        recipientName: String,
++        recipientFingerprint: String,
++        ephemeralPublicKey: Data,
++        nonce: Data,
++        encryptedContentKey: Data,
++        authenticationTag: Data
++    ) {
++        self.recipientName = recipientName
++        self.recipientFingerprint = recipientFingerprint
++        self.ephemeralPublicKey = ephemeralPublicKey
++        self.nonce = nonce
++        self.encryptedContentKey = encryptedContentKey
++        self.authenticationTag = authenticationTag
++    }
++}
++
++public struct ZwzV3SignerRecord: Equatable, Sendable {
++    public let name: String
++    public let fingerprint: String
++    public let signingPublicKey: Data
++    public let signature: Data
++
++    public init(name: String, fingerprint: String, signingPublicKey: Data, signature: Data) {
++        self.name = name
++        self.fingerprint = fingerprint
++        self.signingPublicKey = signingPublicKey
++        self.signature = signature
++    }
++}
++
++public enum ZwzV3Crypto {
++    private static let wrapDomain = Data("ZWZ3 key wrap".utf8)
++    private static let envelopeDomain = Data("ZWZ3 recipient envelope".utf8)
++
++    public static func fingerprint(agreement: Data, signing: Data?) -> String {
++        var canonical = Data("ZWZ3 fingerprint".utf8)
++        canonical.appendLengthPrefixed(agreement)
++        canonical.appendLengthPrefixed(signing ?? Data())
++        return SHA256.hash(data: canonical).map { String(format: "%02x", $0) }.joined()
++    }
++
++    public static func wrap(
++        contentKey: SymmetricKey,
++        recipients: [ZwzRecipient],
++        archiveID: UUID
++    ) throws -> [ZwzV3RecipientEnvelope] {
++        let ephemeralKey = Curve25519.KeyAgreement.PrivateKey()
++        let ephemeralPublicKey = ephemeralKey.publicKey.rawRepresentation
++
++        return try recipients.map { recipient in
++            do {
++                let publicKey = try Curve25519.KeyAgreement.PublicKey(
++                    rawRepresentation: recipient.agreementPublicKey
++                )
++                let sharedSecret = try ephemeralKey.sharedSecretFromKeyAgreement(with: publicKey)
++                let wrappingKey = sharedSecret.hkdfDerivedSymmetricKey(
++                    using: SHA256.self,
++                    salt: archiveID.bytes,
++                    sharedInfo: wrapDomain,
++                    outputByteCount: 32
++                )
++                let nonce = AES.GCM.Nonce()
++                let sealed = try AES.GCM.seal(
++                    contentKey.data,
++                    using: wrappingKey,
++                    nonce: nonce,
++                    authenticating: envelopeAAD(
++                        archiveID: archiveID,
++                        recipientFingerprint: recipient.fingerprint,
++                        ephemeralPublicKey: ephemeralPublicKey
++                    )
++                )
++                return ZwzV3RecipientEnvelope(
++                    recipientName: recipient.name,
++                    recipientFingerprint: recipient.fingerprint,
++                    ephemeralPublicKey: ephemeralPublicKey,
++                    nonce: Data(nonce),
++                    encryptedContentKey: sealed.ciphertext,
++                    authenticationTag: sealed.tag
++                )
++            } catch {
++                throw ZwzV3Error.invalidRecipientPublicKey(recipient.name)
++            }
++        }
++    }
++
++    public static func unwrap(
++        _ envelope: ZwzV3RecipientEnvelope,
++        privateKey: Curve25519.KeyAgreement.PrivateKey,
++        archiveID: UUID
++    ) throws -> SymmetricKey {
++        do {
++            let ephemeralPublicKey = try Curve25519.KeyAgreement.PublicKey(
++                rawRepresentation: envelope.ephemeralPublicKey
++            )
++            let sharedSecret = try privateKey.sharedSecretFromKeyAgreement(with: ephemeralPublicKey)
++            let wrappingKey = sharedSecret.hkdfDerivedSymmetricKey(
++                using: SHA256.self,
++                salt: archiveID.bytes,
++                sharedInfo: wrapDomain,
++                outputByteCount: 32
++            )
++            let nonce = try AES.GCM.Nonce(data: envelope.nonce)
++            let sealed = try AES.GCM.SealedBox(
++                nonce: nonce,
++                ciphertext: envelope.encryptedContentKey,
++                tag: envelope.authenticationTag
++            )
++            let contentKey = try AES.GCM.open(
++                sealed,
++                using: wrappingKey,
++                authenticating: envelopeAAD(
++                    archiveID: archiveID,
++                    recipientFingerprint: envelope.recipientFingerprint,
++                    ephemeralPublicKey: envelope.ephemeralPublicKey
++                )
++            )
++            guard contentKey.count == 32 else { throw ZwzV3Error.keyUnwrapFailed }
++            return SymmetricKey(data: contentKey)
++        } catch {
++            throw ZwzV3Error.keyUnwrapFailed
++        }
++    }
++
++    public static func seal(
++        _ plaintext: Data,
++        key: SymmetricKey,
++        nonce: AES.GCM.Nonce,
++        aad: Data
++    ) throws -> Data {
++        do {
++            guard let combined = try AES.GCM.seal(
++                plaintext, using: key, nonce: nonce, authenticating: aad
++            ).combined else {
++                throw ZwzV3Error.authenticationFailed
++            }
++            return combined
++        } catch {
++            throw ZwzV3Error.authenticationFailed
++        }
++    }
++
++    public static func open(_ combined: Data, key: SymmetricKey, aad: Data) throws -> Data {
++        do {
++            return try AES.GCM.open(
++                AES.GCM.SealedBox(combined: combined), using: key, authenticating: aad
++            )
++        } catch {
++            throw ZwzV3Error.authenticationFailed
++        }
++    }
++
++    public static func sign(
++        _ bytes: Data,
++        privateKey: Curve25519.Signing.PrivateKey
++    ) throws -> Data {
++        do {
++            return try privateKey.signature(for: bytes)
++        } catch {
++            throw ZwzV3Error.authenticationFailed
++        }
++    }
++
++    public static func verify(_ signature: Data, bytes: Data, publicKey: Data) -> Bool {
++        guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: publicKey) else {
++            return false
++        }
++        return key.isValidSignature(signature, for: bytes)
++    }
++
++    private static func envelopeAAD(
++        archiveID: UUID,
++        recipientFingerprint: String,
++        ephemeralPublicKey: Data
++    ) -> Data {
++        var aad = envelopeDomain
++        aad.append(archiveID.bytes)
++        aad.appendLengthPrefixed(Data(recipientFingerprint.utf8))
++        aad.append(ephemeralPublicKey)
++        return aad
++    }
++}
++
++extension UUID {
++    var bytes: Data {
++        var value = uuid
++        return withUnsafeBytes(of: &value) { Data($0) }
++    }
++}
++
++private extension Data {
++    mutating func appendLengthPrefixed(_ value: Data) {
++        var length = UInt32(value.count).bigEndian
++        append(Swift.withUnsafeBytes(of: &length) { Data($0) })
++        append(value)
++    }
++}
++
++private extension SymmetricKey {
++    var data: Data { withUnsafeBytes { Data($0) } }
++}
+diff --git a/Tests/ZwzCoreTests/ZWZV3/ZwzV3CryptoTestSupport.swift b/Tests/ZwzCoreTests/ZWZV3/ZwzV3CryptoTestSupport.swift
+new file mode 100644
+index 0000000..d65470e
+--- /dev/null
++++ b/Tests/ZwzCoreTests/ZWZV3/ZwzV3CryptoTestSupport.swift
+@@ -0,0 +1,41 @@
++import CryptoKit
++import Foundation
++@testable import ZwzCore
++
++struct ZwzV3WrappedFixture {
++    let archiveID: UUID
++    let contentKey: SymmetricKey
++    let recipientKey: Curve25519.KeyAgreement.PrivateKey
++    let wrongKey: Curve25519.KeyAgreement.PrivateKey
++    let envelopes: [ZwzV3RecipientEnvelope]
++}
++
++func makeWrappedFixture() throws -> ZwzV3WrappedFixture {
++    let archiveID = UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!
++    let contentKey = SymmetricKey(size: .bits256)
++    let recipientKey = Curve25519.KeyAgreement.PrivateKey()
++    let wrongKey = Curve25519.KeyAgreement.PrivateKey()
++    let recipient = ZwzRecipient(
++        name: "Alice",
++        fingerprint: ZwzV3Crypto.fingerprint(
++            agreement: recipientKey.publicKey.rawRepresentation,
++            signing: nil
++        ),
++        agreementPublicKey: recipientKey.publicKey.rawRepresentation
++    )
++    return ZwzV3WrappedFixture(
++        archiveID: archiveID,
++        contentKey: contentKey,
++        recipientKey: recipientKey,
++        wrongKey: wrongKey,
++        envelopes: try ZwzV3Crypto.wrap(
++            contentKey: contentKey,
++            recipients: [recipient],
++            archiveID: archiveID
++        )
++    )
++}
++
++extension SymmetricKey {
++    var testBytes: Data { withUnsafeBytes { Data($0) } }
++}
+diff --git a/Tests/ZwzCoreTests/ZWZV3/ZwzV3CryptoTests.swift b/Tests/ZwzCoreTests/ZWZV3/ZwzV3CryptoTests.swift
+new file mode 100644
+index 0000000..037bdb1
+--- /dev/null
++++ b/Tests/ZwzCoreTests/ZWZV3/ZwzV3CryptoTests.swift
+@@ -0,0 +1,143 @@
++import CryptoKit
++import XCTest
++@testable import ZwzCore
++
++final class ZwzV3CryptoTests: XCTestCase {
++    func testAnyRecipientCanUnwrapSameContentKey() throws {
++        let alice = Curve25519.KeyAgreement.PrivateKey()
++        let bob = Curve25519.KeyAgreement.PrivateKey()
++        let contentKey = SymmetricKey(size: .bits256)
++        let archiveID = UUID()
++        let envelopes = try ZwzV3Crypto.wrap(contentKey: contentKey, recipients: [
++            recipient(named: "Alice", key: alice),
++            recipient(named: "Bob", key: bob)
++        ], archiveID: archiveID)
++
++        XCTAssertEqual(
++            try ZwzV3Crypto.unwrap(envelopes[0], privateKey: alice, archiveID: archiveID).testBytes,
++            contentKey.testBytes
++        )
++        XCTAssertEqual(
++            try ZwzV3Crypto.unwrap(envelopes[1], privateKey: bob, archiveID: archiveID).testBytes,
++            contentKey.testBytes
++        )
++        XCTAssertEqual(envelopes[0].ephemeralPublicKey, envelopes[1].ephemeralPublicKey)
++        XCTAssertNotEqual(envelopes[0].nonce, envelopes[1].nonce)
++    }
++
++    func testWrongRecipientFailsWithoutLeakingCryptoDetails() throws {
++        let fixture = try makeWrappedFixture()
++
++        XCTAssertThrowsError(try ZwzV3Crypto.unwrap(
++            fixture.envelopes[0], privateKey: fixture.wrongKey, archiveID: fixture.archiveID
++        )) { error in
++            XCTAssertEqual(error as? ZwzV3Error, .keyUnwrapFailed)
++        }
++    }
++
++    func testEveryEnvelopeByteMutationFailsAuthentication() throws {
++        let fixture = try makeWrappedFixture()
++        let envelope = fixture.envelopes[0]
++
++        for index in envelope.nonce.indices {
++            var mutated = envelope
++            mutated.nonce[index] ^= 0x01
++            XCTAssertThrowsError(try ZwzV3Crypto.unwrap(
++                mutated, privateKey: fixture.recipientKey, archiveID: fixture.archiveID
++            ))
++        }
++        for index in envelope.encryptedContentKey.indices {
++            var mutated = envelope
++            mutated.encryptedContentKey[index] ^= 0x01
++            XCTAssertThrowsError(try ZwzV3Crypto.unwrap(
++                mutated, privateKey: fixture.recipientKey, archiveID: fixture.archiveID
++            ))
++        }
++        for index in envelope.authenticationTag.indices {
++            var mutated = envelope
++            mutated.authenticationTag[index] ^= 0x01
++            XCTAssertThrowsError(try ZwzV3Crypto.unwrap(
++                mutated, privateKey: fixture.recipientKey, archiveID: fixture.archiveID
++            ))
++        }
++    }
++
++    func testAuthenticatedMetadataMutationFailsUnwrap() throws {
++        let fixture = try makeWrappedFixture()
++        let envelope = fixture.envelopes[0]
++        let changedFingerprint = ZwzV3RecipientEnvelope(
++            recipientName: envelope.recipientName,
++            recipientFingerprint: envelope.recipientFingerprint + "0",
++            ephemeralPublicKey: envelope.ephemeralPublicKey,
++            nonce: envelope.nonce,
++            encryptedContentKey: envelope.encryptedContentKey,
++            authenticationTag: envelope.authenticationTag
++        )
++        var ephemeralPublicKey = envelope.ephemeralPublicKey
++        ephemeralPublicKey[0] ^= 0x01
++        let changedEphemeralKey = ZwzV3RecipientEnvelope(
++            recipientName: envelope.recipientName,
++            recipientFingerprint: envelope.recipientFingerprint,
++            ephemeralPublicKey: ephemeralPublicKey,
++            nonce: envelope.nonce,
++            encryptedContentKey: envelope.encryptedContentKey,
++            authenticationTag: envelope.authenticationTag
++        )
++
++        XCTAssertThrowsError(try ZwzV3Crypto.unwrap(
++            changedFingerprint, privateKey: fixture.recipientKey, archiveID: fixture.archiveID
++        ))
++        XCTAssertThrowsError(try ZwzV3Crypto.unwrap(
++            changedEphemeralKey, privateKey: fixture.recipientKey, archiveID: fixture.archiveID
++        ))
++        XCTAssertThrowsError(try ZwzV3Crypto.unwrap(
++            envelope, privateKey: fixture.recipientKey, archiveID: UUID()
++        ))
++    }
++
++    func testSealRoundTripsAndChangedAADFailsAuthentication() throws {
++        let key = SymmetricKey(size: .bits256)
++        let nonce = AES.GCM.Nonce()
++        let sealed = try ZwzV3Crypto.seal(
++            Data("payload".utf8), key: key, nonce: nonce, aad: Data("header".utf8)
++        )
++
++        XCTAssertEqual(
++            try ZwzV3Crypto.open(sealed, key: key, aad: Data("header".utf8)),
++            Data("payload".utf8)
++        )
++        XCTAssertThrowsError(try ZwzV3Crypto.open(
++            sealed, key: key, aad: Data("Header".utf8)
++        )) { error in
++            XCTAssertEqual(error as? ZwzV3Error, .authenticationFailed)
++        }
++    }
++
++    func testEd25519SignatureRejectsChangedCanonicalBytes() throws {
++        let key = Curve25519.Signing.PrivateKey()
++        let original = Data("archive".utf8)
++        let signature = try ZwzV3Crypto.sign(original, privateKey: key)
++
++        XCTAssertTrue(ZwzV3Crypto.verify(
++            signature, bytes: original, publicKey: key.publicKey.rawRepresentation
++        ))
++        XCTAssertFalse(ZwzV3Crypto.verify(
++            signature, bytes: Data("Archive".utf8), publicKey: key.publicKey.rawRepresentation
++        ))
++        XCTAssertFalse(ZwzV3Crypto.verify(
++            signature, bytes: original, publicKey: Data(repeating: 0, count: 3)
++        ))
++    }
++
++    private func recipient(
++        named name: String,
++        key: Curve25519.KeyAgreement.PrivateKey
++    ) -> ZwzRecipient {
++        let publicKey = key.publicKey.rawRepresentation
++        return ZwzRecipient(
++            name: name,
++            fingerprint: ZwzV3Crypto.fingerprint(agreement: publicKey, signing: nil),
++            agreementPublicKey: publicKey
++        )
++    }
++}

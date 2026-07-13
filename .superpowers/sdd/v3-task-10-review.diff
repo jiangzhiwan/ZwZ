@@ -1,0 +1,642 @@
+diff --git a/Package.swift b/Package.swift
+index b99e23c..549a970 100644
+--- a/Package.swift
++++ b/Package.swift
+@@ -44,7 +44,10 @@ let package = Package(
+         .testTarget(
+             name: "ZwzCoreTests",
+             dependencies: ["ZwzCore"],
+-            path: "Tests/ZwzCoreTests"
++            path: "Tests/ZwzCoreTests",
++            resources: [
++                .copy("Fixtures")
++            ]
+         ),
+         .testTarget(
+             name: "ZwzGUITests",
+diff --git a/README.md b/README.md
+index 875d986..6c5ebfc 100644
+--- a/README.md
++++ b/README.md
+@@ -58,7 +58,7 @@ ZwZ 自研的 **ZWZ 格式**采用 AES-256-GCM 认证加密——不仅加密文
+ zwz compress ~/Documents/project
+ 
+ # 命令行解压
+-zwz extract archive.zip -o ~/output
++zwz extract archive.zip ~/output
+ 
+ # 预览压缩包内容
+ zwz list archive.rar
+@@ -68,6 +68,52 @@ GUI 适合日常使用，CLI 适合脚本自动化和远程服务器。
+ 
+ ---
+ 
++## ZWZ 公钥加密与签名
++
++ZWZ 支持无加密、密码加密和公钥加密三种模式。密码与公钥模式互斥；公钥模式可以同时选择多个接收方，并可选择一个本机身份进行 Ed25519 签名。任一接收方持有匹配的 X25519 私钥即可解密，文件内容、文件名、路径、大小、时间戳和目录结构均由 AES-256-GCM 认证加密保护。
++
++### GUI
++
++- 在“设置 > 密钥”中创建本机身份、导入或导出公开身份，以及备份或恢复私钥。
++- 创建 ZWZ 压缩包时可选择无加密、密码或公钥模式；公钥模式支持多个接收方和一个可选的本机签名身份。
++- 接收方名称与指纹是压缩包中的公开标签，未经过信任验证，不能单独证明接收方身份。
++- 签名状态区分“已知签名者且签名有效”“未知签名者但签名有效”“未签名”和“签名无效”。签名无效时，预览、解压、单项打开、编辑和虚拟磁盘挂载都会被拒绝。
++- 缺少匹配私钥时，可恢复 `.zwzkey` 私钥备份并重试原操作。编辑或虚拟磁盘保存公钥压缩包时会保留原接收方与签名保护，不会静默降级。
++
++### CLI
++
++```bash
++# 创建本机身份并导出公钥
++zwz key create "My Mac"
++zwz key export-public "My Mac" recipient.zwzpub
++
++# 接收方先导入公钥；--recipient 接受已导入的名称或指纹，不接受文件路径
++zwz key import-public recipient.zwzpub
++zwz compress -f zwz --recipient "Recipient Name" --sign "My Mac" source shared.zwz
++
++# 解压时自动从本机身份中寻找匹配私钥
++zwz extract archive.zwz output
++
++# 私钥备份与恢复，密码通过隐藏的终端输入读取
++zwz key backup "My Mac" identity.zwzkey
++zwz key restore identity.zwzkey
++```
++
++可重复使用 `--recipient <name-or-fingerprint>` 添加多个接收方。`--sign` 只能选择本机身份，并且必须与至少一个 `--recipient` 一起使用。密码加密使用 `--password`，不能与 `--recipient` 或 `--sign` 同时使用。
++
++### ZwzCore
++
++`CompressionOptions.encryption` 提供 `.none`、`.password` 和 `.publicKey`。公钥压缩、列表与解压通过带 `ZwzPrivateKeyProvider` 的 `ZwzAPI` 重载完成，并返回包含格式版本、加密类型、接收方指纹和结构化签名状态的结果。`ZwzAPI.inspect` 可在请求私钥及解密索引前读取公开接收方标签并验证可选签名。
++
++### 密钥与兼容性
++
++- 生产环境中的私钥保存在 macOS 钥匙串，并使用“用户在场”访问控制；每次解密或签名都会要求 Touch ID 或 Mac 登录密码确认。
++- `.zwzkey` 私钥备份使用 scrypt（N=65,536、r=8、p=1）派生密钥并由 AES-256-GCM 保护，必须设置独立密码。请至少保留一份可用私钥或加密备份；如果所有匹配私钥及备份均丢失，公钥加密内容将永久无法恢复。
++- ZWZ V2 无加密和密码加密压缩包继续支持检测、预览、列表和解压。
++- ZWZ V1 只能被安全检测并报告为不支持；本项目没有可验证的历史 V1 读写器或真实兼容 fixture，因此不声明 V1 解压兼容。
++
++---
++
+ ## 架构设计
+ 
+ ```
+@@ -132,7 +178,8 @@ swift test
+ 
+ | 特性 | 实现 |
+ |------|------|
+-| 加密 | AES-256-GCM 认证加密（CryptoSwift） |
++| 加密 | AES-256-GCM；密码模式 PBKDF2，公钥模式 X25519 + HKDF-SHA-256 |
++| 签名 | 可选 Ed25519，区分已知、未知、未签名和无效状态 |
+ | 压缩 | Deflate / LZMA / Store（Apple Compression） |
+ | ZIP 支持 | ZIPFoundation（AES 加密读写） |
+ | RAR/7Z/TAR | SWCompression（纯 Swift 解压） |
+diff --git a/Tests/ZwzCoreTests/Fixtures/v1-header.zwz b/Tests/ZwzCoreTests/Fixtures/v1-header.zwz
+new file mode 100644
+index 0000000000000000000000000000000000000000..b08664b824dd84408dc69942875883a86d44c1b1
+GIT binary patch
+literal 8
+NcmazFk78s10sseE0Sy2E
+
+literal 0
+HcmV?d00001
+
+diff --git a/Tests/ZwzCoreTests/Fixtures/v2-password.zwz b/Tests/ZwzCoreTests/Fixtures/v2-password.zwz
+new file mode 100644
+index 0000000000000000000000000000000000000000..b45f11af590367c72ed3bb5f1a61bb3276943a82
+GIT binary patch
+literal 590
+zcmazFk1}FnU|@K-YsGnP4rhjW`uRO2lYhrE0>u~@92f+EWPk}X!@;zeSV=YQrSB7*
+zM7}s4%K=MMlK@)82Q&|aU361;(Tx_r8Kf9gRKHGsw@7PgmDq;ay1)G;82W>PojINq
+zKZUp!s0U~Y$i*Nm`sx1(bW>iey1{cIvi^&!lELST-y<&+p12b8RPN&bRc*JHKJwB`
+zIZ{-dcKr6d-CJy%c@}9Mk~nwwWt{N2<+`_DgudVAmQrKr^pIauef@v)<BzVzZ*Je&
+zk+Ga}q940QgrdUcwRLyg9E4og9nL#?^OL}u2_n{K<$C5$pEpVK&`dMI{n-^y#TXsM
+zWo)h0t?b+PFPQke@mJ+;3u~{8sg43)jZ<qs6-hj@sd?7>S>NHhLd=?v!6(m7o*3p*
+zRyF(h)*iutpPa7__oe&`QU0TLKTalax0UgaPY-5fF}X8_ecRB^p|*5Y$phQ7;<{Uw
+zr?jn!`y;^epF4JTYk<>FPDWeDCl|kMInFxomg?_6GvuG^vY4#tY<b^OnN?pW{nz{J
+i5gDDotg|Y6yR4&dqy|1{0Dpi6=&$>Hf6&7g#0LN=m%fw$
+
+literal 0
+HcmV?d00001
+
+diff --git a/Tests/ZwzCoreTests/Fixtures/v2-unencrypted.zwz b/Tests/ZwzCoreTests/Fixtures/v2-unencrypted.zwz
+new file mode 100644
+index 0000000000000000000000000000000000000000..ad117c04a57c08ae5c7e13eb4612b554cc683947
+GIT binary patch
+literal 510
+zcmazFk1}FnU|?|Te{n;8si*V~&5CX9(h?CsAs}!7lk_6^fEIzUi*5=px}9m66(yxb
+zsR|jXIXU@Uj7ZV~KsE@Ae)@j`Nf^RpWMXDvWn<^y<l^Sx<>QYEkMd-~;#UU-W}tdb
+z2C(URB^4!1Aa{U4#?$lNAnTB=gi0|qKp8NHLtM_rke6CqlA40h0W$-noF6KypORRT
+ssF#$P#{_ab7{HWavu+zy4a~O??*jdUHTK>?RbPP84L4&CLzyTP0D$&D2><{9
+
+literal 0
+HcmV?d00001
+
+diff --git a/Tests/ZwzCoreTests/Fixtures/v3-signed-multi-recipient.zwz b/Tests/ZwzCoreTests/Fixtures/v3-signed-multi-recipient.zwz
+new file mode 100644
+index 0000000000000000000000000000000000000000..e3a6d4ca43777c32f995aa81f1482b314edab41b
+GIT binary patch
+literal 1075
+zcmazFk1}RvSir!@z`(%72nGzVSDsN@c*A8&YuR>Y|Gz~?nSgQ&fEWZaKnj6?10)Cp
+zZ4io~56XW7<ySF77(1c-&rrStln+%7<>96_0;PC?*e$c7q_iki!7(Q@In@CuU|?ou
+znQD+|U}|KNVqj)&W@u`WXkuV#l44?JV4Recl5Ap`n3iIYXk=!ZW}KR2W|3-{Vrpq-
+zZjoe?XlR&XyuS0o*On!xeZvIgE5GSqdsm?{ad(o*>y-*Mom!rv!M;)94J#haZ}(Gw
+zSi)0zYJu#jbv3gC#d4JwRBzm`uua`^?$)16dp<9%&g6YxRAlt!f|6|P8@`rVakiK3
+z^VS31$BpD@r~D)bAlEp_($L5t**MX}($v_}%p^I<GR553$j~I&G%48(=;S1`WHY10
+z6f;ZXloaDMOXFm-#1u;dQ*#Sb%R~cX6GBd2o%&|ZkG7bp-=+Rd<;^rzmHhbOh1oHU
+zn`@)>S}Je7Tkyqr>z&WS_w$60OFeh2^jqJi#2kJ>L#mBK@bz9hp!<*kACRL3#4aCg
+z%nNo@@7MdWS1Eht{O@e03;1ex8k{&HIJs13K?UR6*I!d~KQA;W+U5XM4NV+C76XF-
+z5bFT(Ht!A28LvOykK1aV_2olnmFJV?RyX~9PR1U~*suL^#@%JNyzDa1^c#Iy;BGbB
+zf6Z*Aj5B;H`^;EQ&;48zyk|wY#x&7ij6VZB*SYtdG+HlkI_Jg27Q5$(^Io1wp7B7@
+z)v>kkm2Fv*zPHz-_eyMsltiqX4%st{`uP`IRDEzW>z(*MAa-x`5?Qy4lN)c8bNsyV
+zS=958=)K*_FWXnW$T~Vb>_=p7>-pzD&Yjo3d+Pqz^qDD#9d9|<xJ&Vi?YJ!^UA)C!
+ziJ`=8+xm;|cZNL3w6^RM%qrL;?``b=gZEs>yGgOFTc^B^OPLiDcJr~j<U1ShJAam6
+zFX>yKnZl=fceBUlQ)e$P_q7Z9!NT%CWcCE9iz$m%+^bPqBe-2|D==(mlCswxbP)WZ
+zD-(7zY?c4q;v22aiObknT2&uh=t=H99(&{X{QvX)nVmY{IJ=!S30R`7FmWxz-t(^9
+vtoM?8EL+;%ZLB)p;BCw#c>36kKM4mo5*;;MHLtAD<@odI{=MU>0k)g~?16(E
+
+literal 0
+HcmV?d00001
+
+diff --git a/Tests/ZwzCoreTests/Fixtures/v3-unsigned-multi-recipient.zwz b/Tests/ZwzCoreTests/Fixtures/v3-unsigned-multi-recipient.zwz
+new file mode 100644
+index 0000000000000000000000000000000000000000..b7b793588e1bb7664e470bdce8a502489f9e769c
+GIT binary patch
+literal 890
+zcmazFk1}RvSik@ROpHLlz{v3G-IazZGySzTH0_#@DJad&1e99<QUC-Qj1ZawBnSj;
+z5Q?D>%6|jp6QZEX2`OXP2vorf#BP}tC8b5F3XVCM$*B%N0RuBL%T$9z15+cD6azDJ
+zGec90L=yu`lN1v(1LLHmlw=dj#IzKHL?biPG~?7HGmBKq6jMtxbBiRCL_@<A<M*NO
+zMS{1#YZvL5Xf-qH-7^~>gQ-hzKWcvRC)2@y`gM<ki~lax+{`HOAe{Zo)JF$bX#WmB
+z_xC{YAy2_mCBmP>Iacy*wlHG0<~(?!Z-aF9NpCB6HnwTnU6ywolvb|?x{n*l(N6hE
+z4nVGPlBJ=ML9%h8iKVHrrI|@`l4Xjyv5}!kvT0JX8PLf|X31toi7955#wjVrX_m&x
+zW{D}52Bzi~rk05Y#wLWEJT>LjkA?u{?Q(N}Owga;ZSb>J_P?gN&9?o=-u<&+&uu;F
+z%NG5p<={>$cZ<vOUN(MQzh5^&^PcshxUAdmc0l(b13n-}3y8n{kbIz{GX3i}?jO%X
+z^;{Afr@hEFZF_Izx3blI<s%bgtFDLD3bISJm&-Z;RYMa8kj20t0K_^#eA?1ymO-IK
+zd-36Dr71I0)FUrP>SXaq^<6l9RH$Wpo@Cn6`8~JT|E#vL$ye(+zdJj3`>~}-#rKzc
+z74}$L3b)oCm)fLxwmE9j)79M{r?6k2{5FJvugc`X#hUjE%I$0RFPZn<czxxP*ABr4
+zr>Y4lb=>@Wf4g$CvgeDhlAB)q7R`Aa`ndTz)0t3~B`-{xE_U=zvN2tf)1$sWC4b71
+zqOhF(5pUO2tUMJYy|P%n-~WY4*$xvo$AaQD@z%@3I4bA<VN+H;S+TkyO6%&bhw&eG
+zx-)+34BF~_+L!y@eGgGq?!=4USNd8^Pv|UR*VyPDqPEKV%x<5h$95|x_Q;B_zie8X
+fG3m?vvRVCJx>4F|&%L{Rp!-*ntBHZeiYO}pxWG3{
+
+literal 0
+HcmV?d00001
+
+diff --git a/Tests/ZwzCoreTests/ZWZV3/ZwzV3CompatibilityTests.swift b/Tests/ZwzCoreTests/ZWZV3/ZwzV3CompatibilityTests.swift
+new file mode 100644
+index 0000000..7cd732f
+--- /dev/null
++++ b/Tests/ZwzCoreTests/ZWZV3/ZwzV3CompatibilityTests.swift
+@@ -0,0 +1,331 @@
++import CryptoKit
++import Foundation
++import XCTest
++@testable import ZwzCore
++
++final class ZwzV3CompatibilityTests: XCTestCase {
++    func testV1HeaderIsDetectedAndTruthfullyRejectedAsUnsupported() throws {
++        let archive = try fixture("v1-header.zwz")
++
++        XCTAssertEqual(try ZwzAPI().detectFormat(archivePath: archive.path), .zwz)
++        XCTAssertThrowsError(try ZwzAPI().list(archivePath: archive.path)) { error in
++            XCTAssertEqual(error as? ZwzV2Error, .unsupportedVersion(1))
++        }
++    }
++
++    func testFixedV2UnencryptedFixtureCanBeDetectedListedAndExtracted() throws {
++        let archive = try fixture("v2-unencrypted.zwz")
++        let api = ZwzAPI()
++        XCTAssertEqual(try api.detectFormat(archivePath: archive.path), .zwz)
++
++        let listing = try api.list(archivePath: archive.path, keyProvider: nil)
++        XCTAssertEqual(listing.version, 2)
++        XCTAssertEqual(listing.securityInfo?.encryption, ZwzArchiveEncryptionKind.none)
++        XCTAssertEqual(listing.entries.map(\.path), expectedEntryPaths)
++
++        try assertExtractedFixture(archive: archive, password: nil, keyProvider: nil)
++    }
++
++    func testFixedV2PasswordFixtureCanBeDetectedListedAndExtracted() throws {
++        let archive = try fixture("v2-password.zwz")
++        let api = ZwzAPI()
++        XCTAssertEqual(try api.detectFormat(archivePath: archive.path), .zwz)
++
++        let listing = try api.list(
++            archivePath: archive.path,
++            password: CompatibilityMaterial.v2Password,
++            keyProvider: nil
++        )
++        XCTAssertEqual(listing.version, 2)
++        XCTAssertEqual(listing.securityInfo?.encryption, .password)
++        XCTAssertEqual(listing.entries.map(\.path), expectedEntryPaths)
++
++        try assertExtractedFixture(
++            archive: archive,
++            password: CompatibilityMaterial.v2Password,
++            keyProvider: nil
++        )
++        XCTAssertThrowsError(try api.list(
++            archivePath: archive.path,
++            password: "TEST-ONLY wrong fixture password",
++            keyProvider: nil
++        )) { error in
++            XCTAssertEqual(error as? ZwzV2Error, .wrongPasswordOrTamperedData)
++        }
++    }
++
++    func testFixedUnsignedV3FixtureCanBeOpenedByEveryIntendedRecipient() throws {
++        let archive = try fixture("v3-unsigned-multi-recipient.zwz")
++        let api = ZwzAPI()
++        XCTAssertEqual(try api.detectFormat(archivePath: archive.path), .zwz)
++        let inspection = try api.inspect(archivePath: archive.path)
++        XCTAssertEqual(inspection.recipients.count, 2)
++        XCTAssertEqual(inspection.securityInfo.signature, .unsigned)
++
++        for identity in try CompatibilityMaterial.recipientIdentities() {
++            let listing = try api.list(
++                archivePath: archive.path,
++                password: nil,
++                keyProvider: identity.provider
++            )
++            XCTAssertEqual(listing.version, 3)
++            XCTAssertEqual(listing.securityInfo?.encryption, .publicKey)
++            XCTAssertEqual(listing.securityInfo?.signature, .unsigned)
++            XCTAssertEqual(listing.securityInfo?.recipientFingerprints.count, 2)
++            XCTAssertEqual(listing.entries.map(\.path), expectedEntryPaths)
++            try assertExtractedFixture(archive: archive, password: nil, keyProvider: identity.provider)
++        }
++    }
++
++    func testFixedSignedV3FixtureClassifiesKnownAndUnknownSigner() throws {
++        let archive = try fixture("v3-signed-multi-recipient.zwz")
++        let identities = try CompatibilityMaterial.recipientIdentities()
++        let alice = try XCTUnwrap(identities.first)
++        let signing = try CompatibilityMaterial.signingMaterial()
++        let api = ZwzAPI()
++
++        let unknownInspection = try api.inspect(archivePath: archive.path)
++        XCTAssertEqual(unknownInspection.recipients.count, 2)
++        XCTAssertEqual(
++            unknownInspection.securityInfo.signature,
++            .validUnknownSigner(name: "Fixture Alice", fingerprint: signing.fingerprint)
++        )
++        let unknown = try api.list(
++            archivePath: archive.path,
++            password: nil,
++            keyProvider: alice.provider
++        )
++        XCTAssertEqual(
++            unknown.securityInfo?.signature,
++            .validUnknownSigner(name: "Fixture Alice", fingerprint: signing.fingerprint)
++        )
++
++        let knownProvider = CompatibilityProvider(
++            agreementKeys: [alice.recipient.fingerprint: alice.agreementPrivateKey],
++            knownSigningKeys: [signing.fingerprint: signing.publicKey]
++        )
++        let knownInspection = try api.inspect(archivePath: archive.path, keyProvider: knownProvider)
++        XCTAssertEqual(
++            knownInspection.securityInfo.signature,
++            .validKnownSigner(name: "Fixture Alice", fingerprint: signing.fingerprint)
++        )
++        let known = try api.list(
++            archivePath: archive.path,
++            password: nil,
++            keyProvider: knownProvider
++        )
++        XCTAssertEqual(
++            known.securityInfo?.signature,
++            .validKnownSigner(name: "Fixture Alice", fingerprint: signing.fingerprint)
++        )
++
++        for identity in identities {
++            try assertExtractedFixture(archive: archive, password: nil, keyProvider: identity.provider)
++        }
++    }
++
++    func testOneByteMutationOfSignedCanonicalBytesIsRefused() throws {
++        let archive = try fixture("v3-signed-multi-recipient.zwz")
++        let parsed = try ZwzV3BinaryCodec.parse(Data(contentsOf: archive))
++        let mutated = try mutatedCopy(of: archive, offset: Int(parsed.header.dataRegionOffset))
++        defer { try? FileManager.default.removeItem(at: mutated.deletingLastPathComponent()) }
++        let alice = try XCTUnwrap(CompatibilityMaterial.recipientIdentities().first)
++
++        XCTAssertThrowsError(try ZwzAPI().list(
++            archivePath: mutated.path,
++            password: nil,
++            keyProvider: alice.provider
++        )) { error in
++            XCTAssertEqual(error as? ZwzV3Error, .invalidSignature)
++        }
++    }
++
++    func testOneByteMutationOfAuthenticatedEncryptedDataIsRefused() throws {
++        let archive = try fixture("v3-unsigned-multi-recipient.zwz")
++        let parsed = try ZwzV3BinaryCodec.parse(Data(contentsOf: archive))
++        let mutated = try mutatedCopy(of: archive, offset: Int(parsed.header.dataRegionOffset) + 32)
++        defer { try? FileManager.default.removeItem(at: mutated.deletingLastPathComponent()) }
++        let alice = try XCTUnwrap(CompatibilityMaterial.recipientIdentities().first)
++
++        XCTAssertThrowsError(try ZwzAPI().list(
++            archivePath: mutated.path,
++            password: nil,
++            keyProvider: alice.provider
++        )) { error in
++            XCTAssertEqual(error as? ZwzV3Error, .authenticationFailed)
++        }
++    }
++
++    func testCommittedFixtureSHA256DigestsAreLocked() throws {
++        // V2 archive IDs/salts and V3 content/ephemeral keys are intentionally random.
++        // Fixed fixture hashes provide a stable compatibility contract instead of regeneration.
++        let expected = [
++            "v1-header.zwz": "73cec77339335583c48e6ee2aca6c75a7c3279cffa633fea299258833716a3ed",
++            "v2-password.zwz": "7d5d2ad28238e61b8d00720d93789963235792650599e18bb5016715454889b6",
++            "v2-unencrypted.zwz": "49db99117788d180850e1856e59d8e914034fefaaa59aec4344e799abfa0b3d4",
++            "v3-signed-multi-recipient.zwz": "fcf6e395bebb10db6ae68a20c321bd1203c83274321507d100c4d76314267007",
++            "v3-unsigned-multi-recipient.zwz": "edb480f7e291c59d26acccac2f618747ab64d22a9a40afe72154b49c262fc7e2",
++        ]
++
++        for (name, digest) in expected {
++            let bytes = try Data(contentsOf: fixture(name))
++            XCTAssertEqual(SHA256.hash(data: bytes).hexString, digest, name)
++        }
++    }
++
++    private let expectedEntryPaths = ["hello.txt", "nested", "nested/data.bin"]
++
++    private func fixture(_ name: String) throws -> URL {
++        guard let url = Bundle.module.url(
++            forResource: name,
++            withExtension: nil,
++            subdirectory: "Fixtures"
++        ) else {
++            throw FixtureError.missing(name)
++        }
++        return url
++    }
++
++    private func assertExtractedFixture(
++        archive: URL,
++        password: String?,
++        keyProvider: ZwzPrivateKeyProvider?
++    ) throws {
++        let directory = FileManager.default.temporaryDirectory
++            .appendingPathComponent("zwz-compat-extract-\(UUID().uuidString)", isDirectory: true)
++        defer { try? FileManager.default.removeItem(at: directory) }
++        _ = try ZwzAPI().extract(
++            archivePath: archive.path,
++            destinationPath: directory.path,
++            password: password,
++            keyProvider: keyProvider
++        )
++        XCTAssertEqual(
++            try Data(contentsOf: directory.appendingPathComponent("hello.txt")),
++            Data("fixture hello\n".utf8)
++        )
++        XCTAssertEqual(
++            try Data(contentsOf: directory.appendingPathComponent("nested/data.bin")),
++            Data(0..<16)
++        )
++    }
++
++    private func mutatedCopy(of archive: URL, offset: Int) throws -> URL {
++        var bytes = try Data(contentsOf: archive)
++        bytes[offset] ^= 0x01
++        let directory = FileManager.default.temporaryDirectory
++            .appendingPathComponent("zwz-compat-mutation-\(UUID().uuidString)", isDirectory: true)
++        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
++        let result = directory.appendingPathComponent("mutated.zwz")
++        try bytes.write(to: result)
++        return result
++    }
++}
++
++// These constants are deterministic compatibility-test secrets only. They are
++// not generated from, shared with, or suitable for any production identity.
++private enum CompatibilityMaterial {
++    static let v2Password = "TEST-ONLY fixture password: v2"
++    static let aliceAgreementPrivateKey = Data((1...32).map(UInt8.init))
++    static let bobAgreementPrivateKey = Data((33...64).map(UInt8.init))
++    static let aliceSigningPrivateKey = Data((65...96).map(UInt8.init))
++
++    struct RecipientIdentity {
++        let recipient: ZwzRecipient
++        let agreementPrivateKey: Data
++
++        var provider: CompatibilityProvider {
++            CompatibilityProvider(agreementKeys: [recipient.fingerprint: agreementPrivateKey])
++        }
++    }
++
++    struct SigningMaterial {
++        let identity: ZwzSigningIdentity
++        let privateKey: Data
++        let publicKey: Data
++        let fingerprint: String
++    }
++
++    static func recipientIdentities() throws -> [RecipientIdentity] {
++        try [
++            recipient(name: "Fixture Alice", privateKey: aliceAgreementPrivateKey, signingPrivateKey: aliceSigningPrivateKey),
++            recipient(name: "Fixture Bob", privateKey: bobAgreementPrivateKey, signingPrivateKey: nil),
++        ]
++    }
++
++    static func signingMaterial() throws -> SigningMaterial {
++        let agreement = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: aliceAgreementPrivateKey)
++        let signing = try Curve25519.Signing.PrivateKey(rawRepresentation: aliceSigningPrivateKey)
++        let fingerprint = ZwzV3Crypto.fingerprint(
++            agreement: agreement.publicKey.rawRepresentation,
++            signing: signing.publicKey.rawRepresentation
++        )
++        return SigningMaterial(
++            identity: ZwzSigningIdentity(
++                name: "Fixture Alice",
++                fingerprint: fingerprint,
++                agreementPublicKey: agreement.publicKey.rawRepresentation,
++                signingPublicKey: signing.publicKey.rawRepresentation
++            ),
++            privateKey: signing.rawRepresentation,
++            publicKey: signing.publicKey.rawRepresentation,
++            fingerprint: fingerprint
++        )
++    }
++
++    private static func recipient(
++        name: String,
++        privateKey: Data,
++        signingPrivateKey: Data?
++    ) throws -> RecipientIdentity {
++        let agreement = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: privateKey)
++        let signingPublicKey = try signingPrivateKey.map {
++            try Curve25519.Signing.PrivateKey(rawRepresentation: $0).publicKey.rawRepresentation
++        }
++        let fingerprint = ZwzV3Crypto.fingerprint(
++            agreement: agreement.publicKey.rawRepresentation,
++            signing: signingPublicKey
++        )
++        return RecipientIdentity(
++            recipient: ZwzRecipient(
++                name: name,
++                fingerprint: fingerprint,
++                agreementPublicKey: agreement.publicKey.rawRepresentation
++            ),
++            agreementPrivateKey: agreement.rawRepresentation
++        )
++    }
++}
++
++private final class CompatibilityProvider: ZwzPrivateKeyProvider, @unchecked Sendable {
++    private let agreementKeys: [String: Data]
++    private let knownSigningKeys: [String: Data]
++
++    init(agreementKeys: [String: Data], knownSigningKeys: [String: Data] = [:]) {
++        self.agreementKeys = agreementKeys
++        self.knownSigningKeys = knownSigningKeys
++    }
++
++    func agreementPrivateKey(fingerprint: String, reason: String) throws -> Data {
++        guard let key = agreementKeys[fingerprint] else {
++            throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++        }
++        return key
++    }
++
++    func signingPrivateKey(fingerprint: String, reason: String) throws -> Data {
++        throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++    }
++
++    func isKnownSigningKey(fingerprint: String, signingPublicKey: Data) -> Bool {
++        knownSigningKeys[fingerprint] == signingPublicKey
++    }
++}
++
++private enum FixtureError: Error {
++    case missing(String)
++}
++
++private extension SHA256.Digest {
++    var hexString: String { map { String(format: "%02x", $0) }.joined() }
++}
+diff --git a/scripts/check-app-bundle.sh b/scripts/check-app-bundle.sh
+index 7ceec41..57b609d 100755
+--- a/scripts/check-app-bundle.sh
++++ b/scripts/check-app-bundle.sh
+@@ -3,27 +3,109 @@ set -euo pipefail
+ 
+ APP_BUNDLE="${1:?Usage: check-app-bundle.sh /path/to/ZwZ.app}"
+ INFO_PLIST="$APP_BUNDLE/Contents/Info.plist"
+-ICON_FILE="$APP_BUNDLE/Contents/Resources/ZwZ.icns"
++RESOURCES="$APP_BUNDLE/Contents/Resources"
++
++require_mode_bits_for_all() {
++  local path="$1"
++  local required="$2"
++  local description="$3"
++  local mode
++  mode="$(/usr/bin/stat -f '%Lp' "$path")"
++  local owner=$(( (mode / 100) % 10 ))
++  local group=$(( (mode / 10) % 10 ))
++  local other=$(( mode % 10 ))
++  (( (owner & required) == required &&
++     (group & required) == required &&
++     (other & required) == required )) || {
++    printf '%s must be available to owner, group, and other users: %s (mode %s)\n' \
++      "$description" "$path" "$mode" >&2
++    exit 1
++  }
++}
++
++require_readable_by_all() { require_mode_bits_for_all "$1" 4 "Resource"; }
++require_traversable_by_all() { require_mode_bits_for_all "$1" 5 "Directory"; }
++require_executable_by_all() { require_mode_bits_for_all "$1" 5 "Executable"; }
++
++[[ -d "$APP_BUNDLE" && -r "$APP_BUNDLE" ]] || {
++  printf 'App bundle is not readable: %s\n' "$APP_BUNDLE" >&2
++  exit 1
++}
++require_traversable_by_all "$APP_BUNDLE"
++require_traversable_by_all "$APP_BUNDLE/Contents"
+ 
+ [[ -r "$INFO_PLIST" ]] || {
+   printf 'Info.plist is not readable: %s\n' "$INFO_PLIST" >&2
+   exit 1
+ }
+ 
+-[[ -r "$ICON_FILE" ]] || {
++/usr/bin/plutil -lint "$INFO_PLIST" >/dev/null
++require_readable_by_all "$INFO_PLIST"
++
++EXECUTABLE_NAME="$(/usr/bin/plutil -extract CFBundleExecutable raw -o - "$INFO_PLIST")"
++[[ -n "$EXECUTABLE_NAME" && "$EXECUTABLE_NAME" != */* ]] || {
++  printf 'Invalid CFBundleExecutable in: %s\n' "$INFO_PLIST" >&2
++  exit 1
++}
++EXECUTABLE="$APP_BUNDLE/Contents/MacOS/$EXECUTABLE_NAME"
++require_traversable_by_all "$APP_BUNDLE/Contents/MacOS"
++[[ -f "$EXECUTABLE" && -r "$EXECUTABLE" && -x "$EXECUTABLE" ]] || {
++  printf 'App executable is not readable and executable: %s\n' "$EXECUTABLE" >&2
++  exit 1
++}
++require_executable_by_all "$EXECUTABLE"
++
++ICON_NAME="$(/usr/bin/plutil -extract CFBundleIconFile raw -o - "$INFO_PLIST")"
++[[ -n "$ICON_NAME" && "$ICON_NAME" != */* ]] || {
++  printf 'Invalid CFBundleIconFile in: %s\n' "$INFO_PLIST" >&2
++  exit 1
++}
++[[ "$ICON_NAME" == *.* ]] || ICON_NAME="$ICON_NAME.icns"
++ICON_FILE="$RESOURCES/$ICON_NAME"
++require_traversable_by_all "$RESOURCES"
++[[ -f "$ICON_FILE" && -r "$ICON_FILE" ]] || {
+   printf 'App icon is not readable: %s\n' "$ICON_FILE" >&2
+   exit 1
+ }
++require_readable_by_all "$ICON_FILE"
+ 
+-/usr/bin/plutil -lint "$INFO_PLIST" >/dev/null
+-[[ "$(/usr/bin/stat -f '%A' "$INFO_PLIST")" =~ [4-7][0-7][4-7]$ ]] || {
+-  printf 'Info.plist must be readable by all users: %s\n' "$INFO_PLIST" >&2
++LOGO_FILE="$RESOURCES/ZwZLogo.png"
++[[ -f "$LOGO_FILE" && -r "$LOGO_FILE" ]] || {
++  printf 'App logo resource is not readable: %s\n' "$LOGO_FILE" >&2
+   exit 1
+ }
++require_readable_by_all "$LOGO_FILE"
+ 
+-[[ "$(/usr/bin/stat -f '%A' "$ICON_FILE")" =~ [4-7][0-7][4-7]$ ]] || {
+-  printf 'App icon must be readable by all users: %s\n' "$ICON_FILE" >&2
++RESOURCE_BUNDLE="$RESOURCES/zwz_ZwzGUI.bundle"
++[[ -d "$RESOURCE_BUNDLE" && -r "$RESOURCE_BUNDLE" ]] || {
++  printf 'Expected SwiftPM resource bundle is missing: %s\n' "$RESOURCE_BUNDLE" >&2
++  exit 1
++}
++require_traversable_by_all "$RESOURCE_BUNDLE"
++RESOURCE_LOGO="$RESOURCE_BUNDLE/ZwZLogo.png"
++[[ -f "$RESOURCE_LOGO" && -r "$RESOURCE_LOGO" ]] || {
++  printf 'Bundled logo resource is not readable: %s\n' "$RESOURCE_LOGO" >&2
+   exit 1
+ }
++require_readable_by_all "$RESOURCE_LOGO"
++
++SIGNATURE_DETAILS="$(/usr/bin/codesign --display --verbose=2 "$APP_BUNDLE" 2>&1 || true)"
++if [[ "$SIGNATURE_DETAILS" != *"Info.plist=not bound"* &&
++      "$SIGNATURE_DETAILS" != *"Sealed Resources=none"* ]]; then
++  /usr/bin/codesign --verify --deep --strict "$APP_BUNDLE"
++  printf 'App bundle code signature is valid: %s\n' "$APP_BUNDLE"
++else
++  # package-app.sh performs this preflight before applying its ad-hoc bundle signature.
++  # Verify a copy outside the unfinished bundle so codesign does not expect sealed resources yet.
++  TEMP_EXECUTABLE="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/zwz-signature-check.XXXXXX")"
++  cleanup_signature_copy() { /bin/rm -f "$TEMP_EXECUTABLE"; }
++  trap cleanup_signature_copy EXIT
++  /bin/cp "$EXECUTABLE" "$TEMP_EXECUTABLE"
++  /bin/chmod 755 "$TEMP_EXECUTABLE"
++  /usr/bin/codesign --verify --strict "$TEMP_EXECUTABLE"
++  cleanup_signature_copy
++  trap - EXIT
++  printf 'Unsigned bundle preflight passed; executable signature is valid: %s\n' "$EXECUTABLE"
++fi
+ 
+-printf 'App bundle resources are readable: %s\n' "$APP_BUNDLE"
++printf 'App bundle structure and resources are valid: %s\n' "$APP_BUNDLE"

@@ -73,13 +73,33 @@ public class ZipCompressor {
 
     // MARK: - Multi-threaded Compression
 
-    private struct CompressedEntry {
+    private struct CompressedEntry: Sendable {
         let relativePath: String
         let isDirectory: Bool
-        let data: Data           // 压缩后的数据 (或未压缩)
-        let crc32: UInt32
-        let originalSize: UInt32
-        let modifiedDate: Date?
+        let data: Data
+    }
+
+    private final class ConcurrentCompressionResults: @unchecked Sendable {
+        private let lock = NSLock()
+        private var entries: [CompressedEntry?]
+        private var errors: [Error?]
+
+        init(count: Int) {
+            entries = Array(repeating: nil, count: count)
+            errors = Array(repeating: nil, count: count)
+        }
+
+        func store(_ entry: CompressedEntry, at index: Int) {
+            lock.withLock { entries[index] = entry }
+        }
+
+        func store(_ error: Error, at index: Int) {
+            lock.withLock { errors[index] = error }
+        }
+
+        func snapshot() -> (entries: [CompressedEntry?], errors: [Error?]) {
+            lock.withLock { (entries, errors) }
+        }
     }
 
     private func compressMultithreaded(
@@ -94,41 +114,34 @@ public class ZipCompressor {
         let compressionMethod: CompressionMethod = options.level == .none ? .none : .deflate
 
         // 并行压缩各文件到内存（仅预计算 CRC 和原始大小，实际压缩由 ZIPFoundation 在组装时完成）
-        var results = [CompressedEntry?](repeating: nil, count: files.count)
-        var errors: [Error?] = Array(repeating: nil, count: files.count)
+        let concurrentResults = ConcurrentCompressionResults(count: files.count)
 
         DispatchQueue.concurrentPerform(iterations: files.count) { idx in
             let file = files[idx]
             do {
                 if file.isDirectory {
-                    results[idx] = CompressedEntry(
+                    concurrentResults.store(CompressedEntry(
                         relativePath: file.relativePath + "/",
                         isDirectory: true,
-                        data: Data(),
-                        crc32: 0,
-                        originalSize: 0,
-                        modifiedDate: nil
-                    )
+                        data: Data()
+                    ), at: idx)
                 } else {
                     let fileData = try Data(contentsOf: file.url)
-                    let crc = crc32(fileData)
-                    let modDate = (try? file.url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-                    results[idx] = CompressedEntry(
+                    concurrentResults.store(CompressedEntry(
                         relativePath: file.relativePath,
                         isDirectory: false,
-                        data: fileData,  // 存原始数据，压缩由 ZIPFoundation 完成
-                        crc32: crc,
-                        originalSize: UInt32(fileData.count),
-                        modifiedDate: modDate
-                    )
+                        data: fileData
+                    ), at: idx)
                 }
             } catch {
-                errors[idx] = error
+                concurrentResults.store(error, at: idx)
             }
         }
 
+        let results = concurrentResults.snapshot()
+
         // 检查错误
-        for (idx, err) in errors.enumerated() {
+        for (idx, err) in results.errors.enumerated() {
             if let err = err {
                 throw ZwzError.compressionFailed("File \(files[idx].relativePath): \(err.localizedDescription)")
             }
@@ -136,7 +149,7 @@ public class ZipCompressor {
 
         // 单线程快速组装 ZIP 结构 — 使用临时文件方式让 ZIPFoundation 压缩
         let archive = try ZIPFoundation.Archive(url: destinationURL, accessMode: .create)
-        for (idx, result) in results.enumerated() {
+        for (idx, result) in results.entries.enumerated() {
             try cancellationToken?.checkCancellation()
             guard let entry = result else { continue }
             if entry.isDirectory {

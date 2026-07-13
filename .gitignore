@@ -1,10 +1,5 @@
-# ── 核心算法排除（ZWZV2 格式）─────────────────────────────
-Sources/ZwzCore/ZWZV2/
-Tests/ZwzCoreTests/ZWZV2/
-
-# ── V2 格式设计文档 ───────────────────────────────────────────
-docs/superpowers/specs/2026-07-11-zwz-v2-format-design.md
-docs/superpowers/plans/2026-07-11-zwz-v2-implementation.md
+# ── 私钥备份 ─────────────────────────────────────────────────
+*.zwzkey
 
 # ── macOS 杂项 ────────────────────────────────────────────────
 .DS_Store

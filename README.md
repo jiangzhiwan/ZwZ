@@ -9,23 +9,23 @@
 
 ## 为什么选择 ZwZ？
 
-### 🔐 军用级加密，隐私至上
+### 🔐 标准认证加密，隐私优先
 
-ZwZ 自研的 **ZWZ 格式**采用 AES-256-GCM 认证加密——不仅加密文件内容，连同**文件名、路径、大小、时间戳、目录结构**全部隐藏。密码错误时，攻击者连压缩包里有什么都无从知晓。密码强度实时评估，弱密码即时提示。
+ZWZ 使用 AES-256-GCM 认证加密保护归档内容。加密归档会同时保护文件名、路径、大小、时间戳和目录结构；无加密模式则不会隐藏这些元数据。密码强度会在界面中即时提示。
 
 ### 🧩 全格式覆盖，一个就够
 
 | 操作 | 支持格式 |
 |------|----------|
-| 压缩 | ZIP、ZWZ |
+| 创建 | ZIP、ZWZ |
 | 解压 | ZIP、RAR、7Z、TAR.GZ、TGZ、GZ、ZWZ |
-| 预览 | 以上全部 |
+| 预览 | 上述格式（能力取决于系统工具与归档内容） |
 
-无需安装多个解压工具，ZwZ 一站式解决。
+ZIP 和 ZWZ 支持写入；RAR、7Z、TAR.GZ、TGZ、GZ 主要用于读取、解压和预览。RAR/7Z 的部分能力需要系统中可用的 `unar`、`unrar` 或 `7z` 等工具。
 
 ### ⚡ 多线程并行，极速处理
 
-大文件自动分块并行压缩/解压，线程数自适应 CPU 核心数。**10 MB 以上文件自动触发并行管线**，在多核 Mac 上榨干每一分性能。
+ZWZ 按块处理数据，ZIP 对多个文件进行并行预读；线程数可按路径自动选择，也可以手动配置。不同格式使用不同的压缩和解压管线。
 
 ### 🎨 macOS 原生体验，小清新美学
 
@@ -66,9 +66,25 @@ zwz list archive.rar
 
 GUI 适合日常使用，CLI 适合脚本自动化和远程服务器。
 
+### 🗂️ 归档预览、编辑与批量重命名
+
+主界面提供浏览器式标签页、归档内搜索和预览侧栏；文本、图片和视频预览均设置了资源上限。ZIP/ZWZ 归档可进入编辑工作流，执行重命名、删除和保存。
+
+批量重命名支持查找替换、前后缀、序号/模板、正则替换和大小写转换，应用前会显示预览，名称冲突自动编号。GUI 与 CLI 共用同一套规则引擎：
+
+```bash
+# 仅预览，不修改归档
+zwz rename archive.zip --rule find-replace \
+  --find draft --replace final --dry-run
+
+# 添加前缀，并只处理匹配的顶层条目
+zwz rename archive.zwz --rule prefix-suffix \
+  --prefix 2026- --filter '*.txt'
+```
+
 ---
 
-## ZWZ 公钥加密与签名
+## ZWZ V3 公钥加密与签名
 
 ZWZ 支持无加密、密码加密和公钥加密三种模式。密码与公钥模式互斥；公钥模式可以同时选择多个接收方，并可选择一个本机身份进行 Ed25519 签名。任一接收方持有匹配的 X25519 私钥即可解密，文件内容、文件名、路径、大小、时间戳和目录结构均由 AES-256-GCM 认证加密保护。
 
@@ -101,7 +117,7 @@ zwz key restore identity.zwzkey
 
 可重复使用 `--recipient <name-or-fingerprint>` 添加多个接收方。`--sign` 只能选择本机身份，并且必须与至少一个 `--recipient` 一起使用。密码加密使用 `--password`，不能与 `--recipient` 或 `--sign` 同时使用。
 
-### ZwzCore
+### ZwzCore 接口
 
 `CompressionOptions.encryption` 提供 `.none`、`.password` 和 `.publicKey`。公钥压缩、列表与解压通过带 `ZwzPrivateKeyProvider` 的 `ZwzAPI` 重载完成，并返回包含格式版本、加密类型、接收方指纹和结构化签名状态的结果。`ZwzAPI.inspect` 可在请求私钥及解密索引前读取公开接收方标签并验证可选签名。
 
@@ -117,24 +133,23 @@ zwz key restore identity.zwzkey
 ## 架构设计
 
 ```
-┌─────────────────────────────────────┐
-│           ZwZ GUI (App)             │
-│  SwiftUI · 标签页 · 拖拽 · 设置     │
-├─────────────────────────────────────┤
-│           ZwZ CLI (zwz)             │
-│  命令行工具 · 脚本集成               │
-├─────────────────────────────────────┤
-│         ZwzCore (Library)           │
-│  统一 API · 压缩 · 解压 · 预览 · 加密 │
-├──────────┬──────────┬───────────────┤
-│ ZIP (AES)│   RAR    │ 7Z / TAR.GZ   │
-│ Foundation│SWCompr. │  SWCompression│
-└──────────┴──────────┴───────────────┘
+┌─────────────────────────────────────────┐
+│             ZwZ GUI (App)               │
+│     SwiftUI · 标签页 · 预览 · 编辑       │
+├─────────────────────────────────────────┤
+│             ZwZ CLI (zwz)               │
+│       压缩 · 解压 · 列表 · 批量重命名     │
+├─────────────────────────────────────────┤
+│              ZwzCore (Library)          │
+│   统一 API · 格式编解码 · 压缩/解压 · 加密 │
+├─────────────────────────────────────────┤
+│ ZIPFoundation · SWCompression · CryptoSwift │
+└─────────────────────────────────────────┘
 ```
 
-- **ZwzCore** — 纯 Swift 库，无 GUI 依赖，可独立集成到任何 Swift 项目
-- **ZwzGUI** — macOS 原生应用，SwiftUI + AppKit 混合
-- **zwz** — 命令行可执行文件
+- **ZwzGUI** — macOS 原生应用，负责界面、工作区和交互流程
+- **zwz** — 命令行可执行文件，负责脚本入口和身份管理命令
+- **ZwzCore** — 统一承载归档格式、加密、解压、预览、编辑与工作流能力
 
 ---
 
@@ -143,8 +158,7 @@ zwz key restore identity.zwzkey
 ### 环境要求
 
 - macOS 15.0+
-- Xcode 16.0+
-- Swift 6.3
+- 支持 Swift 6.3 的 Xcode 或 Swift toolchain
 
 ### 构建
 
@@ -152,40 +166,28 @@ zwz key restore identity.zwzkey
 git clone git@github.com:jiangzhiwan/ZwZ.git
 cd ZwZ
 swift build
-```
-
-### 运行 CLI
-
-```bash
 swift run zwz help
-```
-
-### 运行 GUI
-
-```bash
 swift run ZwzGUI
-```
-
-### 运行测试
-
-```bash
 swift test
+./build-app.command
+./build-installer.command
 ```
 
 ---
 
 ## 技术亮点
 
-| 特性 | 实现 |
+| 特性 | 说明 |
 |------|------|
-| 加密 | AES-256-GCM；密码模式 PBKDF2，公钥模式 X25519 + HKDF-SHA-256 |
+| 归档保护 | ZWZ 支持 AES-256-GCM 认证加密、公钥接收方和可选签名 |
 | 签名 | 可选 Ed25519，区分已知、未知、未签名和无效状态 |
-| 压缩 | Deflate / LZMA / Store（Apple Compression） |
-| ZIP 支持 | ZIPFoundation（AES 加密读写） |
-| RAR/7Z/TAR | SWCompression（纯 Swift 解压） |
-| 并行 | 大文件自动分块 + OperationQueue 多线程 |
-| 取消 | CancellationToken 协作式取消，资源即时释放 |
-| 分卷 | 压缩时按 MB/KB 自动分割输出 |
+| 压缩 | Deflate、LZMA、Store 等路径按格式选择 |
+| ZIP I/O | ZIPFoundation 负责 ZIP 读写；具体加密能力取决于归档与系统工具 |
+| RAR/7Z/TAR | 以读取、解压和预览为主，必要时调用系统工具 |
+| 并发 | ZWZ 按块处理；ZIP 对多个文件进行并行预读；线程数可自动选择或配置 |
+| 编辑 | 归档条目重命名、删除、保存和批量重命名预览 |
+| 取消 | `CancellationToken` 协作式取消并及时清理资源 |
+| 分卷 | 支持按 MB/KB 设置分卷大小 |
 | 文件关联 | 系统级文件类型注册，双击即开 |
 | 持久化 | UserDefaults + 标签页状态自动恢复 |
 | 国际化 | 零外部依赖的中英双语方案 |
@@ -194,15 +196,13 @@ swift test
 
 ## 项目结构
 
-```
+```text
 ZwZ/
 ├── Sources/
-│   ├── ZwzCore/          # 核心库：压缩/解压/加密/预览
+│   ├── ZwzCore/          # 核心库：格式、加密、预览与工作流
 │   ├── ZwzGUI/           # macOS GUI 应用
 │   └── zwz/              # 命令行工具
-├── Tests/
-│   ├── ZwzCoreTests/     # 核心库单元测试
-│   └── ZwzGUITests/      # GUI 单元测试
+├── Tests/                # Core / GUI / CLI 测试
 ├── Packaging/            # App 图标、安装脚本
 ├── scripts/              # 构建/打包脚本
 ├── docs/                 # 设计文档
@@ -213,4 +213,4 @@ ZwZ/
 
 ## 许可
 
-MIT License
+当前仓库暂未附带单独的 `LICENSE` 文件。

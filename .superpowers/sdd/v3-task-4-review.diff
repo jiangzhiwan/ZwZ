@@ -1,0 +1,2187 @@
+diff --git a/Sources/ZwzCore/ZWZV3/ZwzV3Compressor.swift b/Sources/ZwzCore/ZWZV3/ZwzV3Compressor.swift
+new file mode 100644
+index 0000000..50729da
+--- /dev/null
++++ b/Sources/ZwzCore/ZWZV3/ZwzV3Compressor.swift
+@@ -0,0 +1,722 @@
++import CryptoKit
++import Foundation
++
++public final class ZwzV3Compressor {
++    private let blockSize: Int
++
++    public init(blockSize: Int = ZwzV2Format.defaultBlockSize) {
++        self.blockSize = blockSize
++    }
++
++    public func compress(
++        sourcePath: String,
++        destinationPath: String,
++        options: CompressionOptions,
++        keyProvider: ZwzPrivateKeyProvider?,
++        progress: ProgressHandler?,
++        cancellationToken: CancellationToken?
++    ) throws {
++        guard options.format == .zwz,
++              blockSize > 0,
++              blockSize <= Int(UInt32.max),
++              UInt64(blockSize) <= ZwzV3Extractor.defaultLogicalArchiveSizeLimit,
++              case .publicKey(let recipients, let signingIdentity) = try options.encryption.validated() else {
++            throw ZwzV3Error.recipientRequired
++        }
++        let splitSize = try options.splitVolume.map(Self.splitVolumeSize)
++        progress?(0)
++
++        let destination = URL(fileURLWithPath: destinationPath)
++        let parent = destination.deletingLastPathComponent()
++        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
++        let stagingDirectory = parent.appendingPathComponent(
++            ".\(destination.lastPathComponent).partial-\(UUID().uuidString)",
++            isDirectory: true
++        )
++        try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
++        defer { try? FileManager.default.removeItem(at: stagingDirectory) }
++
++        try cancellationToken?.checkCancellation()
++        let archiveID = UUID()
++        let contentKey = SymmetricKey(size: .bits256)
++        let envelopes = try ZwzV3Crypto.wrap(
++            contentKey: contentKey,
++            recipients: recipients,
++            archiveID: archiveID
++        )
++        var recipientRegion = Data()
++        for envelope in envelopes {
++            let record = try ZwzV3BinaryCodec.encodeRecipient(envelope)
++            let current = try Self.checkedAdd(
++                UInt64(ZwzV3Header.encodedLength),
++                UInt64(recipientRegion.count),
++                reason: "recipient region size overflow"
++            )
++            let projected = try Self.checkedAdd(
++                current,
++                UInt64(record.count),
++                reason: "recipient region size overflow"
++            )
++            try Self.requireWithinArchiveBudget(projected)
++            recipientRegion.append(record)
++        }
++        let sourceItems = try ZwzV2SourceEnumerator().enumerate(root: URL(fileURLWithPath: sourcePath))
++        var entries = sourceItems.map {
++            ZwzV2Entry(
++                path: $0.archivePath,
++                type: $0.type,
++                originalSize: $0.size,
++                modificationTime: normalizedModificationTime($0.modificationTime),
++                isHidden: $0.isHidden,
++                blocks: []
++            )
++        }
++        try ZwzV2PathValidator.validateNoDuplicatePaths(entries)
++        let entryPositions = Dictionary(uniqueKeysWithValues: entries.enumerated().map { ($1.path, $0) })
++        var totalBytes: UInt64 = 0
++        for item in sourceItems where item.type == .file {
++            totalBytes = try Self.checkedAdd(totalBytes, item.size, reason: "source size overflow")
++        }
++        var processedBytes: UInt64 = 0
++        var sequence: UInt64 = 0
++        var dataRegion = Data()
++        let dataRegionOffset = try Self.checkedAdd(
++            UInt64(ZwzV3Header.encodedLength),
++            UInt64(recipientRegion.count),
++            reason: "data region offset overflow"
++        )
++
++        for item in sourceItems where item.type == .file {
++            try cancellationToken?.checkCancellation()
++            let handle = try FileHandle(forReadingFrom: item.url)
++            defer { try? handle.close() }
++            var fileOffset: UInt64 = 0
++            while let chunk = try handle.read(upToCount: blockSize), !chunk.isEmpty {
++                try cancellationToken?.checkCancellation()
++                let encoded = try ZwzV2BlockCodec.encode(chunk, level: options.level.v3CompressionLevel)
++                guard let originalLength = UInt32(exactly: encoded.originalLength) else {
++                    throw ZwzV3Error.malformedArchive("block is too large")
++                }
++                let sealed = try ZwzV3Crypto.seal(
++                    encoded.payload,
++                    key: contentKey,
++                    nonce: AES.GCM.Nonce(),
++                    aad: ZwzV3PayloadCodec.blockAAD(
++                        archiveID: archiveID,
++                        sequence: sequence,
++                        codec: encoded.codec,
++                        originalLength: originalLength
++                    )
++                )
++                let archiveOffset = try Self.checkedAdd(
++                    dataRegionOffset,
++                    UInt64(dataRegion.count),
++                    reason: "data region offset overflow"
++                )
++                let record = try ZwzV3PayloadCodec.encodeRecord(
++                    sequence: sequence,
++                    codec: encoded.codec,
++                    originalLength: originalLength,
++                    sealed: sealed
++                )
++                let projectedSize = try Self.checkedAdd(
++                    archiveOffset,
++                    UInt64(record.count),
++                    reason: "logical archive size overflow"
++                )
++                try Self.requireWithinArchiveBudget(projectedSize)
++                dataRegion.append(record)
++                guard let entryIndex = entryPositions[item.archivePath],
++                      let storedLength = UInt32(exactly: sealed.count) else {
++                    throw ZwzV3Error.malformedArchive("invalid block descriptor")
++                }
++                entries[entryIndex].blocks.append(ZwzV2BlockDescriptor(
++                    sequence: sequence,
++                    fileOffset: fileOffset,
++                    archiveOffset: archiveOffset,
++                    storedLength: storedLength,
++                    originalLength: originalLength,
++                    codec: encoded.codec,
++                    checksum: encoded.checksum,
++                    authenticationTag: []
++                ))
++                guard sequence < UInt64.max else {
++                    throw ZwzV3Error.malformedArchive("too many data blocks")
++                }
++                sequence += 1
++                fileOffset = try Self.checkedAdd(
++                    fileOffset,
++                    UInt64(chunk.count),
++                    reason: "file offset overflow"
++                )
++                processedBytes = try Self.checkedAdd(
++                    processedBytes,
++                    UInt64(chunk.count),
++                    reason: "progress size overflow"
++                )
++                if totalBytes > 0 {
++                    progress?(min(0.9, Double(processedBytes) / Double(totalBytes) * 0.9))
++                }
++                try cancellationToken?.checkCancellation()
++            }
++        }
++
++        let index = ZwzV2Index(archiveID: archiveID, blockSize: blockSize, entries: entries)
++        let estimatedIndexLength = try Self.estimatedPlainIndexLength(entries: entries)
++        var projectedArchiveLength = try Self.checkedAdd(
++            dataRegionOffset,
++            UInt64(dataRegion.count),
++            reason: "logical archive size overflow"
++        )
++        projectedArchiveLength = try Self.checkedAdd(
++            projectedArchiveLength,
++            estimatedIndexLength,
++            reason: "logical archive size overflow"
++        )
++        projectedArchiveLength = try Self.checkedAdd(
++            projectedArchiveLength,
++            28,
++            reason: "logical archive size overflow"
++        )
++        try Self.requireWithinArchiveBudget(projectedArchiveLength)
++        let plainIndex = try ZwzV2IndexCodec.encodePlain(index)
++        let encryptedIndex = try ZwzV3Crypto.seal(
++            plainIndex,
++            key: contentKey,
++            nonce: AES.GCM.Nonce(),
++            aad: ZwzV3PayloadCodec.indexAAD(
++                archiveID: archiveID,
++                recipientCount: UInt32(envelopes.count),
++                recipientRegion: recipientRegion,
++                dataBlockCount: sequence,
++                dataRegion: dataRegion,
++                signatureAlgorithm: signingIdentity == nil ? .none : .ed25519
++            )
++        )
++
++        var archive = try assembleArchive(
++            recipients: recipients,
++            envelopes: envelopes,
++            dataRegion: dataRegion,
++            encryptedIndex: encryptedIndex,
++            archiveID: archiveID,
++            dataBlockCount: sequence,
++            signingIdentity: signingIdentity,
++            keyProvider: keyProvider
++        )
++        try ZwzV3PayloadCodec.verifyBuiltArchive(archive, contentKey: contentKey)
++        try cancellationToken?.checkCancellation()
++
++        let stagedDestination = stagingDirectory.appendingPathComponent(destination.lastPathComponent)
++        let writer = try ZwzV2VolumeWriter(
++            outputURL: stagedDestination,
++            archiveID: archiveID,
++            splitVolumeSize: splitSize
++        )
++        _ = try writer.write(archive)
++        archive.removeAll(keepingCapacity: false)
++        let stagedURLs = try writer.finalize()
++        let stagedArchive = try ZwzV3Extractor.loadLogicalArchive(
++            from: stagedURLs,
++            cancellationToken: cancellationToken
++        )
++        try ZwzV3PayloadCodec.verifyBuiltArchive(stagedArchive, contentKey: contentKey)
++        try cancellationToken?.checkCancellation()
++        try publish(stagedURLs: stagedURLs, destination: destination, stagingDirectory: stagingDirectory)
++        progress?(1)
++    }
++
++    private func assembleArchive(
++        recipients _: [ZwzRecipient],
++        envelopes: [ZwzV3RecipientEnvelope],
++        dataRegion: Data,
++        encryptedIndex: Data,
++        archiveID: UUID,
++        dataBlockCount: UInt64,
++        signingIdentity: ZwzSigningIdentity?,
++        keyProvider: ZwzPrivateKeyProvider?
++    ) throws -> Data {
++        let recipientRegionLength = try envelopes.reduce(into: 0) { length, envelope in
++            length = try Self.checkedIntAdd(
++                length,
++                ZwzV3BinaryCodec.encodeRecipient(envelope).count,
++                reason: "recipient region size overflow"
++            )
++        }
++        guard let signingIdentity else {
++            try Self.requireEncodedArchiveWithinBudget(
++                recipientRegionLength: recipientRegionLength,
++                dataRegionLength: dataRegion.count,
++                encryptedIndexLength: encryptedIndex.count,
++                signerRegionLength: 0
++            )
++            return try ZwzV3ArchiveCodec.encode(
++                recipients: envelopes,
++                dataRegion: dataRegion,
++                encryptedIndex: encryptedIndex,
++                signer: nil,
++                archiveID: archiveID,
++                dataBlockCount: dataBlockCount
++            )
++        }
++        guard let keyProvider else { throw ZwzV3Error.keyUnwrapFailed }
++        let rawPrivate: Data
++        do {
++            rawPrivate = try keyProvider.signingPrivateKey(
++                fingerprint: signingIdentity.fingerprint,
++                reason: "Sign ZWZ archive"
++            )
++        } catch ZwzV3Error.userAuthenticationCancelled {
++            throw ZwzV3Error.userAuthenticationCancelled
++        } catch ZwzV3Error.noMatchingPrivateKey {
++            throw ZwzV3Error.keyUnwrapFailed
++        } catch {
++            throw error
++        }
++        let privateKey: Curve25519.Signing.PrivateKey
++        do {
++            privateKey = try Curve25519.Signing.PrivateKey(rawRepresentation: rawPrivate)
++        } catch {
++            throw ZwzV3Error.keyUnwrapFailed
++        }
++        guard signingIdentity.agreementPublicKey.count == 32,
++              signingIdentity.signingPublicKey.count == 32,
++              privateKey.publicKey.rawRepresentation == signingIdentity.signingPublicKey,
++              ZwzV3Crypto.fingerprint(
++                agreement: signingIdentity.agreementPublicKey,
++                signing: signingIdentity.signingPublicKey
++              ) == signingIdentity.fingerprint else {
++            throw ZwzV3Error.keyUnwrapFailed
++        }
++        let placeholder = ZwzV3SignerRecord(
++            name: signingIdentity.name,
++            fingerprint: signingIdentity.fingerprint,
++            signingPublicKey: privateKey.publicKey.rawRepresentation,
++            signature: Data(repeating: 0, count: 64)
++        )
++        try Self.requireEncodedArchiveWithinBudget(
++            recipientRegionLength: recipientRegionLength,
++            dataRegionLength: dataRegion.count,
++            encryptedIndexLength: encryptedIndex.count,
++            signerRegionLength: try ZwzV3BinaryCodec.encodeSigner(placeholder).count
++        )
++        var archive = try ZwzV3ArchiveCodec.encode(
++            recipients: envelopes,
++            dataRegion: dataRegion,
++            encryptedIndex: encryptedIndex,
++            signer: placeholder,
++            archiveID: archiveID,
++            dataBlockCount: dataBlockCount
++        )
++        let parsed = try ZwzV3BinaryCodec.parse(archive)
++        let signature = try ZwzV3Crypto.sign(parsed.canonicalSignedBytes, privateKey: privateKey)
++        guard signature.count == 64, let offset = Int(exactly: parsed.header.signatureOffset) else {
++            throw ZwzV3Error.invalidSignature
++        }
++        archive.replaceSubrange(offset..<(offset + 64), with: signature)
++        return archive
++    }
++
++    private func publish(stagedURLs: [URL], destination: URL, stagingDirectory: URL) throws {
++        let fileManager = FileManager.default
++        let stagedMappings = stagedURLs.map { staged -> (URL, URL) in
++            if staged.pathExtension.lowercased() == "zwz" {
++                return (staged, destination)
++            }
++            return (staged, destination.deletingPathExtension().appendingPathExtension(staged.pathExtension))
++        }
++        let backupDirectory = stagingDirectory.appendingPathComponent("backups", isDirectory: true)
++        try fileManager.createDirectory(at: backupDirectory, withIntermediateDirectories: true)
++        if stagedMappings.count == 1 {
++            let staged = stagedMappings[0].0
++            if fileManager.fileExists(atPath: destination.path) {
++                _ = try fileManager.replaceItemAt(destination, withItemAt: staged)
++            } else {
++                try fileManager.moveItem(at: staged, to: destination)
++            }
++            try removeStaleVolumes(for: destination)
++            return
++        }
++        var backups: [(URL, URL)] = []
++        var published: [URL] = []
++        do {
++            let existing = try existingVolumeFamily(for: destination)
++            for final in existing {
++                let backup = backupDirectory.appendingPathComponent(UUID().uuidString)
++                try fileManager.moveItem(at: final, to: backup)
++                backups.append((backup, final))
++            }
++            for (staged, final) in stagedMappings {
++                try fileManager.moveItem(at: staged, to: final)
++                published.append(final)
++            }
++        } catch {
++            for url in published { try? fileManager.removeItem(at: url) }
++            for (backup, final) in backups { try? fileManager.moveItem(at: backup, to: final) }
++            throw error
++        }
++    }
++
++    private func removeStaleVolumes(for destination: URL) throws {
++        for url in try existingVolumeFamily(for: destination)
++            where url != destination && url.pathExtension.lowercased() != "zwz" {
++            try FileManager.default.removeItem(at: url)
++        }
++    }
++
++    private func existingVolumeFamily(for destination: URL) throws -> [URL] {
++        let parent = destination.deletingLastPathComponent()
++        let base = destination.deletingPathExtension().lastPathComponent
++        return try FileManager.default.contentsOfDirectory(
++            at: parent,
++            includingPropertiesForKeys: nil,
++            options: [.skipsHiddenFiles]
++        ).filter { url in
++            guard url.deletingPathExtension().lastPathComponent == base else { return false }
++            let ext = url.pathExtension.lowercased()
++            return ext == "zwz" || (ext.first == "z" && ext.dropFirst().allSatisfy(\.isNumber))
++        }
++    }
++
++    private func normalizedModificationTime(_ date: Date) -> Date {
++        Date(timeIntervalSince1970: (date.timeIntervalSince1970 * 1_000).rounded() / 1_000)
++    }
++
++    static func splitVolumeSize(_ splitVolume: SplitVolume) throws -> UInt64 {
++        let value: Int
++        let multiplier: Int64
++        switch splitVolume {
++        case .kiloBytes(let kilobytes):
++            value = kilobytes
++            multiplier = 1_024
++        case .megaBytes(let megabytes):
++            value = megabytes
++            multiplier = 1_024 * 1_024
++        }
++        guard value > 0, let signedValue = Int64(exactly: value) else {
++            throw ZwzV3Error.malformedArchive("invalid split volume size")
++        }
++        let result = signedValue.multipliedReportingOverflow(by: multiplier)
++        guard !result.overflow, let bytes = UInt64(exactly: result.partialValue), bytes > 0 else {
++            throw ZwzV3Error.malformedArchive("split volume size overflow")
++        }
++        return bytes
++    }
++
++    private static func requireEncodedArchiveWithinBudget(
++        recipientRegionLength: Int,
++        dataRegionLength: Int,
++        encryptedIndexLength: Int,
++        signerRegionLength: Int
++    ) throws {
++        var size = UInt64(ZwzV3Header.encodedLength)
++        for length in [recipientRegionLength, dataRegionLength, encryptedIndexLength, signerRegionLength] {
++            guard length >= 0 else {
++                throw ZwzV3Error.malformedArchive("logical archive size overflow")
++            }
++            size = try checkedAdd(size, UInt64(length), reason: "logical archive size overflow")
++        }
++        try requireWithinArchiveBudget(size)
++    }
++
++    private static func estimatedPlainIndexLength(entries: [ZwzV2Entry]) throws -> UInt64 {
++        var length: UInt64 = 30
++        for entry in entries {
++            let entryLength = try checkedAdd(
++                24,
++                UInt64(entry.path.utf8.count),
++                reason: "index size overflow"
++            )
++            length = try checkedAdd(
++                length,
++                entryLength,
++                reason: "index size overflow"
++            )
++            for block in entry.blocks {
++                let blockLength = try checkedAdd(
++                    38,
++                    UInt64(block.authenticationTag.count),
++                    reason: "index size overflow"
++                )
++                length = try checkedAdd(
++                    length,
++                    blockLength,
++                    reason: "index size overflow"
++                )
++            }
++        }
++        return length
++    }
++
++    private static func requireWithinArchiveBudget(_ size: UInt64) throws {
++        guard size <= ZwzV3Extractor.defaultLogicalArchiveSizeLimit else {
++            throw ZwzV3Error.malformedArchive("logical archive exceeds size limit")
++        }
++    }
++
++    private static func checkedIntAdd(_ lhs: Int, _ rhs: Int, reason: String) throws -> Int {
++        let result = lhs.addingReportingOverflow(rhs)
++        guard !result.overflow else { throw ZwzV3Error.malformedArchive(reason) }
++        return result.partialValue
++    }
++
++    private static func checkedAdd(_ lhs: UInt64, _ rhs: UInt64, reason: String) throws -> UInt64 {
++        let result = lhs.addingReportingOverflow(rhs)
++        guard !result.overflow else { throw ZwzV3Error.malformedArchive(reason) }
++        return result.partialValue
++    }
++}
++
++private extension CompressionLevel {
++    var v3CompressionLevel: ZwzV2CompressionLevel {
++        switch self {
++        case .none: return .none
++        case .fastest: return .fastest
++        case .normal: return .normal
++        case .max: return .max
++        }
++    }
++}
++
++struct ZwzV3DataRecord: Sendable {
++    let sequence: UInt64
++    let codec: ZwzV2Codec
++    let originalLength: UInt32
++    let sealed: Data
++    let archiveOffset: UInt64
++}
++
++enum ZwzV3PayloadCodec {
++    private static let blockDomain = Data("ZWZ3 data block v1".utf8)
++    private static let indexDomain = Data("ZWZ3 encrypted index v1".utf8)
++
++    static func encodeRecord(
++        sequence: UInt64,
++        codec: ZwzV2Codec,
++        originalLength: UInt32,
++        sealed: Data
++    ) throws -> Data {
++        guard originalLength > 0,
++              sealed.count >= 28,
++              let sealedLength = UInt32(exactly: sealed.count),
++              let recordLength = UInt32(exactly: 20 + sealed.count) else {
++            throw ZwzV3Error.malformedArchive("invalid data block record")
++        }
++        var data = Data()
++        append(recordLength, to: &data)
++        append(sequence, to: &data)
++        data.append(codec.rawValue)
++        data.append(contentsOf: [0, 0, 0])
++        append(originalLength, to: &data)
++        append(sealedLength, to: &data)
++        data.append(sealed)
++        return data
++    }
++
++    static func parseRecords(
++        _ data: Data,
++        absoluteOffset: UInt64,
++        expectedCount: UInt64
++    ) throws -> [ZwzV3DataRecord] {
++        guard expectedCount <= UInt64(data.count / 32) else {
++            throw ZwzV3Error.malformedArchive("impossible data block count")
++        }
++        var cursor = 0
++        var expectedSequence: UInt64 = 0
++        var records: [ZwzV3DataRecord] = []
++        while expectedSequence < expectedCount {
++            let recordStart = cursor
++            let recordLength = Int(try read(UInt32.self, from: data, cursor: &cursor))
++            let (recordEnd, overflow) = cursor.addingReportingOverflow(recordLength)
++            guard !overflow, recordLength >= 48, recordEnd <= data.count else {
++                throw ZwzV3Error.malformedArchive("invalid data block record length")
++            }
++            let sequence = try read(UInt64.self, from: data, cursor: &cursor)
++            guard sequence == expectedSequence else {
++                throw ZwzV3Error.malformedArchive("non-canonical data block sequence")
++            }
++            guard cursor < recordEnd, let codec = ZwzV2Codec(rawValue: data[cursor]) else {
++                throw ZwzV3Error.malformedArchive("unknown data block codec")
++            }
++            cursor += 1
++            guard cursor + 3 <= recordEnd, data[cursor..<(cursor + 3)].allSatisfy({ $0 == 0 }) else {
++                throw ZwzV3Error.malformedArchive("non-zero data block reserved bytes")
++            }
++            cursor += 3
++            let originalLength = try read(UInt32.self, from: data, cursor: &cursor)
++            let sealedLength = try read(UInt32.self, from: data, cursor: &cursor)
++            guard originalLength > 0,
++                  sealedLength >= 28,
++                  recordLength == 20 + Int(sealedLength),
++                  Int(sealedLength) == recordEnd - cursor else {
++                throw ZwzV3Error.malformedArchive("inconsistent data block lengths")
++            }
++            let sealed = data.subdata(in: cursor..<recordEnd)
++            let offsetResult = absoluteOffset.addingReportingOverflow(UInt64(recordStart))
++            guard !offsetResult.overflow else {
++                throw ZwzV3Error.malformedArchive("overflowing data block offset")
++            }
++            records.append(ZwzV3DataRecord(
++                sequence: sequence,
++                codec: codec,
++                originalLength: originalLength,
++                sealed: sealed,
++                archiveOffset: offsetResult.partialValue
++            ))
++            cursor = recordEnd
++            guard expectedSequence < UInt64.max else {
++                throw ZwzV3Error.malformedArchive("too many data block records")
++            }
++            expectedSequence += 1
++        }
++        guard cursor == data.count else {
++            throw ZwzV3Error.malformedArchive("trailing data region bytes")
++        }
++        return records
++    }
++
++    static func blockAAD(
++        archiveID: UUID,
++        sequence: UInt64,
++        codec: ZwzV2Codec,
++        originalLength: UInt32
++    ) -> Data {
++        var aad = blockDomain
++        aad.append(archiveID.bytes)
++        append(sequence, to: &aad)
++        aad.append(codec.rawValue)
++        append(originalLength, to: &aad)
++        return aad
++    }
++
++    static func indexAAD(
++        archiveID: UUID,
++        recipientCount: UInt32,
++        recipientRegion: Data,
++        dataBlockCount: UInt64,
++        dataRegion: Data,
++        signatureAlgorithm: ZwzV3SignatureAlgorithm
++    ) -> Data {
++        var aad = indexDomain
++        aad.append(archiveID.bytes)
++        aad.append(contentsOf: [
++            ZwzArchiveEncryptionKind.publicKey.rawValue,
++            ZwzV3ContentCipher.aes256GCM.rawValue,
++            ZwzV3KeyAgreement.x25519.rawValue,
++            ZwzV3KDF.hkdfSHA256.rawValue,
++            ZwzV3KeyWrapCipher.aes256GCM.rawValue,
++            signatureAlgorithm.rawValue,
++            ZwzV3IndexCipher.aes256GCM.rawValue,
++        ])
++        append(recipientCount, to: &aad)
++        aad.append(recipientRegion)
++        append(dataBlockCount, to: &aad)
++        aad.append(Data(SHA256.hash(data: dataRegion)))
++        return aad
++    }
++
++    static func verifyBuiltArchive(_ archive: Data, contentKey: SymmetricKey) throws {
++        let parsed = try ZwzV3BinaryCodec.parse(archive)
++        if let signer = parsed.signer,
++           !ZwzV3Crypto.verify(
++               signer.signature,
++               bytes: parsed.canonicalSignedBytes,
++               publicKey: signer.signingPublicKey
++           ) {
++            throw ZwzV3Error.invalidSignature
++        }
++        let recipientRegion = try parsed.recipients.reduce(into: Data()) {
++            $0.append(try ZwzV3BinaryCodec.encodeRecipient($1))
++        }
++        let plainIndex = try ZwzV3Crypto.open(
++            parsed.encryptedIndex,
++            key: contentKey,
++            aad: indexAAD(
++                archiveID: parsed.header.archiveID,
++                recipientCount: parsed.header.recipientCount,
++                recipientRegion: recipientRegion,
++                dataBlockCount: parsed.header.dataBlockCount,
++                dataRegion: parsed.dataRegion,
++                signatureAlgorithm: parsed.header.signatureAlgorithm
++            )
++        )
++        let index = try ZwzV2IndexCodec.decodePlain(plainIndex)
++        let records = try parseRecords(
++            parsed.dataRegion,
++            absoluteOffset: parsed.header.dataRegionOffset,
++            expectedCount: parsed.header.dataBlockCount
++        )
++        try validate(index: index, parsed: parsed, records: records)
++    }
++
++    static func validate(
++        index: ZwzV2Index,
++        parsed: ZwzV3ParsedArchive,
++        records: [ZwzV3DataRecord]
++    ) throws {
++        guard index.archiveID == parsed.header.archiveID,
++              index.blockSize > 0,
++              UInt64(records.count) == parsed.header.dataBlockCount else {
++            throw ZwzV3Error.malformedArchive("index metadata mismatch")
++        }
++        try ZwzV2PathValidator.validateNoDuplicatePaths(index.entries)
++        var seen = Set<UInt64>()
++        for entry in index.entries {
++            if entry.type == .directory {
++                guard entry.blocks.isEmpty, entry.originalSize == 0 else {
++                    throw ZwzV3Error.malformedArchive("directory entry has data")
++                }
++                continue
++            }
++            var expectedFileOffset: UInt64 = 0
++            for descriptor in entry.blocks {
++                guard descriptor.sequence < UInt64(records.count),
++                      seen.insert(descriptor.sequence).inserted else {
++                    throw ZwzV3Error.malformedArchive("duplicate or missing block sequence")
++                }
++                let record = records[Int(descriptor.sequence)]
++                guard descriptor.sequence == record.sequence,
++                      descriptor.fileOffset == expectedFileOffset,
++                      descriptor.archiveOffset == record.archiveOffset,
++                      descriptor.storedLength == UInt32(record.sealed.count),
++                      descriptor.originalLength == record.originalLength,
++                      descriptor.codec == record.codec,
++                      descriptor.authenticationTag.isEmpty else {
++                    throw ZwzV3Error.malformedArchive("block descriptor mismatch")
++                }
++                let next = expectedFileOffset.addingReportingOverflow(UInt64(descriptor.originalLength))
++                guard !next.overflow, next.partialValue <= entry.originalSize else {
++                    throw ZwzV3Error.malformedArchive("block layout exceeds file size")
++                }
++                expectedFileOffset = next.partialValue
++            }
++            guard expectedFileOffset == entry.originalSize else {
++                throw ZwzV3Error.malformedArchive("block layout does not cover file")
++            }
++        }
++        guard seen.count == records.count else {
++            throw ZwzV3Error.malformedArchive("unreferenced data block")
++        }
++    }
++
++    private static func append<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
++        var littleEndian = value.littleEndian
++        Swift.withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
++    }
++
++    private static func read<T: FixedWidthInteger>(
++        _ type: T.Type,
++        from data: Data,
++        cursor: inout Int
++    ) throws -> T {
++        let size = MemoryLayout<T>.size
++        let end = cursor.addingReportingOverflow(size)
++        guard !end.overflow, end.partialValue <= data.count else {
++            throw ZwzV3Error.malformedArchive("truncated data block field")
++        }
++        defer { cursor = end.partialValue }
++        return data[cursor..<end.partialValue].enumerated().reduce(into: T.zero) { value, byte in
++            value |= T(byte.element) << (byte.offset * 8)
++        }
++    }
++}
+diff --git a/Sources/ZwzCore/ZWZV3/ZwzV3Extractor.swift b/Sources/ZwzCore/ZWZV3/ZwzV3Extractor.swift
+new file mode 100644
+index 0000000..a591ce8
+--- /dev/null
++++ b/Sources/ZwzCore/ZWZV3/ZwzV3Extractor.swift
+@@ -0,0 +1,519 @@
++import CryptoKit
++import Foundation
++
++public final class ZwzV3Extractor {
++    static let defaultLogicalArchiveSizeLimit: UInt64 = 512 * 1_024 * 1_024
++    private static let defaultReadChunkSize = 1 * 1_024 * 1_024
++
++    public init() {}
++
++    public func listEntries(
++        archivePath: String,
++        keyProvider: ZwzPrivateKeyProvider
++    ) throws -> ZwzV3ArchiveListing {
++        let opened = try openArchive(
++            archivePath: archivePath,
++            keyProvider: keyProvider,
++            cancellationToken: nil
++        )
++        return ZwzV3ArchiveListing(entries: opened.index.entries, securityInfo: opened.securityInfo)
++    }
++
++    public func extractAll(
++        archivePath: String,
++        destinationPath: String,
++        keyProvider: ZwzPrivateKeyProvider,
++        progress: ProgressHandler?,
++        cancellationToken: CancellationToken?
++    ) throws -> ZwzArchiveSecurityInfo {
++        try cancellationToken?.checkCancellation()
++        let opened = try openArchive(
++            archivePath: archivePath,
++            keyProvider: keyProvider,
++            cancellationToken: cancellationToken
++        )
++        try extract(
++            entries: opened.index.entries,
++            opened: opened,
++            destination: URL(fileURLWithPath: destinationPath),
++            progress: progress,
++            cancellationToken: cancellationToken
++        )
++        return opened.securityInfo
++    }
++
++    public func extractEntryToTemp(
++        archivePath: String,
++        entryPath: String,
++        keyProvider: ZwzPrivateKeyProvider,
++        progress: ProgressHandler? = nil,
++        cancellationToken: CancellationToken? = nil
++    ) throws -> URL {
++        try cancellationToken?.checkCancellation()
++        let opened = try openArchive(
++            archivePath: archivePath,
++            keyProvider: keyProvider,
++            cancellationToken: cancellationToken
++        )
++        guard let root = opened.index.entries.first(where: { $0.path == entryPath }) else {
++            throw ZwzV3Error.malformedArchive("requested entry not found")
++        }
++        let entries = root.type == .directory
++            ? opened.index.entries.filter { $0.path == entryPath || $0.path.hasPrefix(entryPath + "/") }
++            : [root]
++        let destination = FileManager.default.temporaryDirectory
++            .appendingPathComponent("zwz-v3-entry-\(UUID().uuidString)", isDirectory: true)
++        do {
++            try extract(
++                entries: entries,
++                opened: opened,
++                destination: destination,
++                progress: progress,
++                cancellationToken: cancellationToken
++            )
++            return destination.appendingPathComponent(entryPath)
++        } catch {
++            try? FileManager.default.removeItem(at: destination)
++            throw error
++        }
++    }
++
++    static func loadLogicalArchive(
++        from urls: [URL],
++        sizeLimit: UInt64 = defaultLogicalArchiveSizeLimit,
++        cancellationToken: CancellationToken? = nil,
++        chunkSize: Int = defaultReadChunkSize,
++        onChunkRead: ((Int) -> Void)? = nil
++    ) throws -> Data {
++        guard let first = urls.first else {
++            throw ZwzV3Error.malformedArchive("no archive volumes")
++        }
++        guard chunkSize > 0 else {
++            throw ZwzV3Error.malformedArchive("invalid archive read chunk size")
++        }
++        try cancellationToken?.checkCancellation()
++        let prefix = try readExactly(first, count: 4)
++        if Array(prefix) == ZwzV2Format.splitMagic {
++            var volumes: [(url: URL, envelope: ZwzV2SplitEnvelope)] = []
++            var logicalLength: UInt64 = 0
++            var archiveID: UUID?
++            var seenNumbers = Set<UInt32>()
++            for url in urls {
++                try cancellationToken?.checkCancellation()
++                let envelope = try ZwzV2BinaryCodec.decodeSplitEnvelope(
++                    try readExactly(url, count: ZwzV2SplitEnvelope.encodedLength)
++                )
++                if let archiveID {
++                    guard envelope.archiveID == archiveID else {
++                        throw ZwzV3Error.malformedArchive("split volume archive IDs do not match")
++                    }
++                } else {
++                    archiveID = envelope.archiveID
++                }
++                guard seenNumbers.insert(envelope.volumeNumber).inserted else {
++                    throw ZwzV3Error.malformedArchive("duplicate split volume number")
++                }
++                let end = envelope.logicalOffset.addingReportingOverflow(envelope.payloadLength)
++                guard !end.overflow else {
++                    throw ZwzV3Error.malformedArchive("overflowing split archive length")
++                }
++                let expectedFileSize = UInt64(ZwzV2SplitEnvelope.encodedLength)
++                    .addingReportingOverflow(envelope.payloadLength)
++                guard !expectedFileSize.overflow,
++                      try fileSize(of: url) == expectedFileSize.partialValue else {
++                    throw ZwzV3Error.malformedArchive("split payload length does not match file size")
++                }
++                try requireWithinSizeLimit(end.partialValue, limit: sizeLimit)
++                volumes.append((url, envelope))
++            }
++            for (index, number) in seenNumbers.sorted().enumerated() {
++                guard let expectedNumber = UInt32(exactly: index) else {
++                    throw ZwzV3Error.malformedArchive("too many split volumes")
++                }
++                guard number == expectedNumber else { throw ZwzV2Error.missingVolume(index) }
++            }
++            for (index, volume) in volumes.enumerated() {
++                guard let expectedNumber = UInt32(exactly: index) else {
++                    throw ZwzV3Error.malformedArchive("too many split volumes")
++                }
++                guard volume.envelope.volumeNumber == expectedNumber else {
++                    throw ZwzV3Error.malformedArchive("reordered split volume URLs")
++                }
++                guard volume.envelope.logicalOffset == logicalLength else {
++                    throw ZwzV3Error.malformedArchive("non-contiguous split logical ranges")
++                }
++                guard volume.envelope.isFinal == (index == volumes.count - 1) else {
++                    throw ZwzV3Error.malformedArchive("inconsistent final-volume marker")
++                }
++                let end = logicalLength.addingReportingOverflow(volume.envelope.payloadLength)
++                guard !end.overflow else {
++                    throw ZwzV3Error.malformedArchive("overflowing split archive length")
++                }
++                logicalLength = end.partialValue
++            }
++            try requireWithinSizeLimit(logicalLength, limit: sizeLimit)
++            guard let length = Int(exactly: logicalLength) else {
++                throw ZwzV3Error.malformedArchive("archive is too large")
++            }
++            try cancellationToken?.checkCancellation()
++            var archive = Data()
++            archive.reserveCapacity(length)
++            for volume in volumes {
++                let handle = try FileHandle(forReadingFrom: volume.url)
++                defer { try? handle.close() }
++                try handle.seek(toOffset: UInt64(ZwzV2SplitEnvelope.encodedLength))
++                var remaining = volume.envelope.payloadLength
++                var checksum: UInt32 = 2_166_136_261
++                while remaining > 0 {
++                    try cancellationToken?.checkCancellation()
++                    let readLength = Int(min(UInt64(chunkSize), remaining))
++                    guard let chunk = try handle.read(upToCount: readLength),
++                          chunk.count == readLength else {
++                        throw ZwzV3Error.malformedArchive("truncated split payload")
++                    }
++                    for byte in chunk {
++                        checksum ^= UInt32(byte)
++                        checksum &*= 16_777_619
++                    }
++                    archive.append(chunk)
++                    onChunkRead?(readLength)
++                    remaining -= UInt64(readLength)
++                }
++                guard checksum == volume.envelope.payloadChecksum else {
++                    throw ZwzV3Error.malformedArchive("split payload checksum mismatch")
++                }
++            }
++            try cancellationToken?.checkCancellation()
++            return archive
++        }
++        guard Array(prefix) == [0x5A, 0x57, 0x5A, 0x33], urls.count == 1 else {
++            throw ZwzV3Error.malformedArchive("invalid version 3 archive magic")
++        }
++        try requireWithinSizeLimit(try fileSize(of: first), limit: sizeLimit)
++        try cancellationToken?.checkCancellation()
++        let archive = try Data(contentsOf: first, options: [.mappedIfSafe])
++        onChunkRead?(archive.count)
++        try cancellationToken?.checkCancellation()
++        return archive
++    }
++
++    private func openArchive(
++        archivePath: String,
++        keyProvider: ZwzPrivateKeyProvider,
++        cancellationToken: CancellationToken?
++    ) throws -> ZwzV3OpenedArchive {
++        try cancellationToken?.checkCancellation()
++        let urls = try Self.archiveURLs(for: archivePath)
++        let archive = try Self.loadLogicalArchive(
++            from: urls,
++            cancellationToken: cancellationToken
++        )
++        try cancellationToken?.checkCancellation()
++        let parsed: ZwzV3ParsedArchive
++        do {
++            parsed = try ZwzV3BinaryCodec.parse(archive)
++        } catch {
++            if archive.count >= ZwzV3Header.encodedLength,
++               let header = try? ZwzV3BinaryCodec.decodeHeader(
++                   archive.subdata(in: 0..<ZwzV3Header.encodedLength)
++               ),
++               header.signatureAlgorithm == .ed25519 {
++                throw ZwzV3Error.invalidSignature
++            }
++            throw error
++        }
++
++        let signature: ZwzSignatureVerification
++        if let signer = parsed.signer {
++            guard ZwzV3Crypto.verify(
++                signer.signature,
++                bytes: parsed.canonicalSignedBytes,
++                publicKey: signer.signingPublicKey
++            ) else {
++                throw ZwzV3Error.invalidSignature
++            }
++            signature = keyProvider.isKnownSigningKey(
++                fingerprint: signer.fingerprint,
++                signingPublicKey: signer.signingPublicKey
++            )
++                ? .validKnownSigner(name: signer.name, fingerprint: signer.fingerprint)
++                : .validUnknownSigner(name: signer.name, fingerprint: signer.fingerprint)
++        } else {
++            signature = .unsigned
++        }
++
++        let contentKey = try unwrapContentKey(parsed: parsed, keyProvider: keyProvider)
++        let recipientRegion = try parsed.recipients.reduce(into: Data()) {
++            $0.append(try ZwzV3BinaryCodec.encodeRecipient($1))
++        }
++        let plainIndex = try ZwzV3Crypto.open(
++            parsed.encryptedIndex,
++            key: contentKey,
++            aad: ZwzV3PayloadCodec.indexAAD(
++                archiveID: parsed.header.archiveID,
++                recipientCount: parsed.header.recipientCount,
++                recipientRegion: recipientRegion,
++                dataBlockCount: parsed.header.dataBlockCount,
++                dataRegion: parsed.dataRegion,
++                signatureAlgorithm: parsed.header.signatureAlgorithm
++            )
++        )
++        let index: ZwzV2Index
++        do {
++            index = try ZwzV2IndexCodec.decodePlain(plainIndex)
++        } catch let error as ZwzV2Error {
++            throw mapMalformed(error)
++        }
++        let records = try ZwzV3PayloadCodec.parseRecords(
++            parsed.dataRegion,
++            absoluteOffset: parsed.header.dataRegionOffset,
++            expectedCount: parsed.header.dataBlockCount
++        )
++        do {
++            try ZwzV3PayloadCodec.validate(index: index, parsed: parsed, records: records)
++        } catch let error as ZwzV2Error {
++            throw mapMalformed(error)
++        }
++        return ZwzV3OpenedArchive(
++            parsed: parsed,
++            index: index,
++            records: records,
++            contentKey: contentKey,
++            securityInfo: ZwzArchiveSecurityInfo(
++                encryption: .publicKey,
++                recipientFingerprints: parsed.recipients.map(\.recipientFingerprint),
++                signature: signature
++            )
++        )
++    }
++
++    private func unwrapContentKey(
++        parsed: ZwzV3ParsedArchive,
++        keyProvider: ZwzPrivateKeyProvider
++    ) throws -> SymmetricKey {
++        var obtainedMatchingKey = false
++        for envelope in parsed.recipients {
++            let rawPrivate: Data
++            do {
++                rawPrivate = try keyProvider.agreementPrivateKey(
++                    fingerprint: envelope.recipientFingerprint,
++                    reason: "Open ZWZ archive"
++                )
++            } catch ZwzV3Error.userAuthenticationCancelled {
++                throw ZwzV3Error.userAuthenticationCancelled
++            } catch ZwzV3Error.noMatchingPrivateKey {
++                continue
++            } catch {
++                throw error
++            }
++            obtainedMatchingKey = true
++            do {
++                let privateKey = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: rawPrivate)
++                return try ZwzV3Crypto.unwrap(
++                    envelope,
++                    privateKey: privateKey,
++                    archiveID: parsed.header.archiveID
++                )
++            } catch {
++                continue
++            }
++        }
++        if obtainedMatchingKey { throw ZwzV3Error.keyUnwrapFailed }
++        throw ZwzV3Error.noMatchingPrivateKey(parsed.recipients.map(\.recipientFingerprint))
++    }
++
++    private func extract(
++        entries: [ZwzV2Entry],
++        opened: ZwzV3OpenedArchive,
++        destination: URL,
++        progress: ProgressHandler?,
++        cancellationToken: CancellationToken?
++    ) throws {
++        try cancellationToken?.checkCancellation()
++        progress?(0)
++        let fileManager = FileManager.default
++        if (try? fileManager.destinationOfSymbolicLink(atPath: destination.path)) != nil {
++            throw ZwzV2Error.unsafePath(destination.path)
++        }
++        try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
++        var totalBytes: UInt64 = 0
++        for entry in entries where entry.type == .file {
++            totalBytes = try checkedAdd(
++                totalBytes,
++                entry.originalSize,
++                reason: "extraction progress size overflow"
++            )
++        }
++        var completedBytes: UInt64 = 0
++
++        for entry in entries where entry.type == .directory {
++            try cancellationToken?.checkCancellation()
++            let output = try outputURL(for: entry.path, destination: destination)
++            try fileManager.createDirectory(at: output, withIntermediateDirectories: true)
++            try? fileManager.setAttributes([.modificationDate: entry.modificationTime], ofItemAtPath: output.path)
++        }
++        for entry in entries where entry.type == .file {
++            try cancellationToken?.checkCancellation()
++            let output = try outputURL(for: entry.path, destination: destination)
++            do {
++                try fileManager.createDirectory(
++                    at: output.deletingLastPathComponent(),
++                    withIntermediateDirectories: true
++                )
++                if fileManager.fileExists(atPath: output.path) {
++                    let values = try output.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
++                    guard values.isDirectory != true, values.isSymbolicLink != true else {
++                        throw ZwzV2Error.unsafePath(entry.path)
++                    }
++                    try fileManager.removeItem(at: output)
++                }
++                guard fileManager.createFile(atPath: output.path, contents: nil) else {
++                    throw ZwzV3Error.malformedArchive("could not create extraction file")
++                }
++                let handle = try FileHandle(forWritingTo: output)
++                defer { try? handle.close() }
++                for descriptor in entry.blocks {
++                    try cancellationToken?.checkCancellation()
++                    let record = opened.records[Int(descriptor.sequence)]
++                    let encoded = try ZwzV3Crypto.open(
++                        record.sealed,
++                        key: opened.contentKey,
++                        aad: ZwzV3PayloadCodec.blockAAD(
++                            archiveID: opened.parsed.header.archiveID,
++                            sequence: record.sequence,
++                            codec: record.codec,
++                            originalLength: record.originalLength
++                        )
++                    )
++                    let decoded = try ZwzV2BlockCodec.decode(
++                        codec: record.codec,
++                        payload: encoded,
++                        originalLength: Int(record.originalLength),
++                        sequence: record.sequence
++                    )
++                    guard checksum(decoded) == descriptor.checksum else {
++                        throw ZwzV2Error.checksumMismatch(sequence: record.sequence)
++                    }
++                    try handle.seek(toOffset: descriptor.fileOffset)
++                    try handle.write(contentsOf: decoded)
++                    completedBytes = try checkedAdd(
++                        completedBytes,
++                        UInt64(decoded.count),
++                        reason: "extraction progress size overflow"
++                    )
++                    if totalBytes > 0 {
++                        progress?(min(1, Double(completedBytes) / Double(totalBytes)))
++                    }
++                    try cancellationToken?.checkCancellation()
++                }
++                try? fileManager.setAttributes([.modificationDate: entry.modificationTime], ofItemAtPath: output.path)
++            } catch {
++                try? fileManager.removeItem(at: output)
++                throw error
++            }
++        }
++        try cancellationToken?.checkCancellation()
++        progress?(1)
++    }
++
++    private func outputURL(for path: String, destination: URL) throws -> URL {
++        let output = try ZwzV2PathValidator.validateExtractionPath(path, destination: destination)
++        var current = destination.standardizedFileURL
++        for component in path.split(separator: "/", omittingEmptySubsequences: false) {
++            current.appendPathComponent(String(component))
++            if (try? FileManager.default.destinationOfSymbolicLink(atPath: current.path)) != nil {
++                throw ZwzV2Error.unsafePath(path)
++            }
++        }
++        return output
++    }
++
++    private static func archiveURLs(for path: String) throws -> [URL] {
++        let selected = URL(fileURLWithPath: path)
++        let prefix = try readExactly(selected, count: 4)
++        guard Array(prefix) == ZwzV2Format.splitMagic else { return [selected] }
++        let directory = selected.deletingLastPathComponent()
++        let base = splitBaseName(selected.lastPathComponent)
++        let candidates = try FileManager.default.contentsOfDirectory(
++            at: directory,
++            includingPropertiesForKeys: nil,
++            options: [.skipsHiddenFiles]
++        )
++        let volumes = try candidates.compactMap { url -> (URL, UInt32)? in
++            guard splitBaseName(url.lastPathComponent) == base,
++                  let prefix = try? readExactly(url, count: 4),
++                  Array(prefix) == ZwzV2Format.splitMagic else { return nil }
++            let envelope = try ZwzV2BinaryCodec.decodeSplitEnvelope(
++                readExactly(url, count: ZwzV2SplitEnvelope.encodedLength)
++            )
++            return (url, envelope.volumeNumber)
++        }.sorted { $0.1 < $1.1 }.map(\.0)
++        guard !volumes.isEmpty else { throw ZwzV2Error.missingVolume(0) }
++        return volumes
++    }
++
++    private static func splitBaseName(_ name: String) -> String {
++        let value = name as NSString
++        let ext = value.pathExtension.lowercased()
++        let numbered = ext.first == "z" && ext.dropFirst().allSatisfy(\.isNumber)
++        return ext == "zwz" || numbered ? value.deletingPathExtension : name
++    }
++
++    private static func readExactly(_ url: URL, count: Int) throws -> Data {
++        guard FileManager.default.fileExists(atPath: url.path) else {
++            throw ZwzError.fileNotFound(url.path)
++        }
++        let handle = try FileHandle(forReadingFrom: url)
++        defer { try? handle.close() }
++        guard let data = try handle.read(upToCount: count), data.count == count else {
++            throw ZwzV3Error.malformedArchive("truncated archive")
++        }
++        return data
++    }
++
++    private static func fileSize(of url: URL) throws -> UInt64 {
++        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
++        guard let size = attributes[.size] as? NSNumber else {
++            throw ZwzV3Error.malformedArchive("could not determine archive size")
++        }
++        return size.uint64Value
++    }
++
++    private static func requireWithinSizeLimit(_ size: UInt64, limit: UInt64) throws {
++        guard size <= limit else {
++            throw ZwzV3Error.malformedArchive("logical archive exceeds size limit")
++        }
++    }
++
++    private func mapMalformed(_ error: ZwzV2Error) -> Error {
++        switch error {
++        case .unsafePath, .duplicatePath:
++            return error
++        default:
++            return ZwzV3Error.malformedArchive(error.localizedDescription)
++        }
++    }
++
++    private func checksum(_ data: Data) -> UInt32 {
++        var value: UInt32 = 2_166_136_261
++        for byte in data {
++            value ^= UInt32(byte)
++            value &*= 16_777_619
++        }
++        return value
++    }
++
++    private func checkedAdd(_ lhs: UInt64, _ rhs: UInt64, reason: String) throws -> UInt64 {
++        let result = lhs.addingReportingOverflow(rhs)
++        guard !result.overflow else { throw ZwzV3Error.malformedArchive(reason) }
++        return result.partialValue
++    }
++}
++
++private struct ZwzV3OpenedArchive {
++    let parsed: ZwzV3ParsedArchive
++    let index: ZwzV2Index
++    let records: [ZwzV3DataRecord]
++    let contentKey: SymmetricKey
++    let securityInfo: ZwzArchiveSecurityInfo
++}
+diff --git a/Sources/ZwzCore/ZWZV3/ZwzV3Types.swift b/Sources/ZwzCore/ZWZV3/ZwzV3Types.swift
+index 28a76e8..6050564 100644
+--- a/Sources/ZwzCore/ZWZV3/ZwzV3Types.swift
++++ b/Sources/ZwzCore/ZWZV3/ZwzV3Types.swift
+@@ -1,5 +1,11 @@
+ import Foundation
+ 
++public protocol ZwzPrivateKeyProvider: Sendable {
++    func agreementPrivateKey(fingerprint: String, reason: String) throws -> Data
++    func signingPrivateKey(fingerprint: String, reason: String) throws -> Data
++    func isKnownSigningKey(fingerprint: String, signingPublicKey: Data) -> Bool
++}
++
+ public enum ZwzEncryptionMode: Equatable, Sendable {
+     case none
+     case password(String)
+@@ -28,10 +34,19 @@ public struct ZwzRecipient: Equatable, Sendable {
+ public struct ZwzSigningIdentity: Equatable, Sendable {
+     public let name: String
+     public let fingerprint: String
++    public let agreementPublicKey: Data
++    public let signingPublicKey: Data
+ 
+-    public init(name: String, fingerprint: String) {
++    public init(
++        name: String,
++        fingerprint: String,
++        agreementPublicKey: Data = Data(),
++        signingPublicKey: Data = Data()
++    ) {
+         self.name = name
+         self.fingerprint = fingerprint
++        self.agreementPublicKey = agreementPublicKey
++        self.signingPublicKey = signingPublicKey
+     }
+ }
+ 
+@@ -64,6 +79,16 @@ public struct ZwzArchiveSecurityInfo: Equatable, Sendable {
+     }
+ }
+ 
++public struct ZwzV3ArchiveListing: Equatable, Sendable {
++    public let entries: [ZwzV2Entry]
++    public let securityInfo: ZwzArchiveSecurityInfo
++
++    public init(entries: [ZwzV2Entry], securityInfo: ZwzArchiveSecurityInfo) {
++        self.entries = entries
++        self.securityInfo = securityInfo
++    }
++}
++
+ public enum ZwzV3Error: LocalizedError, Equatable, Sendable {
+     case recipientRequired
+     case invalidRecipientPublicKey(String)
+diff --git a/Tests/ZwzCoreTests/ZWZV3/ZwzV3RoundTripTests.swift b/Tests/ZwzCoreTests/ZWZV3/ZwzV3RoundTripTests.swift
+new file mode 100644
+index 0000000..d3f79ba
+--- /dev/null
++++ b/Tests/ZwzCoreTests/ZWZV3/ZwzV3RoundTripTests.swift
+@@ -0,0 +1,277 @@
++import Foundation
++import XCTest
++@testable import ZwzCore
++
++final class ZwzV3RoundTripTests: XCTestCase {
++    func testExtremeSplitVolumeSizesThrowWithoutIntegerTrap() {
++        XCTAssertThrowsError(try ZwzV3Compressor.splitVolumeSize(.megaBytes(Int.max)))
++        XCTAssertThrowsError(try ZwzV3Compressor.splitVolumeSize(.kiloBytes(Int.max)))
++        XCTAssertThrowsError(try ZwzV3Compressor.splitVolumeSize(.kiloBytes(0)))
++        XCTAssertThrowsError(try ZwzV3Compressor.splitVolumeSize(.megaBytes(-1)))
++    }
++
++    func testLogicalArchiveLimitRejectsBeforeParsingOrReadingPayload() throws {
++        let directory = try ZwzV3TestSupport.makeTempDirectory()
++        defer { try? FileManager.default.removeItem(at: directory) }
++        let invalid = directory.appendingPathComponent("oversized.zwz")
++        var oversized = Data([0x5A, 0x57, 0x5A, 0x33])
++        oversized.append(Data(repeating: 0xAA, count: 28))
++        try oversized.write(to: invalid)
++
++        XCTAssertThrowsError(try ZwzV3Extractor.loadLogicalArchive(
++            from: [invalid],
++            sizeLimit: 16
++        )) { error in
++            XCTAssertEqual(
++                error as? ZwzV3Error,
++                .malformedArchive("logical archive exceeds size limit")
++            )
++        }
++    }
++
++    func testTwoRecipientsIndependentlyListAndExtractHiddenEmptyUnicodeAndMultiBlockFiles() throws {
++        let directory = try ZwzV3TestSupport.makeTempDirectory()
++        defer { try? FileManager.default.removeItem(at: directory) }
++        let source = try ZwzV3TestSupport.makeSource(in: directory)
++        let archive = directory.appendingPathComponent("two-recipients.zwz")
++        let alice = ZwzV3IdentityFixture.make(name: "Alice")
++        let bob = ZwzV3IdentityFixture.make(name: "Bob")
++        let options = CompressionOptions(
++            level: .normal,
++            encryption: .publicKey(recipients: [alice.recipient, bob.recipient], signer: nil),
++            format: .zwz
++        )
++
++        try ZwzV3Compressor(blockSize: 4_096).compress(
++            sourcePath: source.path,
++            destinationPath: archive.path,
++            options: options,
++            keyProvider: nil,
++            progress: nil,
++            cancellationToken: nil
++        )
++
++        for identity in [alice, bob] {
++            let listing = try ZwzV3Extractor().listEntries(
++                archivePath: archive.path,
++                keyProvider: identity.provider
++            )
++            XCTAssertEqual(listing.entries.count, 7)
++            XCTAssertEqual(listing.securityInfo.recipientFingerprints.count, 2)
++            let output = directory.appendingPathComponent("out-\(identity.recipient.name)")
++            _ = try ZwzV3Extractor().extractAll(
++                archivePath: archive.path,
++                destinationPath: output.path,
++                keyProvider: identity.provider,
++                progress: nil,
++                cancellationToken: nil
++            )
++            try ZwzV3TestSupport.assertTreesEqual(source, output)
++        }
++    }
++
++    func testSingleFileAndDirectorySubtreeExtraction() throws {
++        let fixture = try makeArchive()
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let extractor = ZwzV3Extractor()
++        let file = try extractor.extractEntryToTemp(
++            archivePath: fixture.archive.path,
++            entryPath: ".hidden",
++            keyProvider: fixture.identity.provider
++        )
++        XCTAssertEqual(try Data(contentsOf: file), Data("hidden".utf8))
++
++        let subtree = try extractor.extractEntryToTemp(
++            archivePath: fixture.archive.path,
++            entryPath: "nested/\u{8d44}\u{6599}",
++            keyProvider: fixture.identity.provider
++        )
++        XCTAssertTrue(FileManager.default.fileExists(atPath: subtree.appendingPathComponent("\u{6587}\u{4ef6}.txt").path))
++    }
++
++    func testSplitVolumeRoundTripAndMissingVolumeFailure() throws {
++        let directory = try ZwzV3TestSupport.makeTempDirectory()
++        defer { try? FileManager.default.removeItem(at: directory) }
++        let source = try ZwzV3TestSupport.makeSource(in: directory)
++        let identity = ZwzV3IdentityFixture.make(name: "Alice")
++        let archive = directory.appendingPathComponent("split.zwz")
++        let options = CompressionOptions(
++            level: .none,
++            encryption: .publicKey(recipients: [identity.recipient], signer: nil),
++            splitVolume: .kiloBytes(4),
++            format: .zwz
++        )
++        try ZwzV3Compressor(blockSize: 2_048).compress(
++            sourcePath: source.path,
++            destinationPath: archive.path,
++            options: options,
++            keyProvider: nil,
++            progress: nil,
++            cancellationToken: nil
++        )
++        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.appendingPathComponent("split.z00").path))
++        let splitURLs = try FileManager.default.contentsOfDirectory(
++            at: directory,
++            includingPropertiesForKeys: nil
++        ).filter { $0.lastPathComponent.hasPrefix("split.") }
++            .sorted { $0.pathExtension < $1.pathExtension }
++        XCTAssertThrowsError(try ZwzV3Extractor.loadLogicalArchive(from: Array(splitURLs.reversed()))) { error in
++            XCTAssertEqual(
++                error as? ZwzV3Error,
++                .malformedArchive("reordered split volume URLs")
++            )
++        }
++        let output = directory.appendingPathComponent("split-out")
++        _ = try ZwzV3Extractor().extractAll(
++            archivePath: archive.path,
++            destinationPath: output.path,
++            keyProvider: identity.provider,
++            progress: nil,
++            cancellationToken: nil
++        )
++        try ZwzV3TestSupport.assertTreesEqual(source, output)
++
++        try FileManager.default.removeItem(at: directory.appendingPathComponent("split.z00"))
++        XCTAssertThrowsError(try ZwzV3Extractor().listEntries(archivePath: archive.path, keyProvider: identity.provider))
++    }
++
++    func testSplitLoaderChecksCancellationBetweenReadChunks() throws {
++        let directory = try ZwzV3TestSupport.makeTempDirectory()
++        defer { try? FileManager.default.removeItem(at: directory) }
++        let source = try ZwzV3TestSupport.makeSource(in: directory)
++        let identity = ZwzV3IdentityFixture.make(name: "Alice")
++        let archive = directory.appendingPathComponent("chunked.zwz")
++        try ZwzV3Compressor(blockSize: 2_048).compress(
++            sourcePath: source.path,
++            destinationPath: archive.path,
++            options: CompressionOptions(
++                level: .none,
++                encryption: .publicKey(recipients: [identity.recipient], signer: nil),
++                splitVolume: .kiloBytes(4),
++                format: .zwz
++            ),
++            keyProvider: nil,
++            progress: nil,
++            cancellationToken: nil
++        )
++        let urls = try splitURLs(for: archive)
++        let token = CancellationToken()
++        XCTAssertThrowsError(try ZwzV3Extractor.loadLogicalArchive(
++            from: urls,
++            cancellationToken: token,
++            chunkSize: 32,
++            onChunkRead: { _ in token.cancel() }
++        )) { error in
++            guard case ZwzError.operationCancelled = error else {
++                return XCTFail("unexpected error: \(error)")
++            }
++        }
++    }
++
++    func testEntryExtractionChecksCancellationBeforeOpeningArchive() throws {
++        let token = CancellationToken()
++        token.cancel()
++        XCTAssertThrowsError(try ZwzV3Extractor().extractEntryToTemp(
++            archivePath: "/does/not/exist.zwz",
++            entryPath: "file.txt",
++            keyProvider: ZwzV3MemoryKeyProvider(),
++            cancellationToken: token
++        )) { error in
++            guard case ZwzError.operationCancelled = error else {
++                return XCTFail("unexpected error: \(error)")
++            }
++        }
++    }
++
++    func testCancellationCleansStagingAndPreservesExistingDestination() throws {
++        let directory = try ZwzV3TestSupport.makeTempDirectory()
++        defer { try? FileManager.default.removeItem(at: directory) }
++        let source = try ZwzV3TestSupport.makeSource(in: directory)
++        let identity = ZwzV3IdentityFixture.make(name: "Alice")
++        let archive = directory.appendingPathComponent("cancel.zwz")
++        let original = Data("existing archive".utf8)
++        try original.write(to: archive)
++        let token = CancellationToken()
++        XCTAssertThrowsError(try ZwzV3Compressor(blockSize: 1_024).compress(
++            sourcePath: source.path,
++            destinationPath: archive.path,
++            options: CompressionOptions(
++                encryption: .publicKey(recipients: [identity.recipient], signer: nil),
++                format: .zwz
++            ),
++            keyProvider: nil,
++            progress: { value in if value > 0 { token.cancel() } },
++            cancellationToken: token
++        ))
++        XCTAssertEqual(try Data(contentsOf: archive), original)
++        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: directory.path)
++            .contains { $0.contains("partial-") })
++    }
++
++    func testVerifiedArchiveAtomicallyReplacesExistingArchive() throws {
++        let directory = try ZwzV3TestSupport.makeTempDirectory()
++        defer { try? FileManager.default.removeItem(at: directory) }
++        let source = try ZwzV3TestSupport.makeSource(in: directory)
++        let identity = ZwzV3IdentityFixture.make(name: "Alice")
++        let archive = directory.appendingPathComponent("replace.zwz")
++        let options = CompressionOptions(
++            encryption: .publicKey(recipients: [identity.recipient], signer: nil),
++            format: .zwz
++        )
++        let compressor = ZwzV3Compressor(blockSize: 4_096)
++        try compressor.compress(
++            sourcePath: source.path,
++            destinationPath: archive.path,
++            options: options,
++            keyProvider: nil,
++            progress: nil,
++            cancellationToken: nil
++        )
++        try Data("replacement".utf8).write(to: source.appendingPathComponent(".hidden"))
++        try compressor.compress(
++            sourcePath: source.path,
++            destinationPath: archive.path,
++            options: options,
++            keyProvider: nil,
++            progress: nil,
++            cancellationToken: nil
++        )
++        let output = directory.appendingPathComponent("replacement-out")
++        _ = try ZwzV3Extractor().extractAll(
++            archivePath: archive.path,
++            destinationPath: output.path,
++            keyProvider: identity.provider,
++            progress: nil,
++            cancellationToken: nil
++        )
++        XCTAssertEqual(try Data(contentsOf: output.appendingPathComponent(".hidden")), Data("replacement".utf8))
++    }
++
++    private func makeArchive() throws -> (directory: URL, archive: URL, identity: ZwzV3IdentityFixture) {
++        let directory = try ZwzV3TestSupport.makeTempDirectory()
++        let source = try ZwzV3TestSupport.makeSource(in: directory)
++        let identity = ZwzV3IdentityFixture.make(name: "Alice")
++        let archive = directory.appendingPathComponent("archive.zwz")
++        try ZwzV3Compressor(blockSize: 4_096).compress(
++            sourcePath: source.path,
++            destinationPath: archive.path,
++            options: CompressionOptions(
++                encryption: .publicKey(recipients: [identity.recipient], signer: nil),
++                format: .zwz
++            ),
++            keyProvider: nil,
++            progress: nil,
++            cancellationToken: nil
++        )
++        return (directory, archive, identity)
++    }
++
++    private func splitURLs(for archive: URL) throws -> [URL] {
++        let base = archive.deletingPathExtension().lastPathComponent
++        return try FileManager.default.contentsOfDirectory(
++            at: archive.deletingLastPathComponent(),
++            includingPropertiesForKeys: nil
++        ).filter { $0.deletingPathExtension().lastPathComponent == base }
++            .sorted { $0.pathExtension < $1.pathExtension }
++    }
++}
+diff --git a/Tests/ZwzCoreTests/ZWZV3/ZwzV3SecurityTests.swift b/Tests/ZwzCoreTests/ZWZV3/ZwzV3SecurityTests.swift
+new file mode 100644
+index 0000000..3488af7
+--- /dev/null
++++ b/Tests/ZwzCoreTests/ZWZV3/ZwzV3SecurityTests.swift
+@@ -0,0 +1,400 @@
++import CryptoKit
++import Foundation
++import XCTest
++@testable import ZwzCore
++
++final class ZwzV3SecurityTests: XCTestCase {
++    private enum KeychainFailure: Error, Equatable {
++        case unavailable
++    }
++
++    func testWrongRecipientAndCancelledAuthenticationRemainDistinct() throws {
++        let fixture = try makeArchive(signed: false)
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let mallory = ZwzV3IdentityFixture.make(name: "Mallory")
++        XCTAssertThrowsError(try ZwzV3Extractor().listEntries(
++            archivePath: fixture.archive.path,
++            keyProvider: mallory.provider
++        )) { error in
++            guard case ZwzV3Error.noMatchingPrivateKey = error else {
++                return XCTFail("unexpected error: \(error)")
++            }
++        }
++
++        let cancelled = ZwzV3MemoryKeyProvider()
++        cancelled.lookupError = ZwzV3Error.userAuthenticationCancelled
++        XCTAssertThrowsError(try ZwzV3Extractor().listEntries(
++            archivePath: fixture.archive.path,
++            keyProvider: cancelled
++        )) { error in
++            XCTAssertEqual(error as? ZwzV3Error, .userAuthenticationCancelled)
++        }
++    }
++
++    func testUnsignedMutationsOfEveryAuthenticatedRegionFailBeforeListingPaths() throws {
++        let fixture = try makeArchive(signed: false)
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let archiveBytes = try Data(contentsOf: fixture.archive)
++        let parsed = try ZwzV3BinaryCodec.parse(archiveBytes)
++        let offsets = [
++            13,
++            Int(parsed.header.recipientRegionOffset) + 8,
++            Int(parsed.header.recipientRegionOffset) + 48,
++            Int(parsed.header.dataRegionOffset) + 4,
++            Int(parsed.header.dataRegionOffset) + 16,
++            Int(parsed.header.dataRegionOffset) + 24,
++            Int(parsed.header.dataRegionOffset) + 36,
++            Int(parsed.header.dataRegionOffset) + 24
++                + Int(readUInt32(archiveBytes, at: Int(parsed.header.dataRegionOffset) + 20)) - 1,
++            Int(parsed.header.encryptedIndexOffset) + 12,
++        ]
++        for offset in offsets {
++            let mutated = try ZwzV3TestSupport.mutate(fixture.archive, at: offset)
++            XCTAssertThrowsError(try ZwzV3Extractor().listEntries(
++                archivePath: mutated.path,
++                keyProvider: fixture.identity.provider
++            ), "mutation at \(offset) was accepted")
++        }
++    }
++
++    func testSignedArchiveReportsKnownAndUnknownSignerAndRejectsMutations() throws {
++        let fixture = try makeArchive(signed: true)
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let unknown = fixture.identity.provider
++        let unknownListing = try ZwzV3Extractor().listEntries(
++            archivePath: fixture.archive.path,
++            keyProvider: unknown
++        )
++        XCTAssertEqual(
++            unknownListing.securityInfo.signature,
++            .validUnknownSigner(name: fixture.identity.signingIdentity.name, fingerprint: fixture.identity.signingFingerprint)
++        )
++
++        let known = fixture.identity.provider
++        known.knownSigningKeys[fixture.identity.signingFingerprint]
++            = fixture.identity.signingIdentity.signingPublicKey
++        let knownListing = try ZwzV3Extractor().listEntries(archivePath: fixture.archive.path, keyProvider: known)
++        XCTAssertEqual(
++            knownListing.securityInfo.signature,
++            .validKnownSigner(name: fixture.identity.signingIdentity.name, fingerprint: fixture.identity.signingFingerprint)
++        )
++
++        let parsed = try ZwzV3BinaryCodec.parse(Data(contentsOf: fixture.archive))
++        for offset in [Int(parsed.header.signerRegionOffset) + 8, Int(parsed.header.signatureOffset)] {
++            let mutated = try ZwzV3TestSupport.mutate(fixture.archive, at: offset)
++            XCTAssertThrowsError(try ZwzV3Extractor().listEntries(
++                archivePath: mutated.path,
++                keyProvider: known
++            )) { error in
++                XCTAssertEqual(error as? ZwzV3Error, .invalidSignature)
++            }
++        }
++    }
++
++    func testKnownFingerprintWithDifferentValidSigningKeyRemainsUnknown() throws {
++        let fixture = try makeArchive(signed: true)
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let parsed = try ZwzV3BinaryCodec.parse(Data(contentsOf: fixture.archive))
++        let attacker = Curve25519.Signing.PrivateKey()
++        let placeholder = ZwzV3SignerRecord(
++            name: "Attacker",
++            fingerprint: fixture.identity.signingFingerprint,
++            signingPublicKey: attacker.publicKey.rawRepresentation,
++            signature: Data(repeating: 0, count: 64)
++        )
++        var forged = try ZwzV3ArchiveCodec.encode(
++            recipients: parsed.recipients,
++            dataRegion: parsed.dataRegion,
++            encryptedIndex: parsed.encryptedIndex,
++            signer: placeholder,
++            archiveID: parsed.header.archiveID,
++            dataBlockCount: parsed.header.dataBlockCount
++        )
++        let unsigned = try ZwzV3BinaryCodec.parse(forged)
++        let signature = try ZwzV3Crypto.sign(unsigned.canonicalSignedBytes, privateKey: attacker)
++        forged.replaceSubrange(
++            Int(unsigned.header.signatureOffset)..<(Int(unsigned.header.signatureOffset) + 64),
++            with: signature
++        )
++        let url = fixture.directory.appendingPathComponent("forged-known-fingerprint.zwz")
++        try forged.write(to: url)
++        let provider = fixture.identity.provider
++        provider.knownSigningKeys[fixture.identity.signingFingerprint]
++            = fixture.identity.signingIdentity.signingPublicKey
++
++        let listing = try ZwzV3Extractor().listEntries(archivePath: url.path, keyProvider: provider)
++        XCTAssertEqual(
++            listing.securityInfo.signature,
++            .validUnknownSigner(name: "Attacker", fingerprint: fixture.identity.signingFingerprint)
++        )
++    }
++
++    func testNonMissingProviderFailureIsPropagated() throws {
++        let fixture = try makeArchive(signed: false)
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let provider = ZwzV3MemoryKeyProvider()
++        provider.lookupError = KeychainFailure.unavailable
++        XCTAssertThrowsError(try ZwzV3Extractor().listEntries(
++            archivePath: fixture.archive.path,
++            keyProvider: provider
++        )) { error in
++            XCTAssertEqual(error as? KeychainFailure, .unavailable)
++        }
++    }
++
++    func testSecondMatchingEnvelopeCanSucceedAfterFirstKeyFails() throws {
++        let directory = try ZwzV3TestSupport.makeTempDirectory()
++        defer { try? FileManager.default.removeItem(at: directory) }
++        let source = try ZwzV3TestSupport.makeSource(in: directory)
++        let identity = ZwzV3IdentityFixture.make(name: "Alice")
++        let archive = directory.appendingPathComponent("duplicate-recipient.zwz")
++        try ZwzV3Compressor().compress(
++            sourcePath: source.path,
++            destinationPath: archive.path,
++            options: CompressionOptions(
++                encryption: .publicKey(
++                    recipients: [identity.recipient, identity.recipient],
++                    signer: nil
++                ),
++                format: .zwz
++            ),
++            keyProvider: nil,
++            progress: nil,
++            cancellationToken: nil
++        )
++        let provider = identity.provider
++        provider.agreementKeyResponses[identity.recipient.fingerprint] = [
++            .success(Data(repeating: 0, count: 31)),
++            .success(identity.agreementPrivateKey),
++        ]
++        XCTAssertFalse(try ZwzV3Extractor().listEntries(
++            archivePath: archive.path,
++            keyProvider: provider
++        ).entries.isEmpty)
++    }
++
++    func testSigningPrivateKeyMustMatchSelectedFingerprint() throws {
++        let directory = try ZwzV3TestSupport.makeTempDirectory()
++        defer { try? FileManager.default.removeItem(at: directory) }
++        let source = try ZwzV3TestSupport.makeSource(in: directory)
++        let identity = ZwzV3IdentityFixture.make(name: "Alice")
++        let wrong = Curve25519.Signing.PrivateKey()
++        let provider = identity.provider
++        provider.signingKeys[identity.signingFingerprint] = wrong.rawRepresentation
++        XCTAssertThrowsError(try ZwzV3Compressor().compress(
++            sourcePath: source.path,
++            destinationPath: directory.appendingPathComponent("mismatch.zwz").path,
++            options: CompressionOptions(
++                encryption: .publicKey(recipients: [identity.recipient], signer: identity.signingIdentity),
++                format: .zwz
++            ),
++            keyProvider: provider,
++            progress: nil,
++            cancellationToken: nil
++        ))
++    }
++
++    func testSignerDoesNotNeedToBeARecipient() throws {
++        let directory = try ZwzV3TestSupport.makeTempDirectory()
++        defer { try? FileManager.default.removeItem(at: directory) }
++        let source = try ZwzV3TestSupport.makeSource(in: directory)
++        let recipient = ZwzV3IdentityFixture.make(name: "Recipient")
++        let sender = ZwzV3IdentityFixture.make(name: "Sender")
++        let signingProvider = sender.provider
++        let archive = directory.appendingPathComponent("independent-signer.zwz")
++        try ZwzV3Compressor().compress(
++            sourcePath: source.path,
++            destinationPath: archive.path,
++            options: CompressionOptions(
++                encryption: .publicKey(
++                    recipients: [recipient.recipient],
++                    signer: sender.signingIdentity
++                ),
++                format: .zwz
++            ),
++            keyProvider: signingProvider,
++            progress: nil,
++            cancellationToken: nil
++        )
++
++        let listing = try ZwzV3Extractor().listEntries(
++            archivePath: archive.path,
++            keyProvider: recipient.provider
++        )
++        XCTAssertEqual(
++            listing.securityInfo.signature,
++            .validUnknownSigner(name: "Sender", fingerprint: sender.signingFingerprint)
++        )
++    }
++
++    func testMaliciousRecordLengthsAndCountsNeverTrap() throws {
++        let fixture = try makeArchive(signed: false)
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let parsed = try ZwzV3BinaryCodec.parse(Data(contentsOf: fixture.archive))
++        for mutation in [(Int(parsed.header.dataRegionOffset), UInt32.max), (120, UInt32.max)] {
++            var bytes = try Data(contentsOf: fixture.archive)
++            Data.writeUInt32(mutation.1, at: mutation.0, in: &bytes)
++            let url = fixture.directory.appendingPathComponent("malicious-\(mutation.0).zwz")
++            try bytes.write(to: url)
++            XCTAssertThrowsError(try ZwzV3Extractor().listEntries(
++                archivePath: url.path,
++                keyProvider: fixture.identity.provider
++            ))
++        }
++    }
++
++    func testAuthenticatedIndexWithDescriptorOffsetMismatchIsRejected() throws {
++        let directory = try ZwzV3TestSupport.makeTempDirectory()
++        defer { try? FileManager.default.removeItem(at: directory) }
++        let identity = ZwzV3IdentityFixture.make(name: "Alice")
++        let archiveID = UUID()
++        let contentKey = SymmetricKey(size: .bits256)
++        let envelopes = try ZwzV3Crypto.wrap(
++            contentKey: contentKey,
++            recipients: [identity.recipient],
++            archiveID: archiveID
++        )
++        let recipientRegion = try envelopes.reduce(into: Data()) {
++            $0.append(try ZwzV3BinaryCodec.encodeRecipient($1))
++        }
++        let plain = Data("payload".utf8)
++        let encoded = try ZwzV2BlockCodec.encode(plain, level: .none)
++        let sealed = try ZwzV3Crypto.seal(
++            encoded.payload,
++            key: contentKey,
++            nonce: AES.GCM.Nonce(),
++            aad: ZwzV3PayloadCodec.blockAAD(
++                archiveID: archiveID,
++                sequence: 0,
++                codec: encoded.codec,
++                originalLength: UInt32(plain.count)
++            )
++        )
++        let dataRegion = try ZwzV3PayloadCodec.encodeRecord(
++            sequence: 0,
++            codec: encoded.codec,
++            originalLength: UInt32(plain.count),
++            sealed: sealed
++        )
++        let canonicalOffset = UInt64(ZwzV3Header.encodedLength + recipientRegion.count)
++        let index = ZwzV2Index(
++            archiveID: archiveID,
++            blockSize: 4_096,
++            entries: [ZwzV2Entry(
++                path: "file.txt",
++                type: .file,
++                originalSize: UInt64(plain.count),
++                modificationTime: Date(timeIntervalSince1970: 0),
++                isHidden: false,
++                blocks: [ZwzV2BlockDescriptor(
++                    sequence: 0,
++                    fileOffset: 0,
++                    archiveOffset: canonicalOffset + 1,
++                    storedLength: UInt32(sealed.count),
++                    originalLength: UInt32(plain.count),
++                    codec: encoded.codec,
++                    checksum: encoded.checksum,
++                    authenticationTag: []
++                )]
++            )]
++        )
++        let encryptedIndex = try ZwzV3Crypto.seal(
++            ZwzV2IndexCodec.encodePlain(index),
++            key: contentKey,
++            nonce: AES.GCM.Nonce(),
++            aad: ZwzV3PayloadCodec.indexAAD(
++                archiveID: archiveID,
++                recipientCount: 1,
++                recipientRegion: recipientRegion,
++                dataBlockCount: 1,
++                dataRegion: dataRegion,
++                signatureAlgorithm: .none
++            )
++        )
++        let archive = try ZwzV3ArchiveCodec.encode(
++            recipients: envelopes,
++            dataRegion: dataRegion,
++            encryptedIndex: encryptedIndex,
++            signer: nil,
++            archiveID: archiveID,
++            dataBlockCount: 1
++        )
++        let url = directory.appendingPathComponent("offset-mismatch.zwz")
++        try archive.write(to: url)
++        XCTAssertThrowsError(try ZwzV3Extractor().listEntries(
++            archivePath: url.path,
++            keyProvider: identity.provider
++        )) { error in
++            guard case ZwzV3Error.malformedArchive = error else {
++                return XCTFail("unexpected error: \(error)")
++            }
++        }
++    }
++
++    func testExistingSymlinkTraversalIsRejectedAndPartialFileIsRemoved() throws {
++        let fixture = try makeArchive(signed: false)
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let destination = fixture.directory.appendingPathComponent("out")
++        let outside = fixture.directory.appendingPathComponent("outside")
++        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
++        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
++        try FileManager.default.createSymbolicLink(
++            at: destination.appendingPathComponent("nested"),
++            withDestinationURL: outside
++        )
++        XCTAssertThrowsError(try ZwzV3Extractor().extractAll(
++            archivePath: fixture.archive.path,
++            destinationPath: destination.path,
++            keyProvider: fixture.identity.provider,
++            progress: nil,
++            cancellationToken: nil
++        ))
++        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("multi.bin").path))
++    }
++
++    func testExtractionCancellationRemovesTheCurrentPartialFile() throws {
++        let fixture = try makeArchive(signed: false)
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let destination = fixture.directory.appendingPathComponent("cancelled-out")
++        let token = CancellationToken()
++        XCTAssertThrowsError(try ZwzV3Extractor().extractAll(
++            archivePath: fixture.archive.path,
++            destinationPath: destination.path,
++            keyProvider: fixture.identity.provider,
++            progress: { value in if value > 0 { token.cancel() } },
++            cancellationToken: token
++        ))
++        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.appendingPathComponent(".hidden").path))
++    }
++
++    private func makeArchive(signed: Bool) throws -> (
++        directory: URL, archive: URL, identity: ZwzV3IdentityFixture
++    ) {
++        let directory = try ZwzV3TestSupport.makeTempDirectory()
++        let source = try ZwzV3TestSupport.makeSource(in: directory)
++        let identity = ZwzV3IdentityFixture.make(name: "Alice")
++        let archive = directory.appendingPathComponent(signed ? "signed.zwz" : "unsigned.zwz")
++        try ZwzV3Compressor(blockSize: 4_096).compress(
++            sourcePath: source.path,
++            destinationPath: archive.path,
++            options: CompressionOptions(
++                encryption: .publicKey(
++                    recipients: [identity.recipient],
++                    signer: signed ? identity.signingIdentity : nil
++                ),
++                format: .zwz
++            ),
++            keyProvider: signed ? identity.provider : nil,
++            progress: nil,
++            cancellationToken: nil
++        )
++        return (directory, archive, identity)
++    }
++
++
++    private func readUInt32(_ data: Data, at offset: Int) -> UInt32 {
++        data[offset..<(offset + 4)].enumerated().reduce(into: UInt32.zero) { value, byte in
++            value |= UInt32(byte.element) << (byte.offset * 8)
++        }
++    }
++}
+diff --git a/Tests/ZwzCoreTests/ZWZV3/ZwzV3TestSupport.swift b/Tests/ZwzCoreTests/ZWZV3/ZwzV3TestSupport.swift
+new file mode 100644
+index 0000000..fca9af6
+--- /dev/null
++++ b/Tests/ZwzCoreTests/ZWZV3/ZwzV3TestSupport.swift
+@@ -0,0 +1,160 @@
++import CryptoKit
++import Foundation
++@testable import ZwzCore
++
++final class ZwzV3MemoryKeyProvider: ZwzPrivateKeyProvider, @unchecked Sendable {
++    var agreementKeys: [String: Data]
++    var signingKeys: [String: Data]
++    var knownSigningKeys: [String: Data]
++    var lookupError: Error?
++    var agreementKeyResponses: [String: [Result<Data, Error>]] = [:]
++
++    init(
++        agreementKeys: [String: Data] = [:],
++        signingKeys: [String: Data] = [:],
++        knownSigningKeys: [String: Data] = [:]
++    ) {
++        self.agreementKeys = agreementKeys
++        self.signingKeys = signingKeys
++        self.knownSigningKeys = knownSigningKeys
++    }
++
++    func agreementPrivateKey(fingerprint: String, reason: String) throws -> Data {
++        if let lookupError { throw lookupError }
++        if var responses = agreementKeyResponses[fingerprint], !responses.isEmpty {
++            let response = responses.removeFirst()
++            agreementKeyResponses[fingerprint] = responses
++            return try response.get()
++        }
++        guard let key = agreementKeys[fingerprint] else {
++            throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++        }
++        return key
++    }
++
++    func signingPrivateKey(fingerprint: String, reason: String) throws -> Data {
++        if let lookupError { throw lookupError }
++        guard let key = signingKeys[fingerprint] else {
++            throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++        }
++        return key
++    }
++
++    func isKnownSigningKey(fingerprint: String, signingPublicKey: Data) -> Bool {
++        knownSigningKeys[fingerprint] == signingPublicKey
++    }
++}
++
++struct ZwzV3IdentityFixture {
++    let recipient: ZwzRecipient
++    let agreementPrivateKey: Data
++    let signingIdentity: ZwzSigningIdentity
++    let signingPrivateKey: Data
++    let signingFingerprint: String
++
++    static func make(name: String) -> Self {
++        let agreement = Curve25519.KeyAgreement.PrivateKey()
++        let signing = Curve25519.Signing.PrivateKey()
++        let fingerprint = ZwzV3Crypto.fingerprint(
++            agreement: agreement.publicKey.rawRepresentation,
++            signing: signing.publicKey.rawRepresentation
++        )
++        return Self(
++            recipient: ZwzRecipient(
++                name: name,
++                fingerprint: fingerprint,
++                agreementPublicKey: agreement.publicKey.rawRepresentation
++            ),
++            agreementPrivateKey: agreement.rawRepresentation,
++            signingIdentity: ZwzSigningIdentity(
++                name: name,
++                fingerprint: fingerprint,
++                agreementPublicKey: agreement.publicKey.rawRepresentation,
++                signingPublicKey: signing.publicKey.rawRepresentation
++            ),
++            signingPrivateKey: signing.rawRepresentation,
++            signingFingerprint: fingerprint
++        )
++    }
++
++    var provider: ZwzV3MemoryKeyProvider {
++        ZwzV3MemoryKeyProvider(
++            agreementKeys: [recipient.fingerprint: agreementPrivateKey],
++            signingKeys: [signingFingerprint: signingPrivateKey]
++        )
++    }
++}
++
++enum ZwzV3TestSupport {
++    static func makeTempDirectory() throws -> URL {
++        let url = FileManager.default.temporaryDirectory
++            .appendingPathComponent("zwz-v3-tests-\(UUID().uuidString)", isDirectory: true)
++        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
++        return url
++    }
++
++    static func makeSource(in directory: URL) throws -> URL {
++        let source = directory.appendingPathComponent("source", isDirectory: true)
++        try FileManager.default.createDirectory(
++            at: source.appendingPathComponent("nested/\u{8d44}\u{6599}/empty-dir", isDirectory: true),
++            withIntermediateDirectories: true
++        )
++        _ = FileManager.default.createFile(atPath: source.appendingPathComponent("empty.txt").path, contents: nil)
++        try Data("hidden".utf8).write(to: source.appendingPathComponent(".hidden"))
++        try Data("unicode".utf8).write(to: source.appendingPathComponent("nested/\u{8d44}\u{6599}/\u{6587}\u{4ef6}.txt"))
++        try Data((0..<48_000).map { UInt8(($0 * 29) % 251) })
++            .write(to: source.appendingPathComponent("nested/multi.bin"))
++        return source
++    }
++
++    static func assertTreesEqual(_ expected: URL, _ actual: URL) throws {
++        let expectedItems = try relativeItems(in: expected)
++        let actualItems = try relativeItems(in: actual)
++        guard expectedItems == actualItems else {
++            throw TreeMismatch(expected: expectedItems.map(\.path), actual: actualItems.map(\.path))
++        }
++        for item in expectedItems where !item.isDirectory {
++            let lhs = try Data(contentsOf: expected.appendingPathComponent(item.path))
++            let rhs = try Data(contentsOf: actual.appendingPathComponent(item.path))
++            guard lhs == rhs else { throw ByteMismatch(path: item.path) }
++        }
++    }
++
++    private struct TreeMismatch: Error, CustomStringConvertible {
++        let expected: [String]
++        let actual: [String]
++        var description: String { "expected \(expected), actual \(actual)" }
++    }
++
++    private struct ByteMismatch: Error {
++        let path: String
++    }
++
++    static func mutate(_ archive: URL, at offset: Int) throws -> URL {
++        var bytes = try Data(contentsOf: archive)
++        bytes[offset] ^= 0x80
++        let mutated = archive.deletingLastPathComponent().appendingPathComponent("mutated-\(UUID().uuidString).zwz")
++        try bytes.write(to: mutated)
++        return mutated
++    }
++
++    private struct RelativeItem: Equatable {
++        let path: String
++        let isDirectory: Bool
++    }
++
++    private static func relativeItems(in root: URL) throws -> [RelativeItem] {
++        guard let enumerator = FileManager.default.enumerator(
++            at: root,
++            includingPropertiesForKeys: [.isDirectoryKey],
++            options: []
++        ) else { return [] }
++        var result: [RelativeItem] = []
++        for case let url as URL in enumerator {
++            let relative = try ZwzV2PathValidator.normalizedArchivePath(root: root, item: url)
++            let directory = try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true
++            result.append(RelativeItem(path: relative, isDirectory: directory))
++        }
++        return result.sorted { $0.path < $1.path }
++    }
++}
+diff --git a/Tests/ZwzCoreTests/ZWZV3/ZwzV3TypesTests.swift b/Tests/ZwzCoreTests/ZWZV3/ZwzV3TypesTests.swift
+index 1b9d6ef..464ac31 100644
+--- a/Tests/ZwzCoreTests/ZWZV3/ZwzV3TypesTests.swift
++++ b/Tests/ZwzCoreTests/ZWZV3/ZwzV3TypesTests.swift
+@@ -2,6 +2,20 @@ import XCTest
+ @testable import ZwzCore
+ 
+ final class ZwzV3TypesTests: XCTestCase {
++    func testSigningIdentityCarriesBothPublicKeysWhileLegacyInitializerRemainsAvailable() {
++        let legacy = ZwzSigningIdentity(name: "Legacy", fingerprint: "fingerprint")
++        XCTAssertTrue(legacy.agreementPublicKey.isEmpty)
++        XCTAssertTrue(legacy.signingPublicKey.isEmpty)
++
++        let identity = ZwzSigningIdentity(
++            name: "Sender",
++            fingerprint: "fingerprint",
++            agreementPublicKey: Data(repeating: 1, count: 32),
++            signingPublicKey: Data(repeating: 2, count: 32)
++        )
++        XCTAssertEqual(identity.agreementPublicKey.count, 32)
++        XCTAssertEqual(identity.signingPublicKey.count, 32)
++    }
+     func testCompressionOptionsMapsLegacyPassword() {
+         XCTAssertEqual(
+             CompressionOptions(password: "secret", format: .zwz).encryption,

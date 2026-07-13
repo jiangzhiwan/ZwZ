@@ -1,0 +1,1075 @@
+diff --git a/Sources/ZwzCore/ArchiveExtractor.swift b/Sources/ZwzCore/ArchiveExtractor.swift
+index 5129911..10c4797 100644
+--- a/Sources/ZwzCore/ArchiveExtractor.swift
++++ b/Sources/ZwzCore/ArchiveExtractor.swift
+@@ -15,15 +15,42 @@ public class ArchiveExtractor {
+         progress: ProgressHandler? = nil,
+         cancellationToken: CancellationToken? = nil
+     ) throws {
++        _ = try extract(
++            archivePath: archivePath,
++            destinationPath: destinationPath,
++            password: password,
++            keyProvider: nil,
++            progress: progress,
++            cancellationToken: cancellationToken
++        )
++    }
++
++    @discardableResult
++    public func extract(
++        archivePath: String,
++        destinationPath: String,
++        password: String? = nil,
++        keyProvider: ZwzPrivateKeyProvider?,
++        progress: ProgressHandler? = nil,
++        cancellationToken: CancellationToken? = nil
++    ) throws -> ZwzArchiveSecurityInfo? {
+         try cancellationToken?.checkCancellation()
+         let format = try detectFormat(archivePath: archivePath)
++        var securityInfo: ZwzArchiveSecurityInfo?
+ 
+         switch format {
+         case .zip:
+             try extractZip(archivePath: archivePath, destinationPath: destinationPath, password: password, progress: progress)
+         case .zwz:
+             let zwzExtractor = ZwzExtractor()
+-            try zwzExtractor.extract(archivePath: archivePath, destinationPath: destinationPath, password: password, progress: progress, cancellationToken: cancellationToken)
++            securityInfo = try zwzExtractor.extract(
++                archivePath: archivePath,
++                destinationPath: destinationPath,
++                password: password,
++                keyProvider: keyProvider,
++                progress: progress,
++                cancellationToken: cancellationToken
++            )
+         case .tarGz, .tgz:
+             try extractTarGz(archivePath: archivePath, destinationPath: destinationPath, progress: progress)
+         case .gz:
+@@ -34,6 +61,7 @@ public class ArchiveExtractor {
+             try extract7z(archivePath: archivePath, destinationPath: destinationPath, password: password, progress: progress)
+         }
+         try cancellationToken?.checkCancellation()
++        return securityInfo
+     }
+ 
+     // MARK: - Format Detection
+@@ -67,6 +95,7 @@ public class ArchiveExtractor {
+             // ZWZ v1/v2 magic and ZWZ v2 split-volume magic
+             if Array(magicBytes.prefix(4)) == ZwzFormat.magic ||
+                Array(magicBytes.prefix(4)) == ZwzV2Format.magic ||
++               Array(magicBytes.prefix(4)) == [0x5A, 0x57, 0x5A, 0x33] ||
+                Array(magicBytes.prefix(4)) == ZwzV2Format.splitMagic {
+                 return .zwz
+             }
+@@ -103,7 +132,8 @@ public class ArchiveExtractor {
+     public func extractEntryToTemp(
+         archivePath: String,
+         entryPath: String,
+-        password: String? = nil
++        password: String? = nil,
++        keyProvider: ZwzPrivateKeyProvider? = nil
+     ) throws -> URL {
+         let format = try detectFormat(archivePath: archivePath)
+ 
+@@ -121,11 +151,11 @@ public class ArchiveExtractor {
+                 password: password
+             )
+         case .zwz:
+-            let zwzExtractor = ZwzExtractor()
+-            return try zwzExtractor.extractEntryToTemp(
++            return try ZwzExtractor().extractEntryToTemp(
+                 archivePath: archivePath,
+                 entryPath: entryPath,
+-                password: password
++                password: password,
++                keyProvider: keyProvider
+             )
+         case .tarGz, .tgz:
+             return try extractTarGzEntryToTemp(
+diff --git a/Sources/ZwzCore/ArchivePreviewer.swift b/Sources/ZwzCore/ArchivePreviewer.swift
+index b2d11da..30ca2f8 100644
+--- a/Sources/ZwzCore/ArchivePreviewer.swift
++++ b/Sources/ZwzCore/ArchivePreviewer.swift
+@@ -8,7 +8,11 @@ public class ArchivePreviewer {
+     public init() {}
+ 
+     /// 预览压缩包内容（不解压）
+-    public func preview(archivePath: String, password: String? = nil) throws -> [ArchiveEntry] {
++    public func preview(
++        archivePath: String,
++        password: String? = nil,
++        keyProvider: ZwzPrivateKeyProvider? = nil
++    ) throws -> [ArchiveEntry] {
+         let extractor = ArchiveExtractor()
+         let format = try extractor.detectFormat(archivePath: archivePath)
+ 
+@@ -16,7 +20,7 @@ public class ArchivePreviewer {
+         case .zip:
+             return try previewZip(archivePath: archivePath)
+         case .zwz:
+-            return try previewZwz(archivePath: archivePath, password: password)
++            return try previewZwz(archivePath: archivePath, password: password, keyProvider: keyProvider)
+         case .tarGz, .tgz:
+             return try previewTarGz(archivePath: archivePath)
+         case .gz:
+@@ -85,9 +89,17 @@ public class ArchivePreviewer {
+ 
+     // MARK: - ZWZ Preview
+ 
+-    private func previewZwz(archivePath: String, password: String?) throws -> [ArchiveEntry] {
++    private func previewZwz(
++        archivePath: String,
++        password: String?,
++        keyProvider: ZwzPrivateKeyProvider?
++    ) throws -> [ArchiveEntry] {
+         let zwzExtractor = ZwzExtractor()
+-        return try zwzExtractor.listEntries(archivePath: archivePath, password: password)
++        return try zwzExtractor.listEntries(
++            archivePath: archivePath,
++            password: password,
++            keyProvider: keyProvider
++        ).entries
+     }
+ 
+     /// 检测字符串是否可能是乱码
+diff --git a/Sources/ZwzCore/Types.swift b/Sources/ZwzCore/Types.swift
+index e30368c..62264c0 100644
+--- a/Sources/ZwzCore/Types.swift
++++ b/Sources/ZwzCore/Types.swift
+@@ -241,7 +241,7 @@ public enum ZwzError: LocalizedError {
+ }
+ 
+ /// 压缩包内的文件条目（用于预览）
+-public struct ArchiveEntry: Identifiable, Sendable {
++public struct ArchiveEntry: Identifiable, Equatable, Sendable {
+     public let id = UUID()
+     public let name: String
+     public let path: String
+@@ -256,4 +256,36 @@ public struct ArchiveEntry: Identifiable, Sendable {
+         self.isDirectory = isDirectory
+         self.modifiedDate = modifiedDate
+     }
++
++    public static func == (lhs: ArchiveEntry, rhs: ArchiveEntry) -> Bool {
++        lhs.name == rhs.name &&
++            lhs.path == rhs.path &&
++            lhs.size == rhs.size &&
++            lhs.isDirectory == rhs.isDirectory &&
++            lhs.modifiedDate == rhs.modifiedDate
++    }
++}
++
++public struct ZwzArchiveListing: Equatable, Sendable {
++    public let entries: [ArchiveEntry]
++    public let version: UInt16?
++    public let securityInfo: ZwzArchiveSecurityInfo?
++
++    public init(entries: [ArchiveEntry], version: UInt16?, securityInfo: ZwzArchiveSecurityInfo?) {
++        self.entries = entries
++        self.version = version
++        self.securityInfo = securityInfo
++    }
++}
++
++public struct ZwzExtractionResult: Equatable, Sendable {
++    public let destinationPath: String
++    public let version: UInt16?
++    public let securityInfo: ZwzArchiveSecurityInfo?
++
++    public init(destinationPath: String, version: UInt16?, securityInfo: ZwzArchiveSecurityInfo?) {
++        self.destinationPath = destinationPath
++        self.version = version
++        self.securityInfo = securityInfo
++    }
+ }
+diff --git a/Sources/ZwzCore/ZWZV3/ZwzV3Extractor.swift b/Sources/ZwzCore/ZWZV3/ZwzV3Extractor.swift
+index a591ce8..9971a75 100644
+--- a/Sources/ZwzCore/ZWZV3/ZwzV3Extractor.swift
++++ b/Sources/ZwzCore/ZWZV3/ZwzV3Extractor.swift
+@@ -455,7 +455,10 @@ public final class ZwzV3Extractor {
+     private static func splitBaseName(_ name: String) -> String {
+         let value = name as NSString
+         let ext = value.pathExtension.lowercased()
+-        let numbered = ext.first == "z" && ext.dropFirst().allSatisfy(\.isNumber)
++        let digits = ext.dropFirst()
++        let numbered = ext.first == "z" &&
++            digits.count >= 2 &&
++            digits.unicodeScalars.allSatisfy { (48...57).contains($0.value) }
+         return ext == "zwz" || numbered ? value.deletingPathExtension : name
+     }
+ 
+diff --git a/Sources/ZwzCore/ZwzAPI.swift b/Sources/ZwzCore/ZwzAPI.swift
+index d24f2e0..bd3ad55 100644
+--- a/Sources/ZwzCore/ZwzAPI.swift
++++ b/Sources/ZwzCore/ZwzAPI.swift
+@@ -31,6 +31,24 @@ public final class ZwzAPI {
+         options: CompressionOptions = CompressionOptions(),
+         progress: ProgressHandler? = nil,
+         cancellationToken: CancellationToken? = nil
++    ) throws -> String {
++        try compress(
++            sourcePath: sourcePath,
++            destinationPath: destinationPath,
++            options: options,
++            keyProvider: nil,
++            progress: progress,
++            cancellationToken: cancellationToken
++        )
++    }
++
++    public func compress(
++        sourcePath: String,
++        destinationPath: String? = nil,
++        options: CompressionOptions = CompressionOptions(),
++        keyProvider: ZwzPrivateKeyProvider?,
++        progress: ProgressHandler? = nil,
++        cancellationToken: CancellationToken? = nil
+     ) throws -> String {
+         let srcURL = URL(fileURLWithPath: sourcePath)
+         guard FileManager.default.fileExists(atPath: sourcePath) else {
+@@ -83,6 +101,7 @@ public final class ZwzAPI {
+                 sourcePath: sourcePath,
+                 destinationPath: finalDestPath,
+                 options: options,
++                keyProvider: keyProvider,
+                 progress: progress,
+                 cancellationToken: cancellationToken
+             )
+@@ -106,6 +125,24 @@ public final class ZwzAPI {
+         progress: ProgressHandler? = nil,
+         cancellationToken: CancellationToken? = nil
+     ) throws -> String {
++        try extract(
++            archivePath: archivePath,
++            destinationPath: destinationPath,
++            password: password,
++            keyProvider: nil,
++            progress: progress,
++            cancellationToken: cancellationToken
++        ).destinationPath
++    }
++
++    public func extract(
++        archivePath: String,
++        destinationPath: String? = nil,
++        password: String? = nil,
++        keyProvider: ZwzPrivateKeyProvider?,
++        progress: ProgressHandler? = nil,
++        cancellationToken: CancellationToken? = nil
++    ) throws -> ZwzExtractionResult {
+         guard FileManager.default.fileExists(atPath: archivePath) else {
+             throw ZwzError.fileNotFound(archivePath)
+         }
+@@ -120,15 +157,21 @@ public final class ZwzAPI {
+                 .appendingPathComponent(baseName).path
+         }
+ 
+-        try extractor.extract(
++        let securityInfo = try extractor.extract(
+             archivePath: archivePath,
+             destinationPath: destPath,
+             password: password,
++            keyProvider: keyProvider,
+             progress: progress,
+             cancellationToken: cancellationToken
+         )
+-
+-        return destPath
++        let version: UInt16? = try extractor.detectFormat(archivePath: archivePath) == .zwz ?
++            (securityInfo?.encryption == .publicKey ? 3 : 2) : nil
++        return ZwzExtractionResult(
++            destinationPath: destPath,
++            version: version,
++            securityInfo: securityInfo
++        )
+     }
+ 
+     // MARK: - List / Preview
+@@ -143,6 +186,28 @@ public final class ZwzAPI {
+         return try previewer.preview(archivePath: archivePath)
+     }
+ 
++    public func list(
++        archivePath: String,
++        password: String? = nil,
++        keyProvider: ZwzPrivateKeyProvider?
++    ) throws -> ZwzArchiveListing {
++        guard FileManager.default.fileExists(atPath: archivePath) else {
++            throw ZwzError.fileNotFound(archivePath)
++        }
++        guard try extractor.detectFormat(archivePath: archivePath) == .zwz else {
++            return ZwzArchiveListing(
++                entries: try previewer.preview(archivePath: archivePath, password: password),
++                version: nil,
++                securityInfo: nil
++            )
++        }
++        return try ZwzExtractor().listEntries(
++            archivePath: archivePath,
++            password: password,
++            keyProvider: keyProvider
++        )
++    }
++
+     // MARK: - Detect Format
+ 
+     /// 检测压缩包格式
+@@ -167,6 +232,20 @@ public final class ZwzAPI {
+         archivePath: String,
+         entryPath: String,
+         password: String? = nil
++    ) throws -> URL {
++        try extractEntryToTemp(
++            archivePath: archivePath,
++            entryPath: entryPath,
++            password: password,
++            keyProvider: nil
++        )
++    }
++
++    public func extractEntryToTemp(
++        archivePath: String,
++        entryPath: String,
++        password: String? = nil,
++        keyProvider: ZwzPrivateKeyProvider?
+     ) throws -> URL {
+         guard FileManager.default.fileExists(atPath: archivePath) else {
+             throw ZwzError.fileNotFound(archivePath)
+@@ -174,7 +253,8 @@ public final class ZwzAPI {
+         return try extractor.extractEntryToTemp(
+             archivePath: archivePath,
+             entryPath: entryPath,
+-            password: password
++            password: password,
++            keyProvider: keyProvider
+         )
+     }
+ }
+diff --git a/Sources/ZwzCore/ZwzCompressor.swift b/Sources/ZwzCore/ZwzCompressor.swift
+index fe81f64..e89e60b 100644
+--- a/Sources/ZwzCore/ZwzCompressor.swift
++++ b/Sources/ZwzCore/ZwzCompressor.swift
+@@ -83,6 +83,24 @@ public final class ZwzCompressor {
+         options: CompressionOptions = CompressionOptions(format: .zwz),
+         progress: ProgressHandler? = nil,
+         cancellationToken: CancellationToken? = nil
++    ) throws {
++        try compress(
++            sourcePath: sourcePath,
++            destinationPath: destinationPath,
++            options: options,
++            keyProvider: nil,
++            progress: progress,
++            cancellationToken: cancellationToken
++        )
++    }
++
++    public func compress(
++        sourcePath: String,
++        destinationPath: String,
++        options: CompressionOptions = CompressionOptions(format: .zwz),
++        keyProvider: ZwzPrivateKeyProvider?,
++        progress: ProgressHandler? = nil,
++        cancellationToken: CancellationToken? = nil
+     ) throws {
+         let sourceURL = URL(fileURLWithPath: sourcePath)
+         let outputURL = URL(fileURLWithPath: destinationPath)
+@@ -91,6 +109,18 @@ public final class ZwzCompressor {
+             withIntermediateDirectories: true
+         )
+ 
++        if case .publicKey = options.encryption {
++            try ZwzV3Compressor().compress(
++                sourcePath: sourcePath,
++                destinationPath: destinationPath,
++                options: options,
++                keyProvider: keyProvider,
++                progress: progress,
++                cancellationToken: cancellationToken
++            )
++            return
++        }
++
+         let v2Options = options.zwzV2Options
+         let progressBox = ZwzProgressBox(progress)
+         try cancellationToken?.checkCancellation()
+diff --git a/Sources/ZwzCore/ZwzExtractor.swift b/Sources/ZwzCore/ZwzExtractor.swift
+index 311ca0c..29b8660 100644
+--- a/Sources/ZwzCore/ZwzExtractor.swift
++++ b/Sources/ZwzCore/ZwzExtractor.swift
+@@ -1,6 +1,18 @@
+ import Foundation
+ 
+-/// Compatibility adapter that preserves the existing synchronous API while reading ZWZ v2 archives.
++private struct MissingZwzPrivateKeyProvider: ZwzPrivateKeyProvider {
++    func agreementPrivateKey(fingerprint: String, reason: String) throws -> Data {
++        throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++    }
++
++    func signingPrivateKey(fingerprint: String, reason: String) throws -> Data {
++        throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++    }
++
++    func isKnownSigningKey(fingerprint: String, signingPublicKey: Data) -> Bool { false }
++}
++
++/// Compatibility adapter that routes synchronous ZWZ APIs by logical archive magic.
+ public final class ZwzExtractor {
+     public init() {}
+ 
+@@ -11,38 +23,110 @@ public final class ZwzExtractor {
+         progress: ProgressHandler? = nil,
+         cancellationToken: CancellationToken? = nil
+     ) throws {
++        _ = try extract(
++            archivePath: archivePath,
++            destinationPath: destinationPath,
++            password: password,
++            keyProvider: nil,
++            progress: progress,
++            cancellationToken: cancellationToken
++        )
++    }
++
++    public func extract(
++        archivePath: String,
++        destinationPath: String,
++        password: String? = nil,
++        keyProvider: ZwzPrivateKeyProvider?,
++        progress: ProgressHandler? = nil,
++        cancellationToken: CancellationToken? = nil
++    ) throws -> ZwzArchiveSecurityInfo {
+         try cancellationToken?.checkCancellation()
+         let archiveURLs = try Self.archiveURLs(for: archivePath)
+-        try Self.rejectV1Archive(at: archiveURLs[0])
+-        let destinationURL = URL(fileURLWithPath: destinationPath)
+-
+-        _ = try waitForZwzAsync {
+-            try await ZwzV2Extractor().extractAll(
+-                archiveURLs: archiveURLs,
+-                to: destinationURL,
+-                password: password
++        switch try Self.codec(for: archiveURLs) {
++        case .v2(let header):
++            let destinationURL = URL(fileURLWithPath: destinationPath)
++            _ = try waitForZwzAsync {
++                try await ZwzV2Extractor().extractAll(
++                    archiveURLs: archiveURLs,
++                    to: destinationURL,
++                    password: password
++                )
++            }
++            try cancellationToken?.checkCancellation()
++            progress?(1.0)
++            return Self.v2SecurityInfo(header: header)
++        case .v3:
++            return try ZwzV3Extractor().extractAll(
++                archivePath: archivePath,
++                destinationPath: destinationPath,
++                keyProvider: keyProvider ?? MissingZwzPrivateKeyProvider(),
++                progress: progress,
++                cancellationToken: cancellationToken
+             )
+         }
+-        try cancellationToken?.checkCancellation()
+-        progress?(1.0)
+     }
+ 
+     public func listEntries(archivePath: String, password: String? = nil) throws -> [ArchiveEntry] {
++        try listEntries(archivePath: archivePath, password: password, keyProvider: nil).entries
++    }
++
++    public func listEntries(
++        archivePath: String,
++        password: String? = nil,
++        keyProvider: ZwzPrivateKeyProvider?
++    ) throws -> ZwzArchiveListing {
+         let archiveURLs = try Self.archiveURLs(for: archivePath)
+-        try Self.rejectV1Archive(at: archiveURLs[0])
+-        let index = try waitForZwzAsync {
+-            try await ZwzV2Extractor().preview(archiveURLs: archiveURLs, password: password)
++        switch try Self.codec(for: archiveURLs) {
++        case .v2(let header):
++            let index = try waitForZwzAsync {
++                try await ZwzV2Extractor().preview(archiveURLs: archiveURLs, password: password)
++            }
++            return ZwzArchiveListing(
++                entries: Self.archiveEntries(from: index.entries),
++                version: 2,
++                securityInfo: Self.v2SecurityInfo(header: header)
++            )
++        case .v3:
++            let listing = try ZwzV3Extractor().listEntries(
++                archivePath: archivePath,
++                keyProvider: keyProvider ?? MissingZwzPrivateKeyProvider()
++            )
++            return ZwzArchiveListing(
++                entries: Self.archiveEntries(from: listing.entries),
++                version: 3,
++                securityInfo: listing.securityInfo
++            )
+         }
+-        return Self.archiveEntries(from: index.entries)
+     }
+ 
+     public func extractEntryToTemp(
+         archivePath: String,
+         entryPath: String,
+         password: String? = nil
++    ) throws -> URL {
++        try extractEntryToTemp(
++            archivePath: archivePath,
++            entryPath: entryPath,
++            password: password,
++            keyProvider: nil
++        )
++    }
++
++    public func extractEntryToTemp(
++        archivePath: String,
++        entryPath: String,
++        password: String? = nil,
++        keyProvider: ZwzPrivateKeyProvider?
+     ) throws -> URL {
+         let archiveURLs = try Self.archiveURLs(for: archivePath)
+-        try Self.rejectV1Archive(at: archiveURLs[0])
++        if case .v3 = try Self.codec(for: archiveURLs) {
++            return try ZwzV3Extractor().extractEntryToTemp(
++                archivePath: archivePath,
++                entryPath: entryPath,
++                keyProvider: keyProvider ?? MissingZwzPrivateKeyProvider()
++            )
++        }
+         let destination = FileManager.default.temporaryDirectory
+             .appendingPathComponent("zwz-entry-\(UUID().uuidString)", isDirectory: true)
+ 
+@@ -61,10 +145,13 @@ public final class ZwzExtractor {
+         guard let data = try? Self.readPrefix(at: URL(fileURLWithPath: path), count: 4) else {
+             return false
+         }
+-        return Array(data) == ZwzV2Format.magic || Array(data) == ZwzV2Format.splitMagic
++        return Array(data) == ZwzFormat.magic ||
++            Array(data) == ZwzV2Format.magic ||
++            Array(data) == [0x5A, 0x57, 0x5A, 0x33] ||
++            Array(data) == ZwzV2Format.splitMagic
+     }
+ 
+-    private static func archiveEntries(from entries: [ZwzV2Entry]) -> [ArchiveEntry] {
++    static func archiveEntries(from entries: [ZwzV2Entry]) -> [ArchiveEntry] {
+         let directorySizes = entries
+             .filter { $0.type == .directory }
+             .reduce(into: [String: Int64]()) { result, directory in
+@@ -87,11 +174,30 @@ public final class ZwzExtractor {
+         }
+     }
+ 
+-    private static func rejectV1Archive(at url: URL) throws {
+-        let prefix = try readPrefix(at: url, count: 4)
+-        if Array(prefix) == ZwzFormat.magic {
+-            throw ZwzV2Error.unsupportedVersion(1)
++    private enum Codec {
++        case v2(ZwzV2Header)
++        case v3
++    }
++
++    private static func codec(for archiveURLs: [URL]) throws -> Codec {
++        let reader = try ZwzV2VolumeReader(urls: archiveURLs)
++        let magic = Array(try reader.read(offset: 0, length: 4))
++        if magic == ZwzFormat.magic { throw ZwzV2Error.unsupportedVersion(1) }
++        if magic == ZwzV2Format.magic {
++            let header = try ZwzV2BinaryCodec.decodeHeader(
++                reader.read(offset: 0, length: ZwzV2Header.encodedLength)
++            )
++            return .v2(header)
+         }
++        if magic == [0x5A, 0x57, 0x5A, 0x33] { return .v3 }
++        throw ZwzV3Error.malformedArchive("unsupported logical archive magic")
++    }
++
++    private static func v2SecurityInfo(header: ZwzV2Header) -> ZwzArchiveSecurityInfo {
++        ZwzArchiveSecurityInfo(
++            encryption: header.flags.contains(.encrypted) ? .password : .none,
++            signature: .unsigned
++        )
+     }
+ 
+     private static func archiveURLs(for path: String) throws -> [URL] {
+@@ -136,7 +242,10 @@ public final class ZwzExtractor {
+     private static func splitBaseName(for name: String) -> String {
+         let nsName = name as NSString
+         let ext = nsName.pathExtension.lowercased()
+-        let isNumberedVolume = ext.count == 3 && ext.first == "z" && Int(ext.dropFirst()) != nil
++        let volumeDigits = ext.dropFirst()
++        let isNumberedVolume = ext.first == "z" &&
++            volumeDigits.count >= 2 &&
++            volumeDigits.unicodeScalars.allSatisfy { (48...57).contains($0.value) }
+         return ext == "zwz" || isNumberedVolume ? nsName.deletingPathExtension : name
+     }
+ 
+diff --git a/Tests/ZwzCoreTests/ZWZV3/ZwzV3APITestSupport.swift b/Tests/ZwzCoreTests/ZWZV3/ZwzV3APITestSupport.swift
+new file mode 100644
+index 0000000..600ba4b
+--- /dev/null
++++ b/Tests/ZwzCoreTests/ZWZV3/ZwzV3APITestSupport.swift
+@@ -0,0 +1,47 @@
++import CryptoKit
++import Foundation
++@testable import ZwzCore
++
++enum ZwzV3APITestSupport {
++    struct Fixture {
++        let directory: URL
++        let source: URL
++        let archive: URL
++        let identity: ZwzV3IdentityFixture
++    }
++
++    static func makeFixture(
++        name: String = "archive.zwz",
++        signer: Bool = false,
++        splitVolume: SplitVolume? = nil
++    ) throws -> Fixture {
++        let directory = try ZwzV3TestSupport.makeTempDirectory()
++        let source = directory.appendingPathComponent("source", isDirectory: true)
++        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
++        try Data("public api".utf8).write(to: source.appendingPathComponent("file.txt"))
++        let identity = ZwzV3IdentityFixture.make(name: "Alice")
++        let archive = directory.appendingPathComponent(name)
++        let signingIdentity = signer ? identity.signingIdentity : nil
++        let options = CompressionOptions(
++            level: .none,
++            encryption: .publicKey(recipients: [identity.recipient], signer: signingIdentity),
++            splitVolume: splitVolume,
++            format: .zwz
++        )
++        _ = try ZwzAPI().compress(
++            sourcePath: source.path,
++            destinationPath: archive.path,
++            options: options,
++            keyProvider: signer ? identity.provider : nil
++        )
++        return Fixture(directory: directory, source: source, archive: archive, identity: identity)
++    }
++
++    static func logicalMagic(at archive: URL) throws -> [UInt8] {
++        let data = try Data(contentsOf: archive)
++        if Array(data.prefix(4)) == ZwzV2Format.splitMagic {
++            return Array(data.dropFirst(ZwzV2SplitEnvelope.encodedLength).prefix(4))
++        }
++        return Array(data.prefix(4))
++    }
++}
+diff --git a/Tests/ZwzCoreTests/ZWZV3/ZwzV3APITests.swift b/Tests/ZwzCoreTests/ZWZV3/ZwzV3APITests.swift
+new file mode 100644
+index 0000000..e12f3fa
+--- /dev/null
++++ b/Tests/ZwzCoreTests/ZWZV3/ZwzV3APITests.swift
+@@ -0,0 +1,407 @@
++import Foundation
++import XCTest
++@testable import ZwzCore
++
++final class ZwzV3APITests: XCTestCase {
++    func testPublicAPIWritesV3OnlyForPublicKeyMode() throws {
++        let fixture = try ZwzV3APITestSupport.makeFixture()
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        XCTAssertEqual(try ZwzV3APITestSupport.logicalMagic(at: fixture.archive), [0x5A, 0x57, 0x5A, 0x33])
++        let unsigned = try ZwzAPI().list(
++            archivePath: fixture.archive.path,
++            password: nil,
++            keyProvider: fixture.identity.provider
++        )
++        XCTAssertEqual(unsigned.securityInfo?.signature, .unsigned)
++
++        for (name, options) in [
++            ("plain.zwz", CompressionOptions(format: .zwz)),
++            ("password.zwz", CompressionOptions(password: "correct horse battery staple", format: .zwz))
++        ] {
++            let archive = fixture.directory.appendingPathComponent(name)
++            _ = try ZwzAPI().compress(
++                sourcePath: fixture.source.path,
++                destinationPath: archive.path,
++                options: options,
++                keyProvider: nil
++            )
++            XCTAssertEqual(try ZwzV3APITestSupport.logicalMagic(at: archive), ZwzV2Format.magic)
++        }
++    }
++
++    func testSingleAndSplitV3UseLogicalMagicAndReportSecurity() throws {
++        for split in [nil, SplitVolume.kiloBytes(1)] {
++            let fixture = try ZwzV3APITestSupport.makeFixture(signer: true, splitVolume: split)
++            defer { try? FileManager.default.removeItem(at: fixture.directory) }
++            let bob = ZwzV3IdentityFixture.make(name: "Bob")
++            _ = try ZwzAPI().compress(
++                sourcePath: fixture.source.path,
++                destinationPath: fixture.archive.path,
++                options: CompressionOptions(
++                    level: .none,
++                    encryption: .publicKey(
++                        recipients: [fixture.identity.recipient, bob.recipient],
++                        signer: fixture.identity.signingIdentity
++                    ),
++                    splitVolume: split,
++                    format: .zwz
++                ),
++                keyProvider: fixture.identity.provider
++            )
++            for identity in [fixture.identity, bob] {
++                let listing = try ZwzAPI().list(
++                    archivePath: fixture.archive.path,
++                    password: nil,
++                    keyProvider: identity.provider
++                )
++                XCTAssertEqual(listing.version, 3)
++                XCTAssertEqual(listing.entries.map(\.path), ["file.txt"])
++                XCTAssertEqual(listing.securityInfo?.encryption, .publicKey)
++                XCTAssertEqual(listing.securityInfo?.recipientFingerprints.count, 2)
++                XCTAssertEqual(
++                    listing.securityInfo?.signature,
++                    .validUnknownSigner(name: "Alice", fingerprint: fixture.identity.signingFingerprint)
++                )
++
++                let destination = fixture.directory.appendingPathComponent("out-\(identity.recipient.name)")
++                let extracted = try ZwzAPI().extract(
++                    archivePath: fixture.archive.path,
++                    destinationPath: destination.path,
++                    password: nil,
++                    keyProvider: identity.provider
++                )
++                XCTAssertEqual(extracted.version, 3)
++                XCTAssertEqual(extracted.securityInfo, listing.securityInfo)
++                XCTAssertEqual(
++                    try Data(contentsOf: destination.appendingPathComponent("file.txt")),
++                    Data("public api".utf8)
++                )
++            }
++        }
++    }
++
++    func testV2DetailedMetadataComesFromHeaderFlags() throws {
++        let fixture = try ZwzV3APITestSupport.makeFixture()
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let api = ZwzAPI()
++        let cases: [(String, String?, ZwzArchiveEncryptionKind)] = [
++            ("v2-plain.zwz", nil, .none),
++            ("v2-password.zwz", "correct horse battery staple", .password)
++        ]
++        for (name, password, expected) in cases {
++            let archive = fixture.directory.appendingPathComponent(name)
++            _ = try api.compress(
++                sourcePath: fixture.source.path,
++                destinationPath: archive.path,
++                options: CompressionOptions(password: password, format: .zwz)
++            )
++            let listing = try api.list(archivePath: archive.path, password: password, keyProvider: nil)
++            XCTAssertEqual(listing.version, 2)
++            XCTAssertEqual(listing.securityInfo, ZwzArchiveSecurityInfo(encryption: expected))
++        }
++    }
++
++    func testV2SplitDetailedListingAndExtractionRemainVersionTwo() throws {
++        let fixture = try ZwzV3APITestSupport.makeFixture()
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let payload = Data((0..<4_096).map { UInt8(truncatingIfNeeded: $0) })
++        try payload.write(to: fixture.source.appendingPathComponent("large.bin"))
++        let archive = fixture.directory.appendingPathComponent("v2-split.zwz")
++        let api = ZwzAPI()
++        _ = try api.compress(
++            sourcePath: fixture.source.path,
++            destinationPath: archive.path,
++            options: CompressionOptions(level: .none, splitVolume: .kiloBytes(1), format: .zwz)
++        )
++        XCTAssertEqual(Array(try Data(contentsOf: archive).prefix(4)), ZwzV2Format.splitMagic)
++        let listing = try api.list(archivePath: archive.path, password: "unused", keyProvider: nil)
++        XCTAssertEqual(listing.version, 2)
++        XCTAssertEqual(listing.securityInfo, ZwzArchiveSecurityInfo(encryption: .none))
++        let destination = fixture.directory.appendingPathComponent("v2-split-out")
++        let result = try api.extract(
++            archivePath: archive.path,
++            destinationPath: destination.path,
++            password: "unused",
++            keyProvider: nil
++        )
++        XCTAssertEqual(result.version, 2)
++        XCTAssertEqual(result.securityInfo, listing.securityInfo)
++        XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent("large.bin")), payload)
++    }
++
++    func testV3ErrorsPassThroughAdaptersUnchanged() throws {
++        let fixture = try ZwzV3APITestSupport.makeFixture()
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let expected = ZwzV3Error.userAuthenticationCancelled
++        let provider = fixture.identity.provider
++        provider.lookupError = expected
++
++        XCTAssertThrowsError(try ArchivePreviewer().preview(
++            archivePath: fixture.archive.path,
++            keyProvider: provider
++        )) { XCTAssertEqual($0 as? ZwzV3Error, expected) }
++        XCTAssertThrowsError(try ArchiveExtractor().extract(
++            archivePath: fixture.archive.path,
++            destinationPath: fixture.directory.appendingPathComponent("failed").path,
++            keyProvider: provider
++        )) { XCTAssertEqual($0 as? ZwzV3Error, expected) }
++    }
++
++    func testMissingWrongAndKeychainProviderErrorsRemainConcrete() throws {
++        let fixture = try ZwzV3APITestSupport.makeFixture()
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let api = ZwzAPI()
++
++        XCTAssertThrowsError(try api.list(
++            archivePath: fixture.archive.path,
++            password: nil,
++            keyProvider: nil
++        )) { error in
++            guard case ZwzV3Error.noMatchingPrivateKey = error else {
++                return XCTFail("unexpected error: \(error)")
++            }
++        }
++
++        let wrong = ZwzV3IdentityFixture.make(name: "Mallory").provider
++        XCTAssertThrowsError(try api.extractEntryToTemp(
++            archivePath: fixture.archive.path,
++            entryPath: "file.txt",
++            keyProvider: wrong
++        )) { error in
++            guard case ZwzV3Error.noMatchingPrivateKey = error else {
++                return XCTFail("unexpected error: \(error)")
++            }
++        }
++
++        let failed = fixture.identity.provider
++        failed.lookupError = ZwzV3Error.keychainFailure(-50)
++        XCTAssertThrowsError(try api.extract(
++            archivePath: fixture.archive.path,
++            destinationPath: fixture.directory.appendingPathComponent("keychain-failed").path,
++            keyProvider: failed
++        )) { XCTAssertEqual($0 as? ZwzV3Error, .keychainFailure(-50)) }
++    }
++
++    func testInvalidSignatureAndAuthenticationErrorsPassThroughPublicAPI() throws {
++        let signed = try ZwzV3APITestSupport.makeFixture(signer: true)
++        defer { try? FileManager.default.removeItem(at: signed.directory) }
++        let signedBytes = try Data(contentsOf: signed.archive)
++        let signedParsed = try ZwzV3BinaryCodec.parse(signedBytes)
++        let badSignature = try ZwzV3TestSupport.mutate(
++            signed.archive,
++            at: Int(signedParsed.header.signatureOffset)
++        )
++        XCTAssertThrowsError(try ZwzAPI().list(
++            archivePath: badSignature.path,
++            password: nil,
++            keyProvider: signed.identity.provider
++        )) { XCTAssertEqual($0 as? ZwzV3Error, .invalidSignature) }
++
++        let unsigned = try ZwzV3APITestSupport.makeFixture()
++        defer { try? FileManager.default.removeItem(at: unsigned.directory) }
++        let parsed = try ZwzV3BinaryCodec.parse(Data(contentsOf: unsigned.archive))
++        let badIndex = try ZwzV3TestSupport.mutate(
++            unsigned.archive,
++            at: Int(parsed.header.encryptedIndexOffset) + 12
++        )
++        XCTAssertThrowsError(try ZwzAPI().list(
++            archivePath: badIndex.path,
++            password: nil,
++            keyProvider: unsigned.identity.provider
++        )) { XCTAssertEqual($0 as? ZwzV3Error, .authenticationFailed) }
++    }
++
++    func testV1UnknownAndTruncatedArchivesFailSafely() throws {
++        let directory = try ZwzV3TestSupport.makeTempDirectory()
++        defer { try? FileManager.default.removeItem(at: directory) }
++        let cases: [(String, Data)] = [
++            ("v1.zwz", Data(ZwzFormat.magic + [0, 0, 0, 0])),
++            ("unknown.zwz", Data("NOPE".utf8)),
++            ("truncated.zwz", Data([0x5A, 0x57, 0x5A]))
++        ]
++        for (name, bytes) in cases {
++            let archive = directory.appendingPathComponent(name)
++            try bytes.write(to: archive)
++            XCTAssertThrowsError(try ZwzAPI().list(
++                archivePath: archive.path,
++                password: nil,
++                keyProvider: nil
++            ))
++        }
++        let v1 = directory.appendingPathComponent("v1.zwz")
++        XCTAssertThrowsError(try ZwzAPI().list(
++            archivePath: v1.path,
++            password: nil,
++            keyProvider: nil
++        )) { XCTAssertEqual($0 as? ZwzV2Error, .unsupportedVersion(1)) }
++    }
++
++    func testZIPIgnoresKeyProviderAndReturnsNoZwzMetadata() throws {
++        let fixture = try ZwzV3APITestSupport.makeFixture()
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let zip = fixture.directory.appendingPathComponent("archive.zip")
++        _ = try ZwzAPI().compress(
++            sourcePath: fixture.source.path,
++            destinationPath: zip.path,
++            options: CompressionOptions(
++                encryption: .publicKey(recipients: [fixture.identity.recipient], signer: nil),
++                format: .zip
++            ),
++            keyProvider: fixture.identity.provider
++        )
++        XCTAssertEqual(Array(try Data(contentsOf: zip).prefix(2)), [0x50, 0x4B])
++        let listing = try ZwzAPI().list(archivePath: zip.path, password: nil, keyProvider: fixture.identity.provider)
++        XCTAssertNil(listing.version)
++        XCTAssertNil(listing.securityInfo)
++        XCTAssertEqual(listing.entries.map(\.path), ["file.txt"])
++    }
++
++    func testRenamedV3ArchiveRoutesThroughPublicListExtractAndPreview() throws {
++        let fixture = try ZwzV3APITestSupport.makeFixture()
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let renamed = fixture.directory.appendingPathComponent("renamed.bin")
++        try FileManager.default.moveItem(at: fixture.archive, to: renamed)
++
++        let listing = try ZwzAPI().list(
++            archivePath: renamed.path,
++            password: nil,
++            keyProvider: fixture.identity.provider
++        )
++        XCTAssertEqual(listing.version, 3)
++        XCTAssertEqual(listing.entries.map(\.path), ["file.txt"])
++        XCTAssertEqual(
++            try ArchivePreviewer().preview(
++                archivePath: renamed.path,
++                keyProvider: fixture.identity.provider
++            ).map(\.path),
++            ["file.txt"]
++        )
++
++        let destination = fixture.directory.appendingPathComponent("renamed-out")
++        let result = try ZwzAPI().extract(
++            archivePath: renamed.path,
++            destinationPath: destination.path,
++            keyProvider: fixture.identity.provider
++        )
++        XCTAssertEqual(result.version, 3)
++        XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent("file.txt")), Data("public api".utf8))
++    }
++
++    func testV3MoreThanOneHundredVolumesAreDiscoveredFromFinalVolume() throws {
++        let fixture = try ZwzV3APITestSupport.makeFixture()
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let payload = Data((0..<(112 * 1_024)).map { UInt8(truncatingIfNeeded: $0 &* 31) })
++        try payload.write(to: fixture.source.appendingPathComponent("many-volumes.bin"))
++        _ = try ZwzAPI().compress(
++            sourcePath: fixture.source.path,
++            destinationPath: fixture.archive.path,
++            options: CompressionOptions(
++                level: .none,
++                encryption: .publicKey(recipients: [fixture.identity.recipient], signer: nil),
++                splitVolume: .kiloBytes(1),
++                format: .zwz
++            ),
++            keyProvider: nil
++        )
++        XCTAssertTrue(FileManager.default.fileExists(
++            atPath: fixture.directory.appendingPathComponent("archive.z100").path
++        ))
++        let generatedVolumes = try FileManager.default.contentsOfDirectory(atPath: fixture.directory.path)
++            .filter { $0 == "archive.zwz" || $0.hasPrefix("archive.z") }
++        XCTAssertGreaterThan(generatedVolumes.count, 101)
++        let firstVolume = fixture.directory.appendingPathComponent("archive.z00")
++        try FileManager.default.copyItem(
++            at: firstVolume,
++            to: fixture.directory.appendingPathComponent("archive.z1")
++        )
++        try FileManager.default.copyItem(
++            at: firstVolume,
++            to: fixture.directory.appendingPathComponent("archive.zxx")
++        )
++
++        let listing = try ZwzAPI().list(
++            archivePath: fixture.archive.path,
++            password: nil,
++            keyProvider: fixture.identity.provider
++        )
++        XCTAssertTrue(listing.entries.contains { $0.path == "many-volumes.bin" })
++        let destination = fixture.directory.appendingPathComponent("many-volumes-out")
++        _ = try ZwzAPI().extract(
++            archivePath: fixture.archive.path,
++            destinationPath: destination.path,
++            keyProvider: fixture.identity.provider
++        )
++        XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent("many-volumes.bin")), payload)
++    }
++
++    func testV2MoreThanOneHundredVolumesShareFinalVolumeDiscovery() throws {
++        let fixture = try ZwzV3APITestSupport.makeFixture(name: "v2-many.zwz")
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let payload = Data((0..<(112 * 1_024)).map { UInt8(truncatingIfNeeded: $0 &* 17) })
++        try payload.write(to: fixture.source.appendingPathComponent("v2-many.bin"))
++        _ = try ZwzAPI().compress(
++            sourcePath: fixture.source.path,
++            destinationPath: fixture.archive.path,
++            options: CompressionOptions(level: .none, splitVolume: .kiloBytes(1), format: .zwz)
++        )
++        XCTAssertTrue(FileManager.default.fileExists(
++            atPath: fixture.directory.appendingPathComponent("v2-many.z100").path
++        ))
++
++        let listing = try ZwzAPI().list(
++            archivePath: fixture.archive.path,
++            password: nil,
++            keyProvider: nil
++        )
++        XCTAssertEqual(listing.version, 2)
++        XCTAssertTrue(listing.entries.contains { $0.path == "v2-many.bin" })
++        let destination = fixture.directory.appendingPathComponent("v2-many-out")
++        let result = try ZwzAPI().extract(
++            archivePath: fixture.archive.path,
++            destinationPath: destination.path,
++            keyProvider: nil
++        )
++        XCTAssertEqual(result.version, 2)
++        XCTAssertEqual(try Data(contentsOf: destination.appendingPathComponent("v2-many.bin")), payload)
++    }
++
++    func testV3SingleEntryFailureLeavesNoAdapterTemporaryDirectory() throws {
++        let fixture = try ZwzV3APITestSupport.makeFixture()
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let temporary = FileManager.default.temporaryDirectory
++        let before = Set(try FileManager.default.contentsOfDirectory(atPath: temporary.path)
++            .filter { $0.hasPrefix("zwz-drag-") || $0.hasPrefix("zwz-v3-entry-") })
++        XCTAssertThrowsError(try ArchiveExtractor().extractEntryToTemp(
++            archivePath: fixture.archive.path,
++            entryPath: "missing.txt",
++            keyProvider: fixture.identity.provider
++        ))
++        let after = Set(try FileManager.default.contentsOfDirectory(atPath: temporary.path)
++            .filter { $0.hasPrefix("zwz-drag-") || $0.hasPrefix("zwz-v3-entry-") })
++        XCTAssertEqual(after, before)
++    }
++
++    func testLegacySignaturesKeepTheirShapes() throws {
++        let fixture = try ZwzV3APITestSupport.makeFixture()
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let api = ZwzAPI()
++        let archive = fixture.directory.appendingPathComponent("legacy-v2.zwz")
++        _ = try api.compress(
++            sourcePath: fixture.source.path,
++            destinationPath: archive.path,
++            options: CompressionOptions(format: .zwz)
++        )
++        let entries: [ArchiveEntry] = try api.list(archivePath: archive.path)
++        let output: String = try api.extract(
++            archivePath: archive.path,
++            destinationPath: fixture.directory.appendingPathComponent("legacy-out").path
++        )
++        let entry: URL = try api.extractEntryToTemp(
++            archivePath: archive.path,
++            entryPath: "file.txt"
++        )
++        XCTAssertFalse(entries.isEmpty)
++        XCTAssertFalse(output.isEmpty)
++        XCTAssertEqual(try Data(contentsOf: entry), Data("public api".utf8))
++    }
++}

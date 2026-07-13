@@ -1,0 +1,4614 @@
+diff --git a/Sources/ZwzCore/ZWZV3/ZwzV3Extractor.swift b/Sources/ZwzCore/ZWZV3/ZwzV3Extractor.swift
+index 14bd8db..075dc18 100644
+--- a/Sources/ZwzCore/ZWZV3/ZwzV3Extractor.swift
++++ b/Sources/ZwzCore/ZWZV3/ZwzV3Extractor.swift
+@@ -16,6 +16,17 @@ public final class ZwzV3Extractor {
+         }
+     }
+ 
++    public func inspectArchive(
++        archivePath: String,
++        keyProvider: ZwzPrivateKeyProvider? = nil
++    ) throws -> ZwzV3ArchiveInspection {
++        let parsed = try parseArchive(
++            archivePath: archivePath,
++            cancellationToken: nil
++        )
++        return inspect(parsed: parsed, keyProvider: keyProvider)
++    }
++
+     public func listEntries(
+         archivePath: String,
+         keyProvider: ZwzPrivateKeyProvider
+@@ -211,44 +222,13 @@ public final class ZwzV3Extractor {
+         keyProvider: ZwzPrivateKeyProvider,
+         cancellationToken: CancellationToken?
+     ) throws -> ZwzV3OpenedArchive {
+-        try cancellationToken?.checkCancellation()
+-        let urls = try Self.archiveURLs(for: archivePath)
+-        let archive = try Self.loadLogicalArchive(
+-            from: urls,
++        let parsed = try parseArchive(
++            archivePath: archivePath,
+             cancellationToken: cancellationToken
+         )
+-        try cancellationToken?.checkCancellation()
+-        let parsed: ZwzV3ParsedArchive
+-        do {
+-            parsed = try ZwzV3BinaryCodec.parse(archive)
+-        } catch {
+-            if archive.count >= ZwzV3Header.encodedLength,
+-               let header = try? ZwzV3BinaryCodec.decodeHeader(
+-                   archive.subdata(in: 0..<ZwzV3Header.encodedLength)
+-               ),
+-               header.signatureAlgorithm == .ed25519 {
+-                throw ZwzV3Error.invalidSignature
+-            }
+-            throw error
+-        }
+-
+-        let signature: ZwzSignatureVerification
+-        if let signer = parsed.signer {
+-            guard ZwzV3Crypto.verify(
+-                signer.signature,
+-                bytes: parsed.canonicalSignedBytes,
+-                publicKey: signer.signingPublicKey
+-            ) else {
+-                throw ZwzV3Error.invalidSignature
+-            }
+-            signature = keyProvider.isKnownSigningKey(
+-                fingerprint: signer.fingerprint,
+-                signingPublicKey: signer.signingPublicKey
+-            )
+-                ? .validKnownSigner(name: signer.name, fingerprint: signer.fingerprint)
+-                : .validUnknownSigner(name: signer.name, fingerprint: signer.fingerprint)
+-        } else {
+-            signature = .unsigned
++        let inspection = inspect(parsed: parsed, keyProvider: keyProvider)
++        guard inspection.securityInfo.signature != .invalid else {
++            throw ZwzV3Error.invalidSignature
+         }
+ 
+         let contentKey = try unwrapContentKey(parsed: parsed, keyProvider: keyProvider)
+@@ -288,10 +268,68 @@ public final class ZwzV3Extractor {
+             index: index,
+             records: records,
+             contentKey: contentKey,
++            securityInfo: inspection.securityInfo
++        )
++    }
++
++    private func parseArchive(
++        archivePath: String,
++        cancellationToken: CancellationToken?
++    ) throws -> ZwzV3ParsedArchive {
++        try cancellationToken?.checkCancellation()
++        let urls = try Self.archiveURLs(for: archivePath)
++        let archive = try Self.loadLogicalArchive(
++            from: urls,
++            cancellationToken: cancellationToken
++        )
++        try cancellationToken?.checkCancellation()
++        do {
++            return try ZwzV3BinaryCodec.parse(archive)
++        } catch {
++            if archive.count >= ZwzV3Header.encodedLength,
++               let header = try? ZwzV3BinaryCodec.decodeHeader(
++                   archive.subdata(in: 0..<ZwzV3Header.encodedLength)
++               ),
++               header.signatureAlgorithm == .ed25519 {
++                throw ZwzV3Error.invalidSignature
++            }
++            throw error
++        }
++    }
++
++    private func inspect(
++        parsed: ZwzV3ParsedArchive,
++        keyProvider: ZwzPrivateKeyProvider?
++    ) -> ZwzV3ArchiveInspection {
++        let signature: ZwzSignatureVerification
++        if let signer = parsed.signer {
++            if ZwzV3Crypto.verify(
++                signer.signature,
++                bytes: parsed.canonicalSignedBytes,
++                publicKey: signer.signingPublicKey
++            ) {
++                signature = keyProvider?.isKnownSigningKey(
++                    fingerprint: signer.fingerprint,
++                    signingPublicKey: signer.signingPublicKey
++                ) == true
++                    ? .validKnownSigner(name: signer.name, fingerprint: signer.fingerprint)
++                    : .validUnknownSigner(name: signer.name, fingerprint: signer.fingerprint)
++            } else {
++                signature = .invalid
++            }
++        } else {
++            signature = .unsigned
++        }
++        let recipients = parsed.recipients.map {
++            ZwzRecipientInfo(name: $0.recipientName, fingerprint: $0.recipientFingerprint)
++        }
++        return ZwzV3ArchiveInspection(
++            recipients: recipients,
+             securityInfo: ZwzArchiveSecurityInfo(
+                 encryption: .publicKey,
+-                recipientFingerprints: parsed.recipients.map(\.recipientFingerprint),
+-                signature: signature
++                recipientFingerprints: recipients.map(\.fingerprint),
++                signature: signature,
++                signerSigningPublicKey: parsed.signer?.signingPublicKey
+             )
+         )
+     }
+diff --git a/Sources/ZwzCore/ZWZV3/ZwzV3Types.swift b/Sources/ZwzCore/ZWZV3/ZwzV3Types.swift
+index 8fb7fbc..a132f3b 100644
+--- a/Sources/ZwzCore/ZWZV3/ZwzV3Types.swift
++++ b/Sources/ZwzCore/ZWZV3/ZwzV3Types.swift
+@@ -78,15 +78,28 @@ public struct ZwzArchiveSecurityInfo: Equatable, Sendable {
+     public let encryption: ZwzArchiveEncryptionKind
+     public let recipientFingerprints: [String]
+     public let signature: ZwzSignatureVerification
++    public let signerSigningPublicKey: Data?
+ 
+     public init(
+         encryption: ZwzArchiveEncryptionKind,
+         recipientFingerprints: [String] = [],
+-        signature: ZwzSignatureVerification = .unsigned
++        signature: ZwzSignatureVerification = .unsigned,
++        signerSigningPublicKey: Data? = nil
+     ) {
+         self.encryption = encryption
+         self.recipientFingerprints = recipientFingerprints
+         self.signature = signature
++        self.signerSigningPublicKey = signerSigningPublicKey
++    }
++}
++
++public struct ZwzV3ArchiveInspection: Equatable, Sendable {
++    public let recipients: [ZwzRecipientInfo]
++    public let securityInfo: ZwzArchiveSecurityInfo
++
++    public init(recipients: [ZwzRecipientInfo], securityInfo: ZwzArchiveSecurityInfo) {
++        self.recipients = recipients
++        self.securityInfo = securityInfo
+     }
+ }
+ 
+diff --git a/Sources/ZwzCore/ZwzAPI.swift b/Sources/ZwzCore/ZwzAPI.swift
+index bd3ad55..ead6e2f 100644
+--- a/Sources/ZwzCore/ZwzAPI.swift
++++ b/Sources/ZwzCore/ZwzAPI.swift
+@@ -208,6 +208,21 @@ public final class ZwzAPI {
+         )
+     }
+ 
++    /// Reads public V3 recipient metadata and verifies its optional signature
++    /// without requesting a private key or decrypting archive contents.
++    public func inspect(
++        archivePath: String,
++        keyProvider: ZwzPrivateKeyProvider? = nil
++    ) throws -> ZwzV3ArchiveInspection {
++        guard FileManager.default.fileExists(atPath: archivePath) else {
++            throw ZwzError.fileNotFound(archivePath)
++        }
++        return try ZwzV3Extractor().inspectArchive(
++            archivePath: archivePath,
++            keyProvider: keyProvider
++        )
++    }
++
+     // MARK: - Detect Format
+ 
+     /// 检测压缩包格式
+diff --git a/Sources/ZwzGUI/ArchiveEditSession.swift b/Sources/ZwzGUI/ArchiveEditSession.swift
+index a26ec61..d9ce2ac 100644
+--- a/Sources/ZwzGUI/ArchiveEditSession.swift
++++ b/Sources/ZwzGUI/ArchiveEditSession.swift
+@@ -21,6 +21,8 @@ final class ArchiveEditSession {
+     let archiveURL: URL
+     let format: ExtractionFormat
+     let workspaceURL: URL
++    let originalSecurityInfo: ZwzArchiveSecurityInfo?
++    let originalPassword: String?
+     private(set) var hasChanges = false
+     private let fileManager = FileManager.default
+ 
+@@ -29,13 +31,49 @@ final class ArchiveEditSession {
+         "java", "c", "cc", "cpp", "cxx", "h", "hpp"
+     ]
+ 
+-    private init(archiveURL: URL, format: ExtractionFormat, workspaceURL: URL) {
++    private init(
++        archiveURL: URL,
++        format: ExtractionFormat,
++        workspaceURL: URL,
++        originalSecurityInfo: ZwzArchiveSecurityInfo?,
++        originalPassword: String?
++    ) {
+         self.archiveURL = archiveURL
+         self.format = format
+         self.workspaceURL = workspaceURL
++        self.originalSecurityInfo = originalSecurityInfo
++        self.originalPassword = originalPassword
+     }
+ 
+     static func create(archiveURL: URL, password: String?) throws -> ArchiveEditSession {
++        try createSession(
++            archiveURL: archiveURL,
++            password: password,
++            identityStore: nil,
++            securityInfo: nil
++        )
++    }
++
++    static func create(
++        archiveURL: URL,
++        password: String?,
++        identityStore: any ZwzIdentityStore,
++        securityInfo: ZwzArchiveSecurityInfo?
++    ) throws -> ArchiveEditSession {
++        try createSession(
++            archiveURL: archiveURL,
++            password: password,
++            identityStore: identityStore,
++            securityInfo: securityInfo
++        )
++    }
++
++    private static func createSession(
++        archiveURL: URL,
++        password: String?,
++        identityStore: (any ZwzIdentityStore)?,
++        securityInfo: ZwzArchiveSecurityInfo?
++    ) throws -> ArchiveEditSession {
+         let extractor = ArchiveExtractor()
+         let format = try extractor.detectFormat(archivePath: archiveURL.path)
+         guard format == .zip || format == .zwz else { throw ArchiveEditorError.unsupportedFormat }
+@@ -44,12 +82,27 @@ final class ArchiveEditSession {
+             .appendingPathComponent("zwz-edit-\(UUID().uuidString)", isDirectory: true)
+         try FileManager.default.createDirectory(at: workspaceURL, withIntermediateDirectories: true)
+         do {
++            var resolvedSecurityInfo = securityInfo
+             if format == .zip {
+                 try extractZip(archiveURL: archiveURL, to: workspaceURL, password: password)
++            } else if let identityStore {
++                let result = try ZwzAPI().extract(
++                    archivePath: archiveURL.path,
++                    destinationPath: workspaceURL.path,
++                    password: password,
++                    keyProvider: identityStore
++                )
++                resolvedSecurityInfo = result.securityInfo ?? securityInfo
+             } else {
+                 try extractor.extract(archivePath: archiveURL.path, destinationPath: workspaceURL.path, password: password)
+             }
+-            return ArchiveEditSession(archiveURL: archiveURL, format: format, workspaceURL: workspaceURL)
++            return ArchiveEditSession(
++                archiveURL: archiveURL,
++                format: format,
++                workspaceURL: workspaceURL,
++                originalSecurityInfo: resolvedSecurityInfo,
++                originalPassword: password.flatMap { $0.isEmpty ? nil : $0 }
++            )
+         } catch {
+             try? FileManager.default.removeItem(at: workspaceURL)
+             throw error
+@@ -141,15 +194,51 @@ final class ArchiveEditSession {
+     }
+ 
+     func save(password: String?, progress: ProgressHandler? = nil) throws {
++        let encryption = password.flatMap { $0.isEmpty ? nil : $0 }
++            .map(ZwzEncryptionMode.password) ?? .none
++        try save(encryption: encryption, keyProvider: nil, progress: progress)
++    }
++
++    func save(
++        encryption: ZwzEncryptionMode,
++        identityStore: any ZwzIdentityStore,
++        progress: ProgressHandler? = nil
++    ) throws {
++        try save(
++            encryption: encryption,
++            keyProvider: identityStore,
++            progress: progress
++        )
++    }
++
++    private func save(
++        encryption: ZwzEncryptionMode,
++        keyProvider: ZwzPrivateKeyProvider?,
++        progress: ProgressHandler?
++    ) throws {
+         let temporaryOutput = archiveURL.deletingLastPathComponent()
+             .appendingPathComponent(".zwz-edit-save-\(UUID().uuidString).\(archiveURL.pathExtension)")
+-        let options = CompressionOptions(level: .normal, password: password, aes256: true, format: format == .zip ? .zip : .zwz)
++        if format == .zip, case .publicKey = encryption {
++            throw ArchiveEditorError.unsupportedFormat
++        }
++        let options = CompressionOptions(
++            level: .normal,
++            encryption: encryption,
++            aes256: true,
++            format: format == .zip ? .zip : .zwz
++        )
+         do {
+             switch format {
+             case .zip:
+                 try ZipCompressor().compress(sourcePath: workspaceURL.path, destinationPath: temporaryOutput.path, options: options, progress: progress)
+             case .zwz:
+-                try ZwzCompressor().compress(sourcePath: workspaceURL.path, destinationPath: temporaryOutput.path, options: options, progress: progress)
++                try ZwzCompressor().compress(
++                    sourcePath: workspaceURL.path,
++                    destinationPath: temporaryOutput.path,
++                    options: options,
++                    keyProvider: keyProvider,
++                    progress: progress
++                )
+             default:
+                 throw ArchiveEditorError.unsupportedFormat
+             }
+@@ -216,3 +305,96 @@ final class ArchiveEditSession {
+         }
+     }
+ }
++
++final class DefaultArchiveEditWorkflowClient: ArchiveEditWorkflowClient, @unchecked Sendable {
++    private let lock = NSLock()
++    private var session: ArchiveEditSession?
++    private var openGeneration: UUID?
++
++    var archivePath: String? {
++        lock.withLock { session?.archiveURL.path }
++    }
++
++    var hasChanges: Bool {
++        lock.withLock { session?.hasChanges ?? false }
++    }
++
++    func open(
++        archivePath: String,
++        password: String?,
++        securityInfo: ZwzArchiveSecurityInfo?,
++        identityStore: any ZwzIdentityStore
++    ) throws -> [ArchiveEntry] {
++        let generation = UUID()
++        lock.withLock { openGeneration = generation }
++        let opened = try ArchiveEditSession.create(
++            archiveURL: URL(fileURLWithPath: archivePath),
++            password: password,
++            identityStore: identityStore,
++            securityInfo: securityInfo
++        )
++        let entries = try opened.entries()
++        let accepted = lock.withLock { () -> Bool in
++            guard openGeneration == generation else { return false }
++            session = opened
++            return true
++        }
++        guard accepted else { throw CancellationError() }
++        return entries
++    }
++
++    func entries() throws -> [ArchiveEntry] {
++        try currentSession().entries()
++    }
++
++    func add(urls: [URL], into directoryPath: String) throws {
++        try currentSession().add(urls: urls, into: directoryPath)
++    }
++
++    func delete(path: String) throws {
++        try currentSession().delete(path: path)
++    }
++
++    func rename(path: String, to newName: String) throws {
++        try currentSession().rename(path: path, to: newName)
++    }
++
++    func replace(path: String, with sourceURL: URL) throws {
++        try currentSession().replace(path: path, with: sourceURL)
++    }
++
++    func text(for path: String) throws -> String {
++        try currentSession().text(for: path)
++    }
++
++    func writeText(_ text: String, to path: String) throws {
++        try currentSession().writeText(text, to: path)
++    }
++
++    func save(identityStore: any ZwzIdentityStore) throws {
++        let session = try currentSession()
++        let encryption = try ArchiveEncryptionResolver.resolve(
++            securityInfo: session.originalSecurityInfo,
++            password: session.originalPassword,
++            identityStore: identityStore
++        )
++        try session.save(
++            encryption: encryption,
++            identityStore: identityStore
++        )
++    }
++
++    func discard() {
++        lock.withLock {
++            openGeneration = nil
++            session = nil
++        }
++    }
++
++    private func currentSession() throws -> ArchiveEditSession {
++        guard let session = lock.withLock({ session }) else {
++            throw ArchiveEditWorkflowError.noActiveSession
++        }
++        return session
++    }
++}
+diff --git a/Sources/ZwzGUI/ArchiveEncryptionResolver.swift b/Sources/ZwzGUI/ArchiveEncryptionResolver.swift
+new file mode 100644
+index 0000000..4599812
+--- /dev/null
++++ b/Sources/ZwzGUI/ArchiveEncryptionResolver.swift
+@@ -0,0 +1,168 @@
++import Foundation
++import ZwzCore
++
++struct ArchiveProtectionDescriptor: Codable, Equatable, Sendable {
++    enum SignatureKind: String, Codable, Sendable {
++        case unsigned
++        case signed
++        case invalid
++    }
++
++    let encryptionRawValue: UInt8
++    let recipientFingerprints: [String]
++    let signatureKind: SignatureKind
++    let signerFingerprint: String?
++    let signerSigningPublicKey: Data?
++
++    init(securityInfo: ZwzArchiveSecurityInfo) {
++        encryptionRawValue = securityInfo.encryption.rawValue
++        recipientFingerprints = securityInfo.recipientFingerprints
++        switch securityInfo.signature {
++        case .validKnownSigner(_, let fingerprint),
++             .validUnknownSigner(_, let fingerprint):
++            signatureKind = .signed
++            signerFingerprint = fingerprint
++        case .unsigned:
++            signatureKind = .unsigned
++            signerFingerprint = nil
++        case .invalid:
++            signatureKind = .invalid
++            signerFingerprint = nil
++        }
++        signerSigningPublicKey = securityInfo.signerSigningPublicKey
++    }
++
++    var securityInfo: ZwzArchiveSecurityInfo? {
++        guard let encryption = ZwzArchiveEncryptionKind(rawValue: encryptionRawValue) else {
++            return nil
++        }
++        let signature: ZwzSignatureVerification
++        switch signatureKind {
++        case .unsigned:
++            signature = .unsigned
++        case .signed:
++            guard let signerFingerprint else { return nil }
++            signature = .validKnownSigner(name: "", fingerprint: signerFingerprint)
++        case .invalid:
++            signature = .invalid
++        }
++        return ZwzArchiveSecurityInfo(
++            encryption: encryption,
++            recipientFingerprints: recipientFingerprints,
++            signature: signature,
++            signerSigningPublicKey: signerSigningPublicKey
++        )
++    }
++}
++
++enum ArchiveEncryptionResolutionError: LocalizedError, Equatable {
++    case passwordRequired
++    case missingRecipient(String)
++    case missingSigner(String)
++    case invalidSignature
++
++    var errorDescription: String? {
++        switch self {
++        case .passwordRequired:
++            return "The original archive password is required to preserve its encryption."
++        case .missingRecipient(let fingerprint):
++            return "The original recipient \(fingerprint) is unavailable. The archive was not saved."
++        case .missingSigner(let fingerprint):
++            return "The original signer \(fingerprint) is not available as a local identity. The archive was not saved."
++        case .invalidSignature:
++            return "The archive has an invalid signature and cannot be opened or saved."
++        }
++    }
++}
++
++enum ArchiveEncryptionResolver {
++    static func resolve(
++        securityInfo: ZwzArchiveSecurityInfo?,
++        password: String?,
++        identityStore: any ZwzIdentityStore
++    ) throws -> ZwzEncryptionMode {
++        guard let securityInfo else {
++            return normalizedPassword(password).map(ZwzEncryptionMode.password) ?? .none
++        }
++
++        switch securityInfo.encryption {
++        case .none:
++            return .none
++        case .password:
++            guard let password = normalizedPassword(password) else {
++                throw ArchiveEncryptionResolutionError.passwordRequired
++            }
++            return .password(password)
++        case .publicKey:
++            return try resolvePublicKey(
++                securityInfo: securityInfo,
++                identityStore: identityStore
++            )
++        }
++    }
++
++    private static func resolvePublicKey(
++        securityInfo: ZwzArchiveSecurityInfo,
++        identityStore: any ZwzIdentityStore
++    ) throws -> ZwzEncryptionMode {
++        guard securityInfo.signature != .invalid else {
++            throw ArchiveEncryptionResolutionError.invalidSignature
++        }
++
++        let identities = try identityStore.identities()
++        let contacts = try identityStore.contacts()
++        var recipientsByFingerprint: [String: ZwzPublicIdentity] = [:]
++        for contact in contacts {
++            recipientsByFingerprint[contact.fingerprint] = contact
++        }
++        for identity in identities {
++            recipientsByFingerprint[identity.fingerprint] = identity.publicIdentity
++        }
++
++        let fingerprints = Array(Set(securityInfo.recipientFingerprints)).sorted()
++        let recipients = try fingerprints.map { fingerprint -> ZwzRecipient in
++            guard let identity = recipientsByFingerprint[fingerprint] else {
++                throw ArchiveEncryptionResolutionError.missingRecipient(fingerprint)
++            }
++            return ZwzRecipient(
++                name: identity.name,
++                fingerprint: identity.fingerprint,
++                agreementPublicKey: identity.agreementPublicKey
++            )
++        }
++
++        guard !recipients.isEmpty else {
++            throw ZwzV3Error.recipientRequired
++        }
++
++        let signer: ZwzSigningIdentity?
++        switch securityInfo.signature {
++        case .unsigned:
++            signer = nil
++        case .validKnownSigner(_, let fingerprint),
++             .validUnknownSigner(_, let fingerprint):
++            guard let expectedSigningPublicKey = securityInfo.signerSigningPublicKey,
++                  let identity = identities.first(where: {
++                      $0.fingerprint == fingerprint
++                          && $0.signingPublicKey == expectedSigningPublicKey
++                  }) else {
++                throw ArchiveEncryptionResolutionError.missingSigner(fingerprint)
++            }
++            signer = ZwzSigningIdentity(
++                name: identity.name,
++                fingerprint: identity.fingerprint,
++                agreementPublicKey: identity.agreementPublicKey,
++                signingPublicKey: identity.signingPublicKey
++            )
++        case .invalid:
++            throw ArchiveEncryptionResolutionError.invalidSignature
++        }
++
++        return .publicKey(recipients: recipients, signer: signer)
++    }
++
++    private static func normalizedPassword(_ password: String?) -> String? {
++        guard let password, !password.isEmpty else { return nil }
++        return password
++    }
++}
+diff --git a/Sources/ZwzGUI/ArchiveEntryPreviewModel.swift b/Sources/ZwzGUI/ArchiveEntryPreviewModel.swift
+index 2767839..e3fefc0 100644
+--- a/Sources/ZwzGUI/ArchiveEntryPreviewModel.swift
++++ b/Sources/ZwzGUI/ArchiveEntryPreviewModel.swift
+@@ -16,6 +16,42 @@ enum ArchiveEntryPreviewState: Equatable, Sendable {
+     case failed(String)
+ }
+ 
++enum ArchiveEntryPreviewProtectionFailure: Equatable, Sendable {
++    case missingPrivateKey([String])
++    case invalidSignature
++
++    init?(_ error: Error) {
++        guard let error = error as? ZwzV3Error else { return nil }
++        switch error {
++        case .noMatchingPrivateKey(let fingerprints):
++            self = .missingPrivateKey(fingerprints)
++        case .invalidSignature:
++            self = .invalidSignature
++        default:
++            return nil
++        }
++    }
++
++    var error: ZwzV3Error {
++        switch self {
++        case .missingPrivateKey(let fingerprints):
++            return .noMatchingPrivateKey(fingerprints)
++        case .invalidSignature:
++            return .invalidSignature
++        }
++    }
++}
++
++struct ArchiveEntryPreviewProtectionEvent: Sendable {
++    let failure: ArchiveEntryPreviewProtectionFailure
++    let allowsPrivateKeyRecovery: Bool
++    let retryAfterPrivateKeyRestore: @MainActor @Sendable () -> Void
++}
++
++typealias ArchiveEntryPreviewProtectionHandler = @MainActor @Sendable (
++    ArchiveEntryPreviewProtectionEvent
++) -> Void
++
+ protocol ArchiveEntryPreviewExtracting: Sendable {
+     func extractEntryToTemp(
+         archivePath: String,
+@@ -27,6 +63,8 @@ protocol ArchiveEntryPreviewExtracting: Sendable {
+ }
+ 
+ private struct DefaultArchiveEntryPreviewExtractor: ArchiveEntryPreviewExtracting {
++    let identityStore: any ZwzIdentityStore
++
+     func extractEntryToTemp(
+         archivePath: String,
+         entryPath: String,
+@@ -38,6 +76,7 @@ private struct DefaultArchiveEntryPreviewExtractor: ArchiveEntryPreviewExtractin
+             archivePath: archivePath,
+             entryPath: entryPath,
+             password: password,
++            keyProvider: identityStore,
+             maximumBytes: maximumBytes,
+             cancellationToken: cancellationToken
+         )
+@@ -53,6 +92,7 @@ final class ArchiveEntryPreviewModel: ObservableObject {
+     var currentEntryPath: String? { currentEntry?.path }
+ 
+     private let extractor: any ArchiveEntryPreviewExtracting
++    private let onProtectionFailure: ArchiveEntryPreviewProtectionHandler?
+     private var currentRequest: PreviewRequest?
+     private var currentTask: Task<Void, Never>?
+     private var currentCancellationToken: CancellationToken?
+@@ -62,9 +102,15 @@ final class ArchiveEntryPreviewModel: ObservableObject {
+         let archivePath: String
+         let entry: ArchiveEntry
+         let password: String?
++        let allowsPrivateKeyRecovery: Bool
+ 
+         var key: PreviewRequestKey {
+-            PreviewRequestKey(archivePath: archivePath, entryPath: entry.path, password: password)
++            PreviewRequestKey(
++                archivePath: archivePath,
++                entryPath: entry.path,
++                password: password,
++                allowsPrivateKeyRecovery: allowsPrivateKeyRecovery
++            )
+         }
+     }
+ 
+@@ -72,17 +118,36 @@ final class ArchiveEntryPreviewModel: ObservableObject {
+         let archivePath: String
+         let entryPath: String
+         let password: String?
++        let allowsPrivateKeyRecovery: Bool
++    }
++
++    init(
++        identityStore: any ZwzIdentityStore = ZwzGUIIdentityStore.shared,
++        onProtectionFailure: ArchiveEntryPreviewProtectionHandler? = nil
++    ) {
++        extractor = DefaultArchiveEntryPreviewExtractor(identityStore: identityStore)
++        self.onProtectionFailure = onProtectionFailure
+     }
+ 
+-    init(extractor: any ArchiveEntryPreviewExtracting = DefaultArchiveEntryPreviewExtractor()) {
++    init(
++        extractor: any ArchiveEntryPreviewExtracting,
++        onProtectionFailure: ArchiveEntryPreviewProtectionHandler? = nil
++    ) {
+         self.extractor = extractor
++        self.onProtectionFailure = onProtectionFailure
+     }
+ 
+-    func preview(archivePath: String, entry: ArchiveEntry, password: String? = nil) {
++    func preview(
++        archivePath: String,
++        entry: ArchiveEntry,
++        password: String? = nil,
++        allowsPrivateKeyRecovery: Bool = true
++    ) {
+         let request = PreviewRequest(
+             archivePath: archivePath,
+             entry: entry,
+-            password: password?.isEmpty == true ? nil : password
++            password: password?.isEmpty == true ? nil : password,
++            allowsPrivateKeyRecovery: allowsPrivateKeyRecovery
+         )
+         if state == .loading, currentRequest?.key == request.key {
+             return
+@@ -162,7 +227,18 @@ final class ArchiveEntryPreviewModel: ObservableObject {
+         preview(
+             archivePath: request.archivePath,
+             entry: request.entry,
+-            password: request.password
++            password: request.password,
++            allowsPrivateKeyRecovery: request.allowsPrivateKeyRecovery
++        )
++    }
++
++    func retryAfterPrivateKeyRestore() {
++        guard let request = currentRequest else { return }
++        preview(
++            archivePath: request.archivePath,
++            entry: request.entry,
++            password: request.password,
++            allowsPrivateKeyRecovery: false
+         )
+     }
+ 
+@@ -214,6 +290,16 @@ final class ArchiveEntryPreviewModel: ObservableObject {
+                 state = .idle
+             } else {
+                 state = .failed(error.localizedDescription)
++                if let failure = ArchiveEntryPreviewProtectionFailure(error),
++                   let request = currentRequest {
++                    onProtectionFailure?(ArchiveEntryPreviewProtectionEvent(
++                        failure: failure,
++                        allowsPrivateKeyRecovery: request.allowsPrivateKeyRecovery,
++                        retryAfterPrivateKeyRestore: { [weak self] in
++                            self?.retryAfterPrivateKeyRestore()
++                        }
++                    ))
++                }
+             }
+         }
+     }
+diff --git a/Sources/ZwzGUI/ArchiveViewModel.swift b/Sources/ZwzGUI/ArchiveViewModel.swift
+index 03155a1..b349c64 100644
+--- a/Sources/ZwzGUI/ArchiveViewModel.swift
++++ b/Sources/ZwzGUI/ArchiveViewModel.swift
+@@ -47,6 +47,26 @@ enum ThreadMode: String, CaseIterable {
+     }
+ }
+ 
++enum EncryptionModeSelection: String, CaseIterable, Sendable {
++    case none
++    case password
++    case publicKey
++}
++
++private enum ArchiveViewModelSecurityError: LocalizedError {
++    case invalidCompressionConfiguration
++    case invalidArchiveSignature
++
++    var errorDescription: String? {
++        switch self {
++        case .invalidCompressionConfiguration:
++            return "The selected archive encryption settings are incomplete."
++        case .invalidArchiveSignature:
++            return "The archive signature is invalid. Content cannot be opened."
++        }
++    }
++}
++
+ // MARK: - View Model
+ 
+ @MainActor
+@@ -63,11 +83,22 @@ class ArchiveViewModel: ObservableObject {
+ 
+     // 压缩选项
+     @Published var showCompressOptions = false
+-    @Published var compressFormat: CompressionFormat = .zip
++    @Published var compressFormat: CompressionFormat = .zip {
++        didSet {
++            if compressFormat == .zip, encryptionModeSelection == .publicKey {
++                selectEncryptionMode(.none)
++            }
++        }
++    }
+     @Published var compressLevel: CompressionLevel = .normal
+     @Published var password = ""
+     @Published var splitSize = ""
+     @Published var splitUnit = "MB"
++    @Published var encryptionModeSelection: EncryptionModeSelection = .none
++    @Published var selectedRecipientFingerprints: Set<String> = []
++    @Published var selectedSignerFingerprint: String?
++    @Published private(set) var availableRecipients: [ZwzPublicIdentity] = []
++    @Published private(set) var availableSigningIdentities: [ZwzIdentityMetadata] = []
+ 
+     // 多线程设置（全局，从 UserDefaults 读取）
+     @Published var threadMode: ThreadMode = .auto
+@@ -87,6 +118,9 @@ class ArchiveViewModel: ObservableObject {
+     @Published var isSavingEdits = false
+     @Published var editErrorMessage: String?
+     @Published private(set) var hasUnsavedArchiveEdits = false
++    @Published private(set) var archiveSecurityInfo: ZwzArchiveSecurityInfo?
++    @Published var showMissingPrivateKeyPrompt = false
++    @Published private(set) var missingPrivateKeyRecipients: [ZwzRecipientInfo] = []
+ 
+     // 压缩包内容（内联显示）
+     @Published var previewEntries: [ArchiveEntry] = []
+@@ -120,7 +154,17 @@ class ArchiveViewModel: ObservableObject {
+     // 文件选择
+     @Published var showFilePicker = false
+     @Published var showSavePanel = false
+-    @Published var sourcePath: String?
++    @Published var sourcePath: String? {
++        didSet {
++            if sourcePath != oldValue {
++                invalidateOperation()
++                editClient.discard()
++                clearPendingPrivateKeyRecovery()
++                archiveSecurityInfo = nil
++                inspectedRecipients = []
++            }
++        }
++    }
+ 
+     // 旋转动画
+     @Published var rotationAngle: Double = 0
+@@ -130,11 +174,13 @@ class ArchiveViewModel: ObservableObject {
+ 
+     // 待操作类型
+     private var pendingAction: PendingAction = .none
+-    private var compressor = ZipCompressor()
+-    private var extractor = ArchiveExtractor()
+-    private var previewer = ArchivePreviewer()
+     private var passwordWasAutoFilled = false
+-    private var editSession: ArchiveEditSession?
++    private var inspectedRecipients: [ZwzRecipientInfo] = []
++
++    let identityStore: any ZwzIdentityStore
++    private let archiveClient: any ArchiveWorkflowClient
++    private let editClient: any ArchiveEditWorkflowClient
++    private let mountClient: any ArchiveMountWorkflowClient
+ 
+     var isEditableArchive: Bool {
+         detectedFormat == .zip || detectedFormat == .zwz
+@@ -146,6 +192,61 @@ class ArchiveViewModel: ObservableObject {
+         case extract
+     }
+ 
++    private enum PendingPrivateKeyOperation {
++        case compress
++        case preview(path: String, isPasswordRetry: Bool)
++        case extract
++        case smartExtract
++        case entry(ArchiveEntry, openAfterExtraction: Bool)
++        case edit
++        case mount(capacityMB: Int)
++        case customResume(@MainActor @Sendable () -> Void)
++    }
++
++    private var pendingPrivateKeyOperation: PendingPrivateKeyOperation?
++
++    init(
++        identityStore: any ZwzIdentityStore = ZwzGUIIdentityStore.shared,
++        archiveClient: any ArchiveWorkflowClient = ZwzAPIArchiveWorkflowClient(),
++        editClient: any ArchiveEditWorkflowClient = DefaultArchiveEditWorkflowClient(),
++        mountClient: any ArchiveMountWorkflowClient = DefaultArchiveMountWorkflowClient()
++    ) {
++        self.identityStore = identityStore
++        self.archiveClient = archiveClient
++        self.editClient = editClient
++        self.mountClient = mountClient
++    }
++
++    var canStartCompression: Bool {
++        guard sourcePath != nil else { return false }
++        switch encryptionModeSelection {
++        case .none:
++            return true
++        case .password:
++            return !password.isEmpty
++        case .publicKey:
++            guard compressFormat == .zwz, !selectedRecipientFingerprints.isEmpty else {
++                return false
++            }
++            let knownRecipients = Set(availableRecipients.map(\.fingerprint))
++            guard selectedRecipientFingerprints.isSubset(of: knownRecipients) else { return false }
++            if let selectedSignerFingerprint {
++                return availableSigningIdentities.contains {
++                    $0.fingerprint == selectedSignerFingerprint
++                }
++            }
++            return true
++        }
++    }
++
++    var signatureBadge: ZwzSignatureVerification? {
++        archiveSecurityInfo?.signature
++    }
++
++    var canOpenArchiveContent: Bool {
++        archiveSecurityInfo?.signature != .invalid
++    }
++
+     @discardableResult
+     func beginOperation() -> UUID {
+         let generation = UUID()
+@@ -156,6 +257,7 @@ class ArchiveViewModel: ObservableObject {
+     }
+ 
+     func cancelOperation() {
++        clearPendingPrivateKeyRecovery()
+         guard isProcessing else { return }
+         isCancelling = true
+         cancellationToken?.cancel()
+@@ -169,6 +271,42 @@ class ArchiveViewModel: ObservableObject {
+         operationGeneration = nil
+     }
+ 
++    func selectEncryptionMode(_ mode: EncryptionModeSelection) {
++        encryptionModeSelection = mode
++        if mode != .publicKey {
++            selectedRecipientFingerprints.removeAll()
++            selectedSignerFingerprint = nil
++        }
++        if mode != .password {
++            password = ""
++        }
++    }
++
++    func refreshIdentityChoices() async throws {
++        let store = identityStore
++        let values = try await Task.detached(priority: .userInitiated) {
++            (try store.identities(), try store.contacts())
++        }.value
++
++        let identities = values.0.sorted(by: Self.identitySort)
++        var recipientsByFingerprint: [String: ZwzPublicIdentity] = [:]
++        for contact in values.1 {
++            recipientsByFingerprint[contact.fingerprint] = contact
++        }
++        for identity in identities {
++            recipientsByFingerprint[identity.fingerprint] = identity.publicIdentity
++        }
++        availableSigningIdentities = identities
++        availableRecipients = recipientsByFingerprint.values.sorted(by: Self.publicIdentitySort)
++
++        let recipientFingerprints = Set(availableRecipients.map(\.fingerprint))
++        selectedRecipientFingerprints.formIntersection(recipientFingerprints)
++        if let selectedSignerFingerprint,
++           !identities.contains(where: { $0.fingerprint == selectedSignerFingerprint }) {
++            self.selectedSignerFingerprint = nil
++        }
++    }
++
+     // MARK: - Actions
+ 
+     func startCompress() {
+@@ -177,6 +315,7 @@ class ArchiveViewModel: ObservableObject {
+         rememberPreviewPassword = false
+         splitSize = ""
+         compressLevel = .normal
++        Task { try? await refreshIdentityChoices() }
+         // 从 UserDefaults 读取多线程设置
+         let modeRaw = UserDefaults.standard.string(forKey: "zwz_thread_mode") ?? "auto"
+         threadMode = ThreadMode(rawValue: modeRaw) ?? .auto
+@@ -206,7 +345,7 @@ class ArchiveViewModel: ObservableObject {
+                 password = ""
+                 rememberPreviewPassword = false
+                 previewPasswordError = nil
+-                detectedFormat = try extractor.detectFormat(archivePath: path)
++                detectedFormat = try archiveClient.detectFormat(archivePath: path)
+                 archiveName = url.lastPathComponent
+                 performPreview(path: path)
+             } catch {
+@@ -247,7 +386,7 @@ class ArchiveViewModel: ObservableObject {
+                 password = ""
+                 rememberPreviewPassword = false
+                 previewPasswordError = nil
+-                detectedFormat = try extractor.detectFormat(archivePath: path)
++                detectedFormat = try archiveClient.detectFormat(archivePath: path)
+                 archiveName = url.lastPathComponent
+                 performPreview(path: path)
+             } catch {
+@@ -262,6 +401,7 @@ class ArchiveViewModel: ObservableObject {
+     /// 清空预览内容，回到拖拽初始界面
+     func clearPreview() {
+         invalidateOperation()
++        clearPendingPrivateKeyRecovery()
+         showPreviewPasswordPrompt = false
+         previewPasswordError = nil
+         password = ""
+@@ -274,6 +414,8 @@ class ArchiveViewModel: ObservableObject {
+         selectedEntryId = nil
+         sourcePath = nil
+         detectedFormat = nil
++        archiveSecurityInfo = nil
++        inspectedRecipients = []
+         errorMessage = nil
+         currentStatus = .idle
+         discardArchiveEdits()
+@@ -281,20 +423,32 @@ class ArchiveViewModel: ObservableObject {
+ 
+     // MARK: - Archive Editing
+ 
+-    func beginArchiveEditing() {
++    func beginArchiveEditing(allowsPrivateKeyRecovery: Bool = true) {
++        guard enforceValidSignature() else { return }
+         guard let sourcePath, isEditableArchive else { return }
+         isProcessing = true
+         processingTitle = "正在准备编辑…"
+         currentStatus = .reading
+         let password = password.isEmpty ? nil : password
++        let securityInfo = archiveSecurityInfo
++        let editClient = editClient
++        let identityStore = identityStore
++        let generation = beginOperation()
+         DispatchQueue.global(qos: .userInitiated).async {
+             do {
+-                let session = try ArchiveEditSession.create(archiveURL: URL(fileURLWithPath: sourcePath), password: password)
+-                let entries = try session.entries()
++                let entries = try editClient.open(
++                    archivePath: sourcePath,
++                    password: password,
++                    securityInfo: securityInfo,
++                    identityStore: identityStore
++                )
+                 DispatchQueue.main.async {
+-                    self.editSession = session
++                    guard self.acceptsCallback(generation: generation), self.sourcePath == sourcePath else {
++                        editClient.discard()
++                        return
++                    }
+                     self.editEntries = entries
+-                    self.hasUnsavedArchiveEdits = false
++                    self.hasUnsavedArchiveEdits = editClient.hasChanges
+                     self.isProcessing = false
+                     self.currentStatus = .idle
+                     self.editErrorMessage = nil
+@@ -302,87 +456,93 @@ class ArchiveViewModel: ObservableObject {
+                 }
+             } catch {
+                 DispatchQueue.main.async {
++                    guard self.acceptsCallback(generation: generation), self.sourcePath == sourcePath else {
++                        return
++                    }
+                     self.isProcessing = false
+-                    self.currentStatus = .error
+-                    self.errorMessage = self.localizedMessage(for: error, context: .preview)
++                    if self.handleProtectedOperationFailure(
++                        error,
++                        operation: .edit,
++                        allowsRecovery: allowsPrivateKeyRecovery,
++                        context: .preview
++                    ) {
++                        return
++                    }
+                 }
+             }
+         }
+     }
+ 
+     func refreshEditEntries() {
+-        do { editEntries = try editSession?.entries() ?? [] }
++        do { editEntries = try editClient.entries() }
+         catch { editErrorMessage = error.localizedDescription }
+     }
+ 
+     func addToArchive(urls: [URL], directory: String) {
+-        guard let editSession else { return }
+         do {
+-            try editSession.add(urls: urls, into: directory)
++            try editClient.add(urls: urls, into: directory)
+             refreshEditEntries()
+         } catch { editErrorMessage = error.localizedDescription }
+-        hasUnsavedArchiveEdits = editSession.hasChanges
++        hasUnsavedArchiveEdits = editClient.hasChanges
+     }
+ 
+     func deleteFromArchive(path: String) {
+-        guard let editSession else { return }
+         do {
+-            try editSession.delete(path: path)
++            try editClient.delete(path: path)
+             refreshEditEntries()
+         } catch { editErrorMessage = error.localizedDescription }
+-        hasUnsavedArchiveEdits = editSession.hasChanges
++        hasUnsavedArchiveEdits = editClient.hasChanges
+     }
+ 
+     func renameInArchive(path: String, to name: String) {
+-        guard let editSession else { return }
+         do {
+-            try editSession.rename(path: path, to: name)
++            try editClient.rename(path: path, to: name)
+             refreshEditEntries()
+         } catch { editErrorMessage = error.localizedDescription }
+-        hasUnsavedArchiveEdits = editSession.hasChanges
++        hasUnsavedArchiveEdits = editClient.hasChanges
+     }
+ 
+     func replaceInArchive(path: String, with url: URL) {
+-        guard let editSession else { return }
+         do {
+-            try editSession.replace(path: path, with: url)
++            try editClient.replace(path: path, with: url)
+             refreshEditEntries()
+         } catch { editErrorMessage = error.localizedDescription }
+-        hasUnsavedArchiveEdits = editSession.hasChanges
++        hasUnsavedArchiveEdits = editClient.hasChanges
+     }
+ 
+-    func textForArchiveEntry(path: String) throws -> String { try editSession?.text(for: path) ?? "" }
++    func textForArchiveEntry(path: String) throws -> String {
++        try editClient.text(for: path)
++    }
+ 
+     @discardableResult
+     func saveTextInArchive(_ text: String, path: String) -> Bool {
+-        guard let editSession else { return false }
+         do {
+-            try editSession.writeText(text, to: path)
++            try editClient.writeText(text, to: path)
+             refreshEditEntries()
+-            hasUnsavedArchiveEdits = editSession.hasChanges
++            hasUnsavedArchiveEdits = editClient.hasChanges
+             return true
+         } catch {
+             editErrorMessage = error.localizedDescription
+-            hasUnsavedArchiveEdits = editSession.hasChanges
++            hasUnsavedArchiveEdits = editClient.hasChanges
+             return false
+         }
+     }
+ 
+     func saveArchiveEdits(onSuccess: (@MainActor @Sendable () -> Void)? = nil) {
+-        guard let session = editSession else {
++        guard let archivePath = editClient.archivePath ?? sourcePath else {
+             onSuccess?()
+             return
+         }
+-        let archivePath = session.archiveURL.path
+         isSavingEdits = true
+         editErrorMessage = nil
+-        let password = password.isEmpty ? nil : password
++        let editClient = editClient
++        let identityStore = identityStore
+         DispatchQueue.global(qos: .userInitiated).async {
+             do {
+-                try session.save(password: password)
++                try editClient.save(identityStore: identityStore)
+                 DispatchQueue.main.async {
+                     self.isSavingEdits = false
+-                    self.editSession = nil
++                    editClient.discard()
+                     self.hasUnsavedArchiveEdits = false
+                     self.showArchiveEditor = false
+                     self.performPreview(path: archivePath)
+@@ -398,7 +558,7 @@ class ArchiveViewModel: ObservableObject {
+     }
+ 
+     func discardArchiveEdits() {
+-        editSession = nil
++        editClient.discard()
+         editEntries = []
+         editErrorMessage = nil
+         hasUnsavedArchiveEdits = false
+@@ -407,36 +567,22 @@ class ArchiveViewModel: ObservableObject {
+ 
+     // MARK: - Compress
+ 
+-    func performCompress() {
++    func performCompress(allowsPrivateKeyRecovery: Bool = true) {
+         guard let srcPath = sourcePath else {
+             errorMessage = "No source file selected"
+             return
+         }
+ 
+-        let ext = compressFormat.fileExtension
+-        let destPath = srcPath.hasSuffix(".\(ext)") ? srcPath : srcPath + ".\(ext)"
+-
+-        var splitVolume: SplitVolume?
+-        if let size = Int(splitSize), size > 0 {
+-            splitVolume = splitUnit == "MB" ? .megaBytes(size) : .kiloBytes(size)
+-        }
+-
+-        // 线程数
+-        let threadCount: Int
+-        if threadMode == .auto {
+-            threadCount = 0  // 0 = 自动检测
+-        } else {
+-            threadCount = manualThreadCount
++        let options: CompressionOptions
++        do {
++            options = try compressionOptions()
++        } catch {
++            errorMessage = error.localizedDescription
++            return
+         }
+ 
+-        let options = CompressionOptions(
+-            level: compressLevel,
+-            password: password.isEmpty ? nil : password,
+-            aes256: true,
+-            splitVolume: splitVolume,
+-            format: compressFormat,
+-            threadCount: threadCount
+-        )
++        let ext = compressFormat.fileExtension
++        let destPath = srcPath.hasSuffix(".\(ext)") ? srcPath : srcPath + ".\(ext)"
+ 
+         isProcessing = true
+         progress = 0
+@@ -446,32 +592,19 @@ class ArchiveViewModel: ObservableObject {
+ 
+         DispatchQueue.global(qos: .userInitiated).async {
+             do {
+-                let compressor = ZipCompressor()
+-                let zwzCompressor = ZwzCompressor()
+-
+-                switch options.format {
+-                case .zip:
+-                    try compressor.compress(
+-                        sourcePath: srcPath,
+-                        destinationPath: destPath,
+-                        options: options,
+-                        progress: { prog in
++                _ = try self.archiveClient.compress(
++                    sourcePath: srcPath,
++                    destinationPath: destPath,
++                    options: options,
++                    identityStore: self.identityStore,
++                    progress: { prog in
+                         DispatchQueue.main.async {
+                             guard self.acceptsCallback(generation: generation) else { return }
+                             self.progress = prog
+                         }
+-                    }, cancellationToken: self.cancellationToken)
+-                case .zwz:
+-                    try zwzCompressor.compress(
+-                        sourcePath: srcPath,
+-                        destinationPath: destPath,
+-                        options: options,
+-                        progress: { prog in
+-                        DispatchQueue.main.async {
+-                            self.progress = prog
+-                        }
+-                    }, cancellationToken: self.cancellationToken)
+-                }
++                    },
++                    cancellationToken: self.cancellationToken
++                )
+ 
+                 DispatchQueue.main.async {
+                     guard self.acceptsCallback(generation: generation) else { return }
+@@ -489,8 +622,14 @@ class ArchiveViewModel: ObservableObject {
+                 DispatchQueue.main.async {
+                     guard self.acceptsCallback(generation: generation) else { return }
+                     self.isProcessing = false
+-                    self.currentStatus = .error
+-                    self.errorMessage = self.localizedMessage(for: error, context: .general)
++                    if self.handleProtectedOperationFailure(
++                        error,
++                        operation: .compress,
++                        allowsRecovery: allowsPrivateKeyRecovery,
++                        context: .general
++                    ) {
++                        return
++                    }
+                     self.history.append(ZWZHistoryItem(
+                         type: .compress,
+                         fileName: (srcPath as NSString).lastPathComponent,
+@@ -504,7 +643,8 @@ class ArchiveViewModel: ObservableObject {
+ 
+     // MARK: - Extract
+ 
+-    func performSmartExtract() {
++    func performSmartExtract(allowsPrivateKeyRecovery: Bool = true) {
++        guard enforceValidSignature() else { return }
+         guard let srcPath = sourcePath else {
+             errorMessage = "No archive selected"
+             return
+@@ -512,6 +652,9 @@ class ArchiveViewModel: ObservableObject {
+ 
+         let archiveURL = URL(fileURLWithPath: srcPath)
+         let plan = SmartExtractionPlanner.makePlan(archiveURL: archiveURL, entries: allEntries)
++        let extractionDirectoryExisted = FileManager.default.fileExists(
++            atPath: plan.extractionDirectory.path
++        )
+         let pwd = password.isEmpty ? nil : password
+ 
+         isProcessing = true
+@@ -526,10 +669,11 @@ class ArchiveViewModel: ObservableObject {
+                     at: plan.extractionDirectory,
+                     withIntermediateDirectories: true
+                 )
+-                try self.extractor.extract(
++                let result = try self.archiveClient.extract(
+                     archivePath: srcPath,
+                     destinationPath: plan.extractionDirectory.path,
+                     password: pwd,
++                    identityStore: self.identityStore,
+                     progress: { prog in
+                         DispatchQueue.main.async {
+                             guard self.acceptsCallback(generation: generation) else { return }
+@@ -545,6 +689,9 @@ class ArchiveViewModel: ObservableObject {
+                     self.isProcessing = false
+                     self.progress = 1
+                     self.currentStatus = .done
++                    if let securityInfo = result.securityInfo {
++                        self.archiveSecurityInfo = securityInfo
++                    }
+                     self.history.append(ZWZHistoryItem(
+                         type: .extract,
+                         fileName: archiveURL.lastPathComponent,
+@@ -556,14 +703,20 @@ class ArchiveViewModel: ObservableObject {
+                     self.currentStatus = .done
+                 }
+             } catch {
+-                if plan.extractedTopLevelName != nil {
++                if plan.extractedTopLevelName != nil || !extractionDirectoryExisted {
+                     try? FileManager.default.removeItem(at: plan.extractionDirectory)
+                 }
+                 DispatchQueue.main.async {
+                     guard self.acceptsCallback(generation: generation) else { return }
+                     self.isProcessing = false
+-                    self.currentStatus = .error
+-                    self.errorMessage = self.localizedMessage(for: error, context: .extract)
++                    if self.handleProtectedOperationFailure(
++                        error,
++                        operation: .smartExtract,
++                        allowsRecovery: allowsPrivateKeyRecovery,
++                        context: .extract
++                    ) {
++                        return
++                    }
+                     self.history.append(ZWZHistoryItem(
+                         type: .extract,
+                         fileName: archiveURL.lastPathComponent,
+@@ -575,7 +728,8 @@ class ArchiveViewModel: ObservableObject {
+         }
+     }
+ 
+-    func performExtract() {
++    func performExtract(allowsPrivateKeyRecovery: Bool = true) {
++        guard enforceValidSignature() else { return }
+         guard let srcPath = sourcePath else {
+             errorMessage = "No archive selected"
+             return
+@@ -592,10 +746,11 @@ class ArchiveViewModel: ObservableObject {
+ 
+         DispatchQueue.global(qos: .userInitiated).async {
+             do {
+-                try self.extractor.extract(
++                let result = try self.archiveClient.extract(
+                     archivePath: srcPath,
+                     destinationPath: destPath,
+                     password: pwd,
++                    identityStore: self.identityStore,
+                     progress: { prog in
+                     DispatchQueue.main.async {
+                         guard self.acceptsCallback(generation: generation) else { return }
+@@ -608,6 +763,9 @@ class ArchiveViewModel: ObservableObject {
+                     self.isProcessing = false
+                     self.progress = 1
+                     self.currentStatus = .done
++                    if let securityInfo = result.securityInfo {
++                        self.archiveSecurityInfo = securityInfo
++                    }
+                     self.history.append(ZWZHistoryItem(
+                         type: .extract,
+                         fileName: (srcPath as NSString).lastPathComponent,
+@@ -622,8 +780,14 @@ class ArchiveViewModel: ObservableObject {
+                 DispatchQueue.main.async {
+                     guard self.acceptsCallback(generation: generation) else { return }
+                     self.isProcessing = false
+-                    self.currentStatus = .error
+-                    self.errorMessage = self.localizedMessage(for: error, context: .extract)
++                    if self.handleProtectedOperationFailure(
++                        error,
++                        operation: .extract,
++                        allowsRecovery: allowsPrivateKeyRecovery,
++                        context: .extract
++                    ) {
++                        return
++                    }
+                     self.history.append(ZWZHistoryItem(
+                         type: .extract,
+                         fileName: (srcPath as NSString).lastPathComponent,
+@@ -635,9 +799,51 @@ class ArchiveViewModel: ObservableObject {
+         }
+     }
+ 
++    func mountArchive(
++        capacityMB: Int,
++        allowsPrivateKeyRecovery: Bool = true
++    ) async {
++        guard enforceValidSignature() else { return }
++        guard let sourcePath else {
++            errorMessage = "No archive selected"
++            return
++        }
++        do {
++            try await mountClient.mount(
++                archivePath: sourcePath,
++                password: password.isEmpty ? nil : password,
++                capacityMB: capacityMB,
++                securityInfo: archiveSecurityInfo,
++                identityStore: identityStore
++            )
++        } catch {
++            _ = handleProtectedOperationFailure(
++                error,
++                operation: .mount(capacityMB: capacityMB),
++                allowsRecovery: allowsPrivateKeyRecovery,
++                context: .extract
++            )
++        }
++    }
++
++    func saveMountedArchive() async {
++        guard enforceValidSignature() else { return }
++        let identityStore = identityStore
++        do {
++            try await mountClient.save(identityStore: identityStore)
++        } catch {
++            errorMessage = error.localizedDescription
++        }
++    }
++
+     // MARK: - Preview (inline, not a sheet)
+ 
+-    func performPreview(path: String, isPasswordRetry: Bool = false) {
++    func performPreview(
++        path: String,
++        isPasswordRetry: Bool = false,
++        allowsPrivateKeyRecovery: Bool = true
++    ) {
++        guard enforceValidSignature() else { return }
+         searchQuery = ""
+         showHiddenFiles = UserDefaults.standard.bool(forKey: "zwz_preview_show_hidden")
+         previewPasswordError = nil
+@@ -646,17 +852,51 @@ class ArchiveViewModel: ObservableObject {
+         currentStatus = .reading
+         let previewPassword = password.isEmpty ? nil : password
+         let generation = beginOperation()
++        let shouldInspect = detectedFormat == .zwz || Self.looksLikeZwzPath(path)
+ 
+         DispatchQueue.global(qos: .userInitiated).async {
++            var inspection: ZwzV3ArchiveInspection?
+             do {
+-                let entries = try self.previewer.preview(archivePath: path, password: previewPassword)
++                if shouldInspect {
++                    inspection = try? self.archiveClient.inspect(
++                        archivePath: path,
++                        identityStore: self.identityStore
++                    )
++                }
++                if inspection?.securityInfo.signature == .invalid {
++                    DispatchQueue.main.async {
++                        guard self.acceptsCallback(generation: generation) else { return }
++                        self.applyInspection(inspection)
++                        self.publishInvalidSignature()
++                    }
++                    return
++                }
++
++                let listing = try self.archiveClient.list(
++                    archivePath: path,
++                    password: previewPassword,
++                    identityStore: self.identityStore
++                )
+                 DispatchQueue.main.async {
+                     guard self.acceptsCallback(generation: generation) else { return }
+-                    self.handlePreviewSuccess(entries)
++                    self.handlePreviewSuccess(
++                        listing.entries,
++                        securityInfo: listing.securityInfo ?? inspection?.securityInfo,
++                        recipients: inspection?.recipients ?? []
++                    )
+                 }
+             } catch {
+                 DispatchQueue.main.async {
+                     guard self.acceptsCallback(generation: generation) else { return }
++                    self.applyInspection(inspection)
++                    if self.handleProtectedOperationFailure(
++                        error,
++                        operation: .preview(path: path, isPasswordRetry: isPasswordRetry),
++                        allowsRecovery: allowsPrivateKeyRecovery,
++                        context: .preview
++                    ) {
++                        return
++                    }
+                     self.handlePreviewFailure(error, isPasswordRetry: isPasswordRetry)
+                 }
+             }
+@@ -708,8 +948,18 @@ class ArchiveViewModel: ObservableObject {
+     }
+ 
+     func handlePreviewSuccess(_ entries: [ArchiveEntry]) {
++        handlePreviewSuccess(entries, securityInfo: nil, recipients: [])
++    }
++
++    private func handlePreviewSuccess(
++        _ entries: [ArchiveEntry],
++        securityInfo: ZwzArchiveSecurityInfo?,
++        recipients: [ZwzRecipientInfo]
++    ) {
+         currentDir = ""
+         setArchiveEntries(entries)
++        archiveSecurityInfo = securityInfo
++        inspectedRecipients = recipients
+         isProcessing = false
+         currentStatus = .idle
+         errorMessage = nil
+@@ -924,24 +1174,42 @@ class ArchiveViewModel: ObservableObject {
+     // MARK: - Drag Out (提取单个文件供拖拽)
+ 
+     func extractEntryForDrag(entry: ArchiveEntry) -> URL {
++        extractEntry(entry, openAfterExtraction: false, allowsPrivateKeyRecovery: true)
++    }
++
++    private func extractEntry(
++        _ entry: ArchiveEntry,
++        openAfterExtraction: Bool,
++        allowsPrivateKeyRecovery: Bool
++    ) -> URL {
++        guard enforceValidSignature() else {
++            return makeEntryErrorFile(ArchiveViewModelSecurityError.invalidArchiveSignature)
++        }
+         guard let archivePath = sourcePath else {
+             return URL(fileURLWithPath: "/tmp/zwz-error.txt")
+         }
+ 
+         do {
+-            let url = try extractor.extractEntryToTemp(
++            let url = try archiveClient.extractEntryToTemp(
+                 archivePath: archivePath,
+                 entryPath: entry.path,
+-                password: password.isEmpty ? nil : password
++                password: password.isEmpty ? nil : password,
++                identityStore: identityStore
+             )
++            if openAfterExtraction {
++                NSWorkspace.shared.open(url)
++            }
+             return url
+         } catch {
+-            let tempDir = FileManager.default.temporaryDirectory
+-                .appendingPathComponent("zwz-error-\(UUID().uuidString)")
+-            try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+-            let errorFile = tempDir.appendingPathComponent("error.txt")
+-            try? error.localizedDescription.write(to: errorFile, atomically: true, encoding: .utf8)
+-            return errorFile
++            if handleProtectedOperationFailure(
++                error,
++                operation: .entry(entry, openAfterExtraction: openAfterExtraction),
++                allowsRecovery: allowsPrivateKeyRecovery,
++                context: .preview
++            ) {
++                return makeEntryErrorFile(error)
++            }
++            return makeEntryErrorFile(error)
+         }
+     }
+ 
+@@ -951,14 +1219,242 @@ class ArchiveViewModel: ObservableObject {
+             // 目录：在预览列表中进入子目录
+             enterDirectory(entry)
+         } else {
+-            // 文件：用系统默认应用打开
+-            let tempURL = extractEntryForDrag(entry: entry)
+-            NSWorkspace.shared.open(tempURL)
++            _ = extractEntry(entry, openAfterExtraction: true, allowsPrivateKeyRecovery: true)
+         }
+     }
+ 
+     // MARK: - Helpers
+ 
++    func resumePendingPrivateKeyOperationAfterRestore() {
++        guard let operation = pendingPrivateKeyOperation else { return }
++        clearPendingPrivateKeyRecovery()
++
++        switch operation {
++        case .compress:
++            performCompress(allowsPrivateKeyRecovery: false)
++        case .preview(let path, let isPasswordRetry):
++            performPreview(
++                path: path,
++                isPasswordRetry: isPasswordRetry,
++                allowsPrivateKeyRecovery: false
++            )
++        case .extract:
++            performExtract(allowsPrivateKeyRecovery: false)
++        case .smartExtract:
++            performSmartExtract(allowsPrivateKeyRecovery: false)
++        case .entry(let entry, let openAfterExtraction):
++            _ = extractEntry(
++                entry,
++                openAfterExtraction: openAfterExtraction,
++                allowsPrivateKeyRecovery: false
++            )
++        case .edit:
++            beginArchiveEditing(allowsPrivateKeyRecovery: false)
++        case .mount(let capacityMB):
++            Task {
++                await mountArchive(
++                    capacityMB: capacityMB,
++                    allowsPrivateKeyRecovery: false
++                )
++            }
++        case .customResume(let resume):
++            resume()
++        }
++    }
++
++    func dismissMissingPrivateKeyPrompt() {
++        clearPendingPrivateKeyRecovery()
++    }
++
++    func handleEntryPreviewProtectionFailure(
++        _ error: Error,
++        allowsPrivateKeyRecovery: Bool,
++        retryAfterRestore: @escaping @MainActor @Sendable () -> Void
++    ) {
++        _ = handleProtectedOperationFailure(
++            error,
++            operation: .customResume(retryAfterRestore),
++            allowsRecovery: allowsPrivateKeyRecovery,
++            context: .preview
++        )
++    }
++
++    private func compressionOptions() throws -> CompressionOptions {
++        guard canStartCompression else {
++            throw ArchiveViewModelSecurityError.invalidCompressionConfiguration
++        }
++
++        let encryption: ZwzEncryptionMode
++        switch encryptionModeSelection {
++        case .none:
++            encryption = .none
++        case .password:
++            encryption = .password(password)
++        case .publicKey:
++            let recipientsByFingerprint = Dictionary(
++                uniqueKeysWithValues: availableRecipients.map { ($0.fingerprint, $0) }
++            )
++            let recipients = try selectedRecipientFingerprints.sorted().map {
++                fingerprint -> ZwzRecipient in
++                guard let identity = recipientsByFingerprint[fingerprint] else {
++                    throw ArchiveViewModelSecurityError.invalidCompressionConfiguration
++                }
++                return ZwzRecipient(
++                    name: identity.name,
++                    fingerprint: identity.fingerprint,
++                    agreementPublicKey: identity.agreementPublicKey
++                )
++            }
++            let signer: ZwzSigningIdentity?
++            if let selectedSignerFingerprint {
++                guard let identity = availableSigningIdentities.first(where: {
++                    $0.fingerprint == selectedSignerFingerprint
++                }) else {
++                    throw ArchiveViewModelSecurityError.invalidCompressionConfiguration
++                }
++                signer = ZwzSigningIdentity(
++                    name: identity.name,
++                    fingerprint: identity.fingerprint,
++                    agreementPublicKey: identity.agreementPublicKey,
++                    signingPublicKey: identity.signingPublicKey
++                )
++            } else {
++                signer = nil
++            }
++            encryption = .publicKey(recipients: recipients, signer: signer)
++        }
++
++        let splitVolume: SplitVolume?
++        if let size = Int(splitSize), size > 0 {
++            splitVolume = splitUnit == "MB" ? .megaBytes(size) : .kiloBytes(size)
++        } else {
++            splitVolume = nil
++        }
++        let threadCount = threadMode == .auto ? 0 : manualThreadCount
++        return CompressionOptions(
++            level: compressLevel,
++            encryption: encryption,
++            aes256: true,
++            splitVolume: splitVolume,
++            format: compressFormat,
++            threadCount: threadCount
++        )
++    }
++
++    @discardableResult
++    private func handleProtectedOperationFailure(
++        _ error: Error,
++        operation: PendingPrivateKeyOperation,
++        allowsRecovery: Bool,
++        context: ErrorContext
++    ) -> Bool {
++        if let v3Error = error as? ZwzV3Error {
++            switch v3Error {
++            case .invalidSignature:
++                let fingerprints = archiveSecurityInfo?.recipientFingerprints
++                    ?? inspectedRecipients.map(\.fingerprint)
++                archiveSecurityInfo = ZwzArchiveSecurityInfo(
++                    encryption: .publicKey,
++                    recipientFingerprints: fingerprints,
++                    signature: .invalid
++                )
++                publishInvalidSignature()
++                return true
++            case .noMatchingPrivateKey(let fingerprints):
++                isProcessing = false
++                if allowsRecovery {
++                    pendingPrivateKeyOperation = operation
++                    if inspectedRecipients.isEmpty {
++                        missingPrivateKeyRecipients = fingerprints.map {
++                            ZwzRecipientInfo(name: "", fingerprint: $0)
++                        }
++                    } else {
++                        missingPrivateKeyRecipients = inspectedRecipients
++                    }
++                    showMissingPrivateKeyPrompt = true
++                    currentStatus = .idle
++                    errorMessage = nil
++                } else {
++                    clearPendingPrivateKeyRecovery()
++                    currentStatus = .error
++                    errorMessage = v3Error.localizedDescription
++                }
++                return true
++            default:
++                break
++            }
++        }
++
++        currentStatus = .error
++        errorMessage = localizedMessage(for: error, context: context)
++        return false
++    }
++
++    private func enforceValidSignature() -> Bool {
++        guard archiveSecurityInfo?.signature == .invalid else { return true }
++        publishInvalidSignature()
++        return false
++    }
++
++    private func publishInvalidSignature() {
++        clearPendingPrivateKeyRecovery()
++        isProcessing = false
++        currentStatus = .error
++        errorMessage = ArchiveViewModelSecurityError.invalidArchiveSignature.localizedDescription
++    }
++
++    private func applyInspection(_ inspection: ZwzV3ArchiveInspection?) {
++        guard let inspection else { return }
++        archiveSecurityInfo = inspection.securityInfo
++        inspectedRecipients = inspection.recipients
++    }
++
++    private func clearPendingPrivateKeyRecovery() {
++        pendingPrivateKeyOperation = nil
++        showMissingPrivateKeyPrompt = false
++        missingPrivateKeyRecipients = []
++    }
++
++    private func makeEntryErrorFile(_ error: Error) -> URL {
++        let tempDir = FileManager.default.temporaryDirectory
++            .appendingPathComponent("zwz-error-\(UUID().uuidString)")
++        try? FileManager.default.createDirectory(
++            at: tempDir,
++            withIntermediateDirectories: true
++        )
++        let errorFile = tempDir.appendingPathComponent("error.txt")
++        try? error.localizedDescription.write(
++            to: errorFile,
++            atomically: true,
++            encoding: .utf8
++        )
++        return errorFile
++    }
++
++    private static func looksLikeZwzPath(_ path: String) -> Bool {
++        URL(fileURLWithPath: path).pathExtension.lowercased() == "zwz"
++    }
++
++    private static func identitySort(
++        _ lhs: ZwzIdentityMetadata,
++        _ rhs: ZwzIdentityMetadata
++    ) -> Bool {
++        if lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedSame {
++            return lhs.fingerprint < rhs.fingerprint
++        }
++        return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
++    }
++
++    private static func publicIdentitySort(
++        _ lhs: ZwzPublicIdentity,
++        _ rhs: ZwzPublicIdentity
++    ) -> Bool {
++        if lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedSame {
++            return lhs.fingerprint < rhs.fingerprint
++        }
++        return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
++    }
++
+     private enum ErrorContext {
+         case general
+         case preview
+diff --git a/Sources/ZwzGUI/ArchiveWorkflowClients.swift b/Sources/ZwzGUI/ArchiveWorkflowClients.swift
+new file mode 100644
+index 0000000..6bb4c2d
+--- /dev/null
++++ b/Sources/ZwzGUI/ArchiveWorkflowClients.swift
+@@ -0,0 +1,201 @@
++import Foundation
++import ZwzCore
++
++protocol ArchiveWorkflowClient: Sendable {
++    func detectFormat(archivePath: String) throws -> ExtractionFormat
++
++    func inspect(
++        archivePath: String,
++        identityStore: any ZwzIdentityStore
++    ) throws -> ZwzV3ArchiveInspection
++
++    func list(
++        archivePath: String,
++        password: String?,
++        identityStore: any ZwzIdentityStore
++    ) throws -> ZwzArchiveListing
++
++    func compress(
++        sourcePath: String,
++        destinationPath: String?,
++        options: CompressionOptions,
++        identityStore: any ZwzIdentityStore,
++        progress: ProgressHandler?,
++        cancellationToken: CancellationToken?
++    ) throws -> String
++
++    func extract(
++        archivePath: String,
++        destinationPath: String?,
++        password: String?,
++        identityStore: any ZwzIdentityStore,
++        progress: ProgressHandler?,
++        cancellationToken: CancellationToken?
++    ) throws -> ZwzExtractionResult
++
++    func extractEntryToTemp(
++        archivePath: String,
++        entryPath: String,
++        password: String?,
++        identityStore: any ZwzIdentityStore
++    ) throws -> URL
++}
++
++final class ZwzAPIArchiveWorkflowClient: ArchiveWorkflowClient, @unchecked Sendable {
++    private let api: ZwzAPI
++
++    init(api: ZwzAPI = ZwzAPI()) {
++        self.api = api
++    }
++
++    func detectFormat(archivePath: String) throws -> ExtractionFormat {
++        try api.detectFormat(archivePath: archivePath)
++    }
++
++    func inspect(
++        archivePath: String,
++        identityStore: any ZwzIdentityStore
++    ) throws -> ZwzV3ArchiveInspection {
++        try api.inspect(archivePath: archivePath, keyProvider: identityStore)
++    }
++
++    func list(
++        archivePath: String,
++        password: String?,
++        identityStore: any ZwzIdentityStore
++    ) throws -> ZwzArchiveListing {
++        try api.list(
++            archivePath: archivePath,
++            password: password,
++            keyProvider: identityStore
++        )
++    }
++
++    func compress(
++        sourcePath: String,
++        destinationPath: String?,
++        options: CompressionOptions,
++        identityStore: any ZwzIdentityStore,
++        progress: ProgressHandler?,
++        cancellationToken: CancellationToken?
++    ) throws -> String {
++        try api.compress(
++            sourcePath: sourcePath,
++            destinationPath: destinationPath,
++            options: options,
++            keyProvider: identityStore,
++            progress: progress,
++            cancellationToken: cancellationToken
++        )
++    }
++
++    func extract(
++        archivePath: String,
++        destinationPath: String?,
++        password: String?,
++        identityStore: any ZwzIdentityStore,
++        progress: ProgressHandler?,
++        cancellationToken: CancellationToken?
++    ) throws -> ZwzExtractionResult {
++        try api.extract(
++            archivePath: archivePath,
++            destinationPath: destinationPath,
++            password: password,
++            keyProvider: identityStore,
++            progress: progress,
++            cancellationToken: cancellationToken
++        )
++    }
++
++    func extractEntryToTemp(
++        archivePath: String,
++        entryPath: String,
++        password: String?,
++        identityStore: any ZwzIdentityStore
++    ) throws -> URL {
++        try api.extractEntryToTemp(
++            archivePath: archivePath,
++            entryPath: entryPath,
++            password: password,
++            keyProvider: identityStore
++        )
++    }
++}
++
++protocol ArchiveEditWorkflowClient: Sendable {
++    var archivePath: String? { get }
++    var hasChanges: Bool { get }
++
++    func open(
++        archivePath: String,
++        password: String?,
++        securityInfo: ZwzArchiveSecurityInfo?,
++        identityStore: any ZwzIdentityStore
++    ) throws -> [ArchiveEntry]
++
++    func entries() throws -> [ArchiveEntry]
++    func add(urls: [URL], into directoryPath: String) throws
++    func delete(path: String) throws
++    func rename(path: String, to newName: String) throws
++    func replace(path: String, with sourceURL: URL) throws
++    func text(for path: String) throws -> String
++    func writeText(_ text: String, to path: String) throws
++
++    func save(identityStore: any ZwzIdentityStore) throws
++
++    func discard()
++}
++
++extension ArchiveEditWorkflowClient {
++    var archivePath: String? { nil }
++    var hasChanges: Bool { false }
++
++    func entries() throws -> [ArchiveEntry] { [] }
++
++    func add(urls: [URL], into directoryPath: String) throws {
++        throw ArchiveEditWorkflowError.noActiveSession
++    }
++
++    func delete(path: String) throws {
++        throw ArchiveEditWorkflowError.noActiveSession
++    }
++
++    func rename(path: String, to newName: String) throws {
++        throw ArchiveEditWorkflowError.noActiveSession
++    }
++
++    func replace(path: String, with sourceURL: URL) throws {
++        throw ArchiveEditWorkflowError.noActiveSession
++    }
++
++    func text(for path: String) throws -> String {
++        throw ArchiveEditWorkflowError.noActiveSession
++    }
++
++    func writeText(_ text: String, to path: String) throws {
++        throw ArchiveEditWorkflowError.noActiveSession
++    }
++
++    func discard() {}
++}
++
++enum ArchiveEditWorkflowError: LocalizedError {
++    case noActiveSession
++
++    var errorDescription: String? {
++        "There is no active archive editing session."
++    }
++}
++
++@MainActor
++protocol ArchiveMountWorkflowClient: AnyObject {
++    func mount(
++        archivePath: String,
++        password: String?,
++        capacityMB: Int,
++        securityInfo: ZwzArchiveSecurityInfo?,
++        identityStore: any ZwzIdentityStore
++    ) async throws
++
++    func save(identityStore: any ZwzIdentityStore) async throws
++}
+diff --git a/Sources/ZwzGUI/IdentityManagerView.swift b/Sources/ZwzGUI/IdentityManagerView.swift
+index 7a9794f..25ea033 100644
+--- a/Sources/ZwzGUI/IdentityManagerView.swift
++++ b/Sources/ZwzGUI/IdentityManagerView.swift
+@@ -65,7 +65,7 @@ struct IdentityManagerView: View {
+ 
+     init(onPrivateRestore: (@MainActor @Sendable () -> Void)? = nil) {
+         _model = StateObject(wrappedValue: IdentityManagerViewModel(
+-            store: MacKeychainIdentityStore(),
++            store: ZwzGUIIdentityStore.shared,
+             onPrivateRestore: onPrivateRestore
+         ))
+     }
+diff --git a/Sources/ZwzGUI/VirtualDiskManager.swift b/Sources/ZwzGUI/VirtualDiskManager.swift
+index 343be27..c7b3efd 100644
+--- a/Sources/ZwzGUI/VirtualDiskManager.swift
++++ b/Sources/ZwzGUI/VirtualDiskManager.swift
+@@ -6,12 +6,80 @@ struct VirtualDiskSession: Codable, Equatable {
+     var archivePath: String
+     var imagePath: String
+     var mountPath: String
+-    var password: String?
+     var capacityMB: Int
+     var baselineFingerprint: String
+     var splitVolumeBytes: Int64?
+     var isMounted: Bool
+     var ownerTabID: UUID? = nil
++    var protection: ArchiveProtectionDescriptor? = nil
++
++    private enum CodingKeys: String, CodingKey {
++        case archivePath
++        case imagePath
++        case mountPath
++        case password
++        case capacityMB
++        case baselineFingerprint
++        case splitVolumeBytes
++        case isMounted
++        case ownerTabID
++        case protection
++    }
++
++    init(
++        archivePath: String,
++        imagePath: String,
++        mountPath: String,
++        capacityMB: Int,
++        baselineFingerprint: String,
++        splitVolumeBytes: Int64?,
++        isMounted: Bool,
++        ownerTabID: UUID? = nil,
++        protection: ArchiveProtectionDescriptor? = nil
++    ) {
++        self.archivePath = archivePath
++        self.imagePath = imagePath
++        self.mountPath = mountPath
++        self.capacityMB = capacityMB
++        self.baselineFingerprint = baselineFingerprint
++        self.splitVolumeBytes = splitVolumeBytes
++        self.isMounted = isMounted
++        self.ownerTabID = ownerTabID
++        self.protection = protection
++    }
++
++    init(from decoder: Decoder) throws {
++        let container = try decoder.container(keyedBy: CodingKeys.self)
++        archivePath = try container.decode(String.self, forKey: .archivePath)
++        imagePath = try container.decode(String.self, forKey: .imagePath)
++        mountPath = try container.decode(String.self, forKey: .mountPath)
++        capacityMB = try container.decode(Int.self, forKey: .capacityMB)
++        baselineFingerprint = try container.decode(String.self, forKey: .baselineFingerprint)
++        splitVolumeBytes = try container.decodeIfPresent(Int64.self, forKey: .splitVolumeBytes)
++        isMounted = try container.decode(Bool.self, forKey: .isMounted)
++        ownerTabID = try container.decodeIfPresent(UUID.self, forKey: .ownerTabID)
++        protection = try container.decodeIfPresent(ArchiveProtectionDescriptor.self, forKey: .protection)
++
++        let legacyPassword = try container.decodeIfPresent(String.self, forKey: .password)
++        if protection == nil, legacyPassword?.isEmpty == false {
++            protection = ArchiveProtectionDescriptor(securityInfo: ZwzArchiveSecurityInfo(
++                encryption: .password
++            ))
++        }
++    }
++
++    func encode(to encoder: Encoder) throws {
++        var container = encoder.container(keyedBy: CodingKeys.self)
++        try container.encode(archivePath, forKey: .archivePath)
++        try container.encode(imagePath, forKey: .imagePath)
++        try container.encode(mountPath, forKey: .mountPath)
++        try container.encode(capacityMB, forKey: .capacityMB)
++        try container.encode(baselineFingerprint, forKey: .baselineFingerprint)
++        try container.encodeIfPresent(splitVolumeBytes, forKey: .splitVolumeBytes)
++        try container.encode(isMounted, forKey: .isMounted)
++        try container.encodeIfPresent(ownerTabID, forKey: .ownerTabID)
++        try container.encodeIfPresent(protection, forKey: .protection)
++    }
+ }
+ 
+ enum VirtualDiskError: LocalizedError {
+@@ -42,6 +110,7 @@ final class VirtualDiskManager: ObservableObject {
+ 
+     private let fileManager = FileManager.default
+     private var unmountObserver: NSObjectProtocol?
++    private var activePassword: String?
+ 
+     private var rootURL: URL {
+         let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+@@ -62,10 +131,31 @@ final class VirtualDiskManager: ObservableObject {
+     }
+ 
+     func mount(archivePath: String, password: String?, capacityMB: Int, ownerTabID: UUID? = nil) async throws {
++        try await mount(
++            archivePath: archivePath,
++            password: password,
++            capacityMB: capacityMB,
++            ownerTabID: ownerTabID,
++            securityInfo: nil,
++            identityStore: ZwzGUIIdentityStore.shared
++        )
++    }
++
++    func mount(
++        archivePath: String,
++        password: String?,
++        capacityMB: Int,
++        ownerTabID: UUID? = nil,
++        securityInfo: ZwzArchiveSecurityInfo?,
++        identityStore: any ZwzIdentityStore
++    ) async throws {
+         guard session == nil else { throw VirtualDiskError.sessionAlreadyActive }
+         guard URL(fileURLWithPath: archivePath).pathExtension.lowercased() == "zwz" else {
+             throw VirtualDiskError.unsupportedArchive
+         }
++        guard securityInfo?.signature != .invalid else {
++            throw ZwzV3Error.invalidSignature
++        }
+         isBusy = true
+         defer { isBusy = false }
+ 
+@@ -80,15 +170,35 @@ final class VirtualDiskManager: ObservableObject {
+         try runHdiutil(["attach", imageURL.path, "-mountpoint", mountURL.path])
+         guard fileManager.fileExists(atPath: mountURL.path) else { throw VirtualDiskError.mountPointMissing }
+ 
++        let extraction: ZwzExtractionResult
+         do {
+-            _ = try ZwzAPI().extract(archivePath: archivePath, destinationPath: mountURL.path, password: password)
++            extraction = try ZwzAPI().extract(
++                archivePath: archivePath,
++                destinationPath: mountURL.path,
++                password: password,
++                keyProvider: identityStore
++            )
+         } catch {
+             try? runHdiutil(["detach", mountURL.path])
++            try? fileManager.removeItem(at: imageURL)
++            try? fileManager.removeItem(at: mountURL)
+             throw error
+         }
+ 
+         let fingerprint = try fingerprint(of: mountURL)
+-        session = VirtualDiskSession(archivePath: archivePath, imagePath: imageURL.path, mountPath: mountURL.path, password: password, capacityMB: capacityMB, baselineFingerprint: fingerprint, splitVolumeBytes: inferSplitVolumeBytes(archivePath: archivePath), isMounted: true, ownerTabID: ownerTabID)
++        let resolvedSecurityInfo = extraction.securityInfo ?? securityInfo
++        session = VirtualDiskSession(
++            archivePath: archivePath,
++            imagePath: imageURL.path,
++            mountPath: mountURL.path,
++            capacityMB: capacityMB,
++            baselineFingerprint: fingerprint,
++            splitVolumeBytes: inferSplitVolumeBytes(archivePath: archivePath),
++            isMounted: true,
++            ownerTabID: ownerTabID,
++            protection: resolvedSecurityInfo.map(ArchiveProtectionDescriptor.init)
++        )
++        activePassword = password
+         try persistSession()
+     }
+ 
+@@ -109,6 +219,49 @@ final class VirtualDiskManager: ObservableObject {
+     }
+ 
+     func save(to destinationPath: String) throws {
++        try save(to: destinationPath, identityStore: ZwzGUIIdentityStore.shared)
++    }
++
++    func save(
++        to destinationPath: String,
++        identityStore: any ZwzIdentityStore
++    ) throws {
++        guard let current = session else { throw VirtualDiskError.noActiveSession }
++        let securityInfo: ZwzArchiveSecurityInfo?
++        if let persisted = current.protection?.securityInfo {
++            securityInfo = persisted
++        } else {
++            securityInfo = try? ZwzAPI().inspect(
++                archivePath: current.archivePath,
++                keyProvider: identityStore
++            ).securityInfo
++        }
++        if securityInfo?.encryption == .password, activePassword == nil {
++            let candidate = try requestPasswordForSave()
++            _ = try ZwzAPI().list(
++                archivePath: current.archivePath,
++                password: candidate,
++                keyProvider: identityStore
++            )
++            activePassword = candidate
++        }
++        let encryption = try ArchiveEncryptionResolver.resolve(
++            securityInfo: securityInfo,
++            password: activePassword,
++            identityStore: identityStore
++        )
++        try save(
++            to: destinationPath,
++            encryption: encryption,
++            identityStore: identityStore
++        )
++    }
++
++    func save(
++        to destinationPath: String,
++        encryption: ZwzEncryptionMode,
++        identityStore: any ZwzIdentityStore
++    ) throws {
+         guard let current = session else { throw VirtualDiskError.noActiveSession }
+         try ensureMounted()
+         let destination = URL(fileURLWithPath: destinationPath)
+@@ -122,8 +275,18 @@ final class VirtualDiskManager: ObservableObject {
+         try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
+         try copyArchiveContent(from: URL(fileURLWithPath: current.mountPath), to: staging)
+         defer { try? fileManager.removeItem(at: staging) }
+-        let options = CompressionOptions(level: .normal, password: current.password, splitVolume: split, format: .zwz)
+-        _ = try ZwzAPI().compress(sourcePath: staging.path, destinationPath: temporary.path, options: options)
++        let options = CompressionOptions(
++            level: .normal,
++            encryption: encryption,
++            splitVolume: split,
++            format: .zwz
++        )
++        _ = try ZwzAPI().compress(
++            sourcePath: staging.path,
++            destinationPath: temporary.path,
++            options: options,
++            keyProvider: identityStore
++        )
+         try detach()
+         try installArchiveVolumes(from: temporary, to: destination)
+         try finishSession()
+@@ -145,6 +308,7 @@ final class VirtualDiskManager: ObservableObject {
+         try? fileManager.removeItem(atPath: current.imagePath)
+         try? fileManager.removeItem(at: sessionURL)
+         session = nil
++        activePassword = nil
+     }
+ 
+     func requestUnmount() {
+@@ -202,11 +366,33 @@ final class VirtualDiskManager: ObservableObject {
+         alert.runModal()
+     }
+ 
++    private func requestPasswordForSave() throws -> String {
++        let alert = NSAlert()
++        alert.messageText = SettingsStrings.text("输入原压缩密码", "Enter Original Archive Password")
++        alert.informativeText = SettingsStrings.text(
++            "需要原密码才能保留虚拟磁盘的加密并保存修改。密码不会写入会话文件。",
++            "The original password is required to preserve encryption when saving. It will not be stored in the session file."
++        )
++        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
++        field.placeholderString = SettingsStrings.text("压缩密码", "Archive password")
++        alert.accessoryView = field
++        alert.addButton(withTitle: SettingsStrings.text("继续保存", "Continue Saving"))
++        alert.addButton(withTitle: SettingsStrings.text("取消", "Cancel"))
++        guard alert.runModal() == .alertFirstButtonReturn else {
++            throw CancellationError()
++        }
++        guard !field.stringValue.isEmpty else {
++            throw ArchiveEncryptionResolutionError.passwordRequired
++        }
++        return field.stringValue
++    }
++
+     private func finishSession() throws {
+         guard let current = session else { return }
+         try? fileManager.removeItem(atPath: current.imagePath)
+         try? fileManager.removeItem(at: sessionURL)
+         session = nil
++        activePassword = nil
+     }
+ 
+     private func restoreSession() {
+@@ -214,6 +400,7 @@ final class VirtualDiskManager: ObservableObject {
+         let mountedPaths = fileManager.mountedVolumeURLs(includingResourceValuesForKeys: nil, options: [])?.map { $0.path } ?? []
+         restored.isMounted = mountedPaths.contains(restored.mountPath)
+         session = restored
++        activePassword = nil
+     }
+ 
+     private func persistSession() throws {
+@@ -318,3 +505,35 @@ final class VirtualDiskManager: ObservableObject {
+         return parts.compactMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize }.map(Int64.init).max()
+     }
+ }
++
++@MainActor
++final class DefaultArchiveMountWorkflowClient: ArchiveMountWorkflowClient {
++    private let manager: VirtualDiskManager
++
++    init(manager: VirtualDiskManager = .shared) {
++        self.manager = manager
++    }
++
++    func mount(
++        archivePath: String,
++        password: String?,
++        capacityMB: Int,
++        securityInfo: ZwzArchiveSecurityInfo?,
++        identityStore: any ZwzIdentityStore
++    ) async throws {
++        try await manager.mount(
++            archivePath: archivePath,
++            password: password,
++            capacityMB: capacityMB,
++            securityInfo: securityInfo,
++            identityStore: identityStore
++        )
++    }
++
++    func save(identityStore: any ZwzIdentityStore) async throws {
++        guard let destinationPath = manager.session?.archivePath else {
++            throw VirtualDiskError.noActiveSession
++        }
++        try manager.save(to: destinationPath, identityStore: identityStore)
++    }
++}
+diff --git a/Sources/ZwzGUI/ZwzApp.swift b/Sources/ZwzGUI/ZwzApp.swift
+index 33f0e90..728f730 100644
+--- a/Sources/ZwzGUI/ZwzApp.swift
++++ b/Sources/ZwzGUI/ZwzApp.swift
+@@ -229,8 +229,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+     // MARK: - Menu Actions
+ 
+     private let compressor = ZipCompressor()
+-    private let extractor = ArchiveExtractor()
+-    private let previewer = ArchivePreviewer()
+ 
+     @objc func compressFileAction() {
+         let panel = NSOpenPanel()
+@@ -312,45 +310,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+     }
+ 
+     func extractArchive(at path: String) {
+-        let destPath = (path as NSString).deletingPathExtension
+-        let extractor = self.extractor
+-        DispatchQueue.global(qos: .userInitiated).async {
+-            do {
+-                try extractor.extract(archivePath: path, destinationPath: destPath, password: nil)
+-                DispatchQueue.main.async {
+-                    NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: destPath)
+-                    Self.notify(title: "解压完成", body: (destPath as NSString).lastPathComponent)
+-                }
+-            } catch {
+-                let msg = error.localizedDescription
+-                DispatchQueue.main.async { Self.notify(title: "解压失败", body: msg) }
+-            }
+-        }
++        openArchiveInWorkspace(at: path, intent: .extract)
+     }
+ 
+     func previewArchive(at path: String) {
+-        let previewer = self.previewer
+-        DispatchQueue.global(qos: .userInitiated).async {
+-            do {
+-                let entries = try previewer.preview(archivePath: path)
+-                var content = "共 \(entries.count) 个项目\n"
+-                for entry in entries.prefix(20) {
+-                    let icon = entry.isDirectory ? "📁" : "📄"
+-                    content += "\(icon) \(entry.name) - \(self.formatBytes(entry.size))\n"
+-                }
+-                if entries.count > 20 { content += "... 还有 \(entries.count - 20) 个项目" }
+-                DispatchQueue.main.async {
+-                    let alert = NSAlert()
+-                    alert.messageText = (path as NSString).lastPathComponent
+-                    alert.informativeText = content
+-                    alert.alertStyle = .informational
+-                    alert.runModal()
+-                }
+-            } catch {
+-                let msg = error.localizedDescription
+-                DispatchQueue.main.async { Self.notify(title: "预览失败", body: msg) }
+-            }
+-        }
++        openArchiveInWorkspace(at: path, intent: .preview)
++    }
++
++    private func openArchiveInWorkspace(at path: String, intent: WorkspaceOpenIntent) {
++        createMainWindow()
++        mainWorkspace.requestOpen(url: URL(fileURLWithPath: path), intent: intent)
++        NSApp.activate(ignoringOtherApps: true)
+     }
+ 
+     @MainActor static func notify(title: String, body: String) {
+@@ -361,13 +331,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+         NSUserNotificationCenter.default.deliver(notification)
+     }
+ 
+-    func formatBytes(_ bytes: Int64) -> String {
+-        let b = Double(bytes)
+-        if b < 1024 { return "\(Int64(b)) B" }
+-        if b < 1024 * 1024 { return String(format: "%.1f KB", b / 1024) }
+-        if b < 1024 * 1024 * 1024 { return String(format: "%.1f MB", b / (1024 * 1024)) }
+-        return String(format: "%.2f GB", b / (1024 * 1024 * 1024))
+-    }
+ }
+ 
+ // MARK: - App Entry
+@@ -418,9 +381,12 @@ struct ContentView: View {
+ 
+                     if viewModel.isProcessing {
+                         ZWZProcessingView(viewModel: viewModel)
++                    } else if viewModel.signatureBadge == .invalid,
++                              viewModel.sourcePath != nil {
++                        ZWZArchiveContentView(viewModel: viewModel)
+                     } else if let errorMessage = viewModel.errorMessage {
+                         ZWZErrorView(message: errorMessage) { viewModel.errorMessage = nil }
+-                    } else if !viewModel.previewEntries.isEmpty {
++                    } else if !viewModel.previewEntries.isEmpty || viewModel.archiveSecurityInfo != nil {
+                         ZWZArchiveContentView(viewModel: viewModel)
+                     } else {
+                         ZWZDropZone(viewModel: viewModel, isDragging: $isDropTargeted)
+@@ -458,6 +424,9 @@ struct ContentView: View {
+         .sheet(isPresented: $viewModel.showVaultUnlockPrompt) {
+             ZWZMasterPasswordUnlockView(viewModel: viewModel)
+         }
++        .sheet(isPresented: $viewModel.showMissingPrivateKeyPrompt) {
++            ZWZMissingPrivateKeyRecoveryView(viewModel: viewModel)
++        }
+         .background {
+             ArchiveEditorWindowPresenter(
+                 isPresented: $viewModel.showArchiveEditor,
+@@ -968,6 +937,119 @@ struct ZWZArchiveTextEditor: View {
+     }
+ }
+ 
++@MainActor
++struct ZWZMissingPrivateKeyRecoveryView: View {
++    @ObservedObject private var viewModel: ArchiveViewModel
++    @StateObject private var identityModel: IdentityManagerViewModel
++    @Environment(\.dismiss) private var dismiss
++
++    init(viewModel: ArchiveViewModel) {
++        _viewModel = ObservedObject(wrappedValue: viewModel)
++        _identityModel = StateObject(wrappedValue: IdentityManagerViewModel(
++            store: viewModel.identityStore,
++            onPrivateRestore: { [weak viewModel] in
++                viewModel?.resumePendingPrivateKeyOperationAfterRestore()
++            }
++        ))
++    }
++
++    var body: some View {
++        VStack(spacing: 0) {
++            HStack(spacing: 12) {
++                Image(systemName: "key.horizontal.fill")
++                    .font(.system(size: 20, weight: .medium))
++                    .foregroundColor(.zwzOrange)
++                    .frame(width: 36, height: 36)
++
++                VStack(alignment: .leading, spacing: 2) {
++                    Text(SettingsStrings.text("缺少匹配的私钥", "Matching Private Key Required"))
++                        .font(.system(size: 17, weight: .semibold, design: .rounded))
++                    Text(SettingsStrings.text(
++                        "恢复接收方的私钥备份后将自动重试一次。",
++                        "Restore a recipient private-key backup to retry once."
++                    ))
++                    .font(.system(size: 11, design: .rounded))
++                    .foregroundColor(.secondary)
++                }
++
++                Spacer()
++
++                Button {
++                    cancel()
++                } label: {
++                    Image(systemName: "xmark")
++                        .font(.system(size: 12, weight: .medium))
++                        .frame(width: 30, height: 30)
++                        .contentShape(Rectangle())
++                }
++                .buttonStyle(.plain)
++                .help(L.string("cancel"))
++            }
++            .padding(.horizontal, 20)
++            .padding(.vertical, 14)
++
++            Divider()
++
++            VStack(alignment: .leading, spacing: 8) {
++                Label(
++                    SettingsStrings.text("归档声明的接收方（未验证）", "Archive-declared recipients (unverified)"),
++                    systemImage: "exclamationmark.shield"
++                )
++                .font(.system(size: 12, weight: .medium, design: .rounded))
++                .foregroundColor(.zwzOrange)
++
++                ScrollView {
++                    LazyVStack(alignment: .leading, spacing: 8) {
++                        ForEach(Array(viewModel.missingPrivateKeyRecipients.enumerated()), id: \.offset) { _, recipient in
++                            VStack(alignment: .leading, spacing: 3) {
++                                Text(recipient.name.isEmpty
++                                    ? SettingsStrings.text("未知接收方", "Unknown Recipient")
++                                    : recipient.name)
++                                    .font(.system(size: 12, weight: .medium, design: .rounded))
++                                Text(recipient.fingerprint)
++                                    .font(.system(size: 10, design: .monospaced))
++                                    .foregroundColor(.secondary)
++                                    .fixedSize(horizontal: false, vertical: true)
++                                    .textSelection(.enabled)
++                            }
++                            .frame(maxWidth: .infinity, alignment: .leading)
++                        }
++                    }
++                }
++                .frame(maxHeight: 120)
++            }
++            .padding(.horizontal, 20)
++            .padding(.vertical, 12)
++
++            Divider()
++
++            IdentityManagerView(model: identityModel)
++                .padding(20)
++
++            Divider()
++
++            HStack {
++                Spacer()
++                Button(L.string("cancel"), action: cancel)
++                    .zwzSheetButtonStyle(.secondary)
++            }
++            .padding(.horizontal, 20)
++            .padding(.vertical, 12)
++        }
++        .frame(width: 700, height: 640)
++        .background(LinearGradient.zwzBackground.opacity(0.5))
++        .interactiveDismissDisabled()
++        .onDisappear {
++            viewModel.dismissMissingPrivateKeyPrompt()
++        }
++    }
++
++    private func cancel() {
++        viewModel.dismissMissingPrivateKeyPrompt()
++        dismiss()
++    }
++}
++
+ // MARK: - Toolbar
+ 
+ struct ZWZToolbar: View {
+@@ -1401,8 +1483,9 @@ struct ZWZErrorView: View {
+ struct ZWZArchiveContentView: View {
+     @ObservedObject var viewModel: ArchiveViewModel
+     @ObservedObject private var virtualDisk = VirtualDiskManager.shared
+-    @StateObject private var entryPreviewModel = ArchiveEntryPreviewModel()
++    @StateObject private var entryPreviewModel: ArchiveEntryPreviewModel
+     @State private var showMountOptions = false
++    @State private var presentRecoveryAfterMountDismiss = false
+     @State private var capacityMB = 256
+     @State private var isPreviewSidebarPresented = false
+     @State private var closedPreviewEntryID: UUID?
+@@ -1413,6 +1496,20 @@ struct ZWZArchiveContentView: View {
+     @AppStorage(ArchiveEntryPreviewSettings.triggerKey) private var previewTrigger = "single"
+     @AppStorage(ArchiveEntryPreviewSettings.sidebarWidthKey) private var previewSidebarWidth = ArchiveEntryPreviewSettings.defaultSidebarWidth
+ 
++    init(viewModel: ArchiveViewModel) {
++        _viewModel = ObservedObject(wrappedValue: viewModel)
++        _entryPreviewModel = StateObject(wrappedValue: ArchiveEntryPreviewModel(
++            identityStore: viewModel.identityStore,
++            onProtectionFailure: { [weak viewModel] event in
++                viewModel?.handleEntryPreviewProtectionFailure(
++                    event.failure.error,
++                    allowsPrivateKeyRecovery: event.allowsPrivateKeyRecovery,
++                    retryAfterRestore: event.retryAfterPrivateKeyRestore
++                )
++            }
++        ))
++    }
++
+     var body: some View {
+         VStack(spacing: 0) {
+             // 头部
+@@ -1431,10 +1528,15 @@ struct ZWZArchiveContentView: View {
+                         .font(.system(size: 15, weight: .semibold, design: .rounded))
+                         .lineLimit(1)
+                         .truncationMode(.middle)
+-                    if let format = viewModel.detectedFormat {
+-                        Text(format.displayName)
+-                            .font(.system(size: 11))
+-                            .foregroundColor(.zwzPink)
++                    HStack(spacing: 7) {
++                        if let format = viewModel.detectedFormat {
++                            Text(format.displayName)
++                                .font(.system(size: 11))
++                                .foregroundColor(.zwzPink)
++                        }
++                        if let signature = viewModel.signatureBadge {
++                            ZWZArchiveSignatureBadge(signature: signature)
++                        }
+                     }
+                 }
+ 
+@@ -1472,6 +1574,7 @@ struct ZWZArchiveContentView: View {
+                             .contentShape(RoundedRectangle(cornerRadius: 8))
+                     }
+                     .buttonStyle(.plain)
++                    .disabled(virtualDisk.session == nil && !viewModel.canOpenArchiveContent)
+                     .help(virtualDisk.session == nil
+                         ? SettingsStrings.text("挂载为虚拟磁盘", "Mount as Virtual Disk")
+                         : SettingsStrings.text("卸载虚拟磁盘", "Unmount Virtual Disk"))
+@@ -1490,6 +1593,7 @@ struct ZWZArchiveContentView: View {
+                             .contentShape(RoundedRectangle(cornerRadius: 8))
+                     }
+                     .buttonStyle(.plain)
++                    .disabled(!viewModel.canOpenArchiveContent)
+                     .help("编辑压缩包")
+                 }
+ 
+@@ -1500,7 +1604,7 @@ struct ZWZArchiveContentView: View {
+                 ) {
+                     viewModel.performSmartExtract()
+                 }
+-                .disabled(viewModel.isProcessing)
++                .disabled(viewModel.isProcessing || !viewModel.canOpenArchiveContent)
+ 
+                 // 解压按钮（粉色渐变）
+                 ZWZGradientButton(
+@@ -1511,6 +1615,7 @@ struct ZWZArchiveContentView: View {
+                     viewModel.password = ""
+                     viewModel.showExtractOptions = true
+                 }
++                .disabled(!viewModel.canOpenArchiveContent)
+ 
+                 // 关闭
+                 ZWZIconButton(icon: "xmark") {
+@@ -1621,20 +1726,35 @@ struct ZWZArchiveContentView: View {
+         .onChange(of: previewTrigger) { _, _ in
+             handlePreviewSelectionChange(viewModel.selectedEntryId)
+         }
++        .onChange(of: viewModel.canOpenArchiveContent) { _, canOpen in
++            if !canOpen {
++                hideEntryPreview()
++            }
++        }
+         .onDisappear {
+             hideEntryPreview()
+         }
+         .onAppear {
+             normalizePreviewSidebarWidth()
+         }
+-        .sheet(isPresented: $showMountOptions) {
++        .sheet(isPresented: $showMountOptions, onDismiss: {
++            guard presentRecoveryAfterMountDismiss else { return }
++            presentRecoveryAfterMountDismiss = false
++            guard !viewModel.missingPrivateKeyRecipients.isEmpty else { return }
++            DispatchQueue.main.async {
++                viewModel.showMissingPrivateKeyPrompt = true
++            }
++        }) {
+             VirtualDiskMountOptionsView(
+-                archivePath: viewModel.sourcePath ?? "",
+-                password: viewModel.password,
++                viewModel: viewModel,
+                 capacityMB: $capacityMB,
+                 minimumCapacityMB: VirtualDiskManager.recommendedCapacityMB(
+                     uncompressedBytes: viewModel.previewEntries.reduce(UInt64(0)) { $0 + UInt64(max(0, viewModel.displaySize(for: $1))) }
+-                )
++                ),
++                onPrivateKeyRecoveryRequired: {
++                    presentRecoveryAfterMountDismiss = true
++                    viewModel.showMissingPrivateKeyPrompt = false
++                }
+             )
+         }
+     }
+@@ -1665,6 +1785,7 @@ struct ZWZArchiveContentView: View {
+                                 .contentShape(Rectangle())
+                         }
+                         .buttonStyle(.plain)
++                        .disabled(!viewModel.canOpenArchiveContent)
+                     } else {
+                         Image(systemName: ArchiveEntryPresentation.iconName(forFileNamed: entry.name, isDirectory: false))
+                             .foregroundColor(.zwzBlue)
+@@ -1691,6 +1812,7 @@ struct ZWZArchiveContentView: View {
+                             .contentShape(Rectangle())
+                         }
+                         .buttonStyle(.plain)
++                        .disabled(!viewModel.canOpenArchiveContent)
+                     } else {
+                         VStack(alignment: .leading, spacing: 2) {
+                             Text(entry.name)
+@@ -1735,10 +1857,12 @@ struct ZWZArchiveContentView: View {
+                 .padding(.vertical, 3)
+                 .contentShape(Rectangle())
+                 .onTapGesture {
++                    guard viewModel.canOpenArchiveContent else { return }
+                     closedPreviewEntryID = nil
+                     viewModel.selectedEntryId = entry.id
+                 }
+                 .onTapGesture(count: 2) {
++                    guard viewModel.canOpenArchiveContent else { return }
+                     closedPreviewEntryID = nil
+                     viewModel.selectedEntryId = entry.id
+                     if entry.isDirectory || previewTrigger == "single" {
+@@ -1748,6 +1872,9 @@ struct ZWZArchiveContentView: View {
+                     }
+                 }
+                 .onDrag {
++                    guard viewModel.canOpenArchiveContent else {
++                        return NSItemProvider()
++                    }
+                     let tempURL = viewModel.extractEntryForDrag(entry: entry)
+                     return NSItemProvider(contentsOf: tempURL) ?? NSItemProvider()
+                 }
+@@ -1773,7 +1900,8 @@ struct ZWZArchiveContentView: View {
+     }
+ 
+     private func updateEntryPreview(selectedEntryID: UUID?) {
+-        guard let selectedEntryID,
++        guard viewModel.canOpenArchiveContent,
++              let selectedEntryID,
+               previewSidebarEnabled,
+               selectedEntryID != closedPreviewEntryID,
+               let entry = viewModel.previewEntries.first(where: { $0.id == selectedEntryID }),
+@@ -1899,11 +2027,75 @@ struct ZWZArchiveContentView: View {
+     }
+ }
+ 
++private struct ZWZArchiveSignatureBadge: View {
++    let signature: ZwzSignatureVerification
++
++    var body: some View {
++        Label(title, systemImage: icon)
++            .font(.system(size: 10, weight: .medium, design: .rounded))
++            .foregroundColor(color)
++            .lineLimit(1)
++            .truncationMode(.tail)
++            .frame(maxWidth: 170, alignment: .leading)
++            .padding(.horizontal, 6)
++            .padding(.vertical, 3)
++            .background(color.opacity(0.12))
++            .clipShape(RoundedRectangle(cornerRadius: 5))
++            .help(helpText)
++    }
++
++    private var title: String {
++        switch signature {
++        case .unsigned:
++            return SettingsStrings.text("未签名", "Unsigned")
++        case .validKnownSigner(let name, _):
++            return name.isEmpty
++                ? SettingsStrings.text("签名有效", "Valid Signature")
++                : SettingsStrings.text("签名有效 · \(name)", "Valid · \(name)")
++        case .validUnknownSigner:
++            return SettingsStrings.text("签名有效 · 未知签名者", "Valid · Unknown Signer")
++        case .invalid:
++            return SettingsStrings.text("签名无效", "Invalid Signature")
++        }
++    }
++
++    private var icon: String {
++        switch signature {
++        case .unsigned: return "pencil.slash"
++        case .validKnownSigner: return "checkmark.seal.fill"
++        case .validUnknownSigner: return "questionmark.diamond.fill"
++        case .invalid: return "xmark.seal.fill"
++        }
++    }
++
++    private var color: Color {
++        switch signature {
++        case .unsigned: return .secondary
++        case .validKnownSigner: return .green
++        case .validUnknownSigner: return .zwzOrange
++        case .invalid: return .red
++        }
++    }
++
++    private var helpText: String {
++        switch signature {
++        case .unsigned:
++            return SettingsStrings.text("此归档没有签名。", "This archive is not signed.")
++        case .validKnownSigner(let name, let fingerprint):
++            return "\(name)\n\(fingerprint)"
++        case .validUnknownSigner(let name, let fingerprint):
++            return "\(SettingsStrings.text("未知签名者", "Unknown signer")): \(name)\n\(fingerprint)"
++        case .invalid:
++            return SettingsStrings.text("签名验证失败，内容操作已禁用。", "Signature verification failed; content actions are disabled.")
++        }
++    }
++}
++
+ struct VirtualDiskMountOptionsView: View {
+-    let archivePath: String
+-    let password: String
++    @ObservedObject var viewModel: ArchiveViewModel
+     @Binding var capacityMB: Int
+     let minimumCapacityMB: Int
++    let onPrivateKeyRecoveryRequired: () -> Void
+     @Environment(\.dismiss) private var dismiss
+     @AppStorage("zwz_mount_open_finder") private var openFinder = true
+     @State private var errorMessage: String?
+@@ -1932,24 +2124,31 @@ struct VirtualDiskMountOptionsView: View {
+                 Button(SettingsStrings.text("挂载", "Mount")) {
+                     isMounting = true
+                     Task {
+-                        do {
+-                            try await VirtualDiskManager.shared.mount(
+-                                archivePath: archivePath,
+-                                password: password.isEmpty ? nil : password,
+-                                capacityMB: capacityMB
+-                            )
+-                            if openFinder, let session = VirtualDiskManager.shared.session {
+-                                NSWorkspace.shared.open(URL(fileURLWithPath: session.mountPath))
+-                            }
++                        await viewModel.mountArchive(capacityMB: capacityMB)
++                        if viewModel.showMissingPrivateKeyPrompt {
++                            onPrivateKeyRecoveryRequired()
+                             dismiss()
+-                        } catch {
+-                            errorMessage = error.localizedDescription
++                            return
++                        }
++                        if let message = viewModel.errorMessage {
++                            errorMessage = message
++                            viewModel.errorMessage = nil
+                             isMounting = false
++                            return
+                         }
++                        guard let session = VirtualDiskManager.shared.session else {
++                            errorMessage = SettingsStrings.text("无法挂载虚拟磁盘。", "Unable to mount the virtual disk.")
++                            isMounting = false
++                            return
++                        }
++                        if openFinder {
++                            NSWorkspace.shared.open(URL(fileURLWithPath: session.mountPath))
++                        }
++                        dismiss()
+                     }
+                 }
+                 .zwzSheetButtonStyle(.primary)
+-                .disabled(isMounting)
++                .disabled(isMounting || !viewModel.canOpenArchiveContent)
+             }
+         }
+         .padding(24)
+@@ -2012,17 +2211,24 @@ struct ZWZCompressOptionsView: View {
+                 .pickerStyle(.segmented)
+             }
+ 
+-            // 密码
+-            ZWZSheetSection(title: L.string("password_optional")) {
+-                SecureField(L.string("enter_password"), text: $viewModel.password)
+-                    .textFieldStyle(.roundedBorder)
+-                    .font(.system(size: 14, design: .rounded))
+-
+-                if !viewModel.password.isEmpty {
+-                    ZWZPasswordStrengthView(strength: PasswordStrength.evaluate(viewModel.password))
++            ZWZSheetSection(title: SettingsStrings.text("加密方式", "Encryption")) {
++                Picker(
++                    SettingsStrings.text("加密方式", "Encryption"),
++                    selection: encryptionModeBinding
++                ) {
++                    Text(SettingsStrings.text("不加密", "None"))
++                        .tag(EncryptionModeSelection.none)
++                    Text(SettingsStrings.text("密码", "Password"))
++                        .tag(EncryptionModeSelection.password)
++                    Text(SettingsStrings.text("公钥", "Public Key"))
++                        .tag(EncryptionModeSelection.publicKey)
++                        .disabled(viewModel.compressFormat != .zwz)
+                 }
++                .pickerStyle(.segmented)
+             }
+ 
++            encryptionConfiguration
++
+             // 分卷
+             ZWZSheetSection(title: L.string("split_size_optional")) {
+                 HStack {
+@@ -2049,12 +2255,122 @@ struct ZWZCompressOptionsView: View {
+                     viewModel.performCompress()
+                 }
+                 .zwzSheetButtonStyle(.primary)
++                .disabled(!viewModel.canStartCompression)
+             }
+             .padding(.bottom, 24)
+         }
+         .padding(.horizontal, 28)
+-        .frame(width: 500, height: 560)
++        .frame(width: 520, height: 680)
+         .background(LinearGradient.zwzBackground.opacity(0.5))
++        .task {
++            try? await viewModel.refreshIdentityChoices()
++        }
++    }
++
++    @ViewBuilder
++    private var encryptionConfiguration: some View {
++        switch viewModel.encryptionModeSelection {
++        case .none:
++            EmptyView()
++        case .password:
++            ZWZSheetSection(title: SettingsStrings.text("密码", "Password")) {
++                SecureField(L.string("enter_password"), text: $viewModel.password)
++                    .textFieldStyle(.roundedBorder)
++                    .font(.system(size: 14, design: .rounded))
++
++                if !viewModel.password.isEmpty {
++                    ZWZPasswordStrengthView(strength: PasswordStrength.evaluate(viewModel.password))
++                }
++            }
++        case .publicKey:
++            ZWZSheetSection(title: SettingsStrings.text("接收方", "Recipients")) {
++                if viewModel.availableRecipients.isEmpty {
++                    Text(SettingsStrings.text("尚无可用的本地身份或公开联系人。", "No local identities or public contacts are available."))
++                        .font(.system(size: 12, design: .rounded))
++                        .foregroundColor(.secondary)
++                } else {
++                    ScrollView {
++                        LazyVStack(alignment: .leading, spacing: 0) {
++                            ForEach(viewModel.availableRecipients, id: \.fingerprint) { recipient in
++                                Toggle(isOn: recipientBinding(recipient.fingerprint)) {
++                                    VStack(alignment: .leading, spacing: 2) {
++                                        Text(recipient.name)
++                                            .font(.system(size: 12, weight: .medium, design: .rounded))
++                                            .lineLimit(1)
++                                        Text(shortFingerprint(recipient.fingerprint))
++                                            .font(.system(size: 10, design: .monospaced))
++                                            .foregroundColor(.secondary)
++                                    }
++                                    .frame(maxWidth: .infinity, alignment: .leading)
++                                }
++                                .toggleStyle(.checkbox)
++                                .padding(.vertical, 6)
++                                .help(recipient.fingerprint)
++
++                                if recipient.fingerprint != viewModel.availableRecipients.last?.fingerprint {
++                                    Divider()
++                                }
++                            }
++                        }
++                    }
++                    .frame(height: 116)
++                }
++
++                if viewModel.selectedRecipientFingerprints.isEmpty {
++                    Text(SettingsStrings.text("至少选择一个接收方。", "Select at least one recipient."))
++                        .font(.system(size: 11, design: .rounded))
++                        .foregroundColor(.red)
++                }
++            }
++
++            ZWZSheetSection(title: SettingsStrings.text("签名者（可选）", "Signer (Optional)")) {
++                Picker(
++                    SettingsStrings.text("签名者", "Signer"),
++                    selection: signerBinding
++                ) {
++                    Text(SettingsStrings.text("不签名", "Unsigned"))
++                        .tag(nil as String?)
++                    ForEach(viewModel.availableSigningIdentities, id: \.fingerprint) { identity in
++                        Text(identity.name)
++                            .tag(identity.fingerprint as String?)
++                    }
++                }
++                .labelsHidden()
++                .frame(maxWidth: .infinity)
++            }
++        }
++    }
++
++    private var encryptionModeBinding: Binding<EncryptionModeSelection> {
++        Binding(
++            get: { viewModel.encryptionModeSelection },
++            set: { viewModel.selectEncryptionMode($0) }
++        )
++    }
++
++    private var signerBinding: Binding<String?> {
++        Binding(
++            get: { viewModel.selectedSignerFingerprint },
++            set: { viewModel.selectedSignerFingerprint = $0 }
++        )
++    }
++
++    private func recipientBinding(_ fingerprint: String) -> Binding<Bool> {
++        Binding(
++            get: { viewModel.selectedRecipientFingerprints.contains(fingerprint) },
++            set: { isSelected in
++                if isSelected {
++                    viewModel.selectedRecipientFingerprints.insert(fingerprint)
++                } else {
++                    viewModel.selectedRecipientFingerprints.remove(fingerprint)
++                }
++            }
++        )
++    }
++
++    private func shortFingerprint(_ fingerprint: String) -> String {
++        guard fingerprint.count > 24 else { return fingerprint }
++        return "\(fingerprint.prefix(16))...\(fingerprint.suffix(8))"
+     }
+ }
+ 
+diff --git a/Sources/ZwzGUI/ZwzGUIIdentityStore.swift b/Sources/ZwzGUI/ZwzGUIIdentityStore.swift
+new file mode 100644
+index 0000000..4359941
+--- /dev/null
++++ b/Sources/ZwzGUI/ZwzGUIIdentityStore.swift
+@@ -0,0 +1,5 @@
++import ZwzCore
++
++enum ZwzGUIIdentityStore {
++    static let shared: any ZwzIdentityStore = MacKeychainIdentityStore()
++}
+diff --git a/Tests/ZwzCoreTests/ZWZV3/ZwzV3APITestSupport.swift b/Tests/ZwzCoreTests/ZWZV3/ZwzV3APITestSupport.swift
+index 600ba4b..e08a0f5 100644
+--- a/Tests/ZwzCoreTests/ZWZV3/ZwzV3APITestSupport.swift
++++ b/Tests/ZwzCoreTests/ZWZV3/ZwzV3APITestSupport.swift
+@@ -13,12 +13,13 @@ enum ZwzV3APITestSupport {
+     static func makeFixture(
+         name: String = "archive.zwz",
+         signer: Bool = false,
+-        splitVolume: SplitVolume? = nil
++        splitVolume: SplitVolume? = nil,
++        contents: Data = Data("public api".utf8)
+     ) throws -> Fixture {
+         let directory = try ZwzV3TestSupport.makeTempDirectory()
+         let source = directory.appendingPathComponent("source", isDirectory: true)
+         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+-        try Data("public api".utf8).write(to: source.appendingPathComponent("file.txt"))
++        try contents.write(to: source.appendingPathComponent("file.txt"))
+         let identity = ZwzV3IdentityFixture.make(name: "Alice")
+         let archive = directory.appendingPathComponent(name)
+         let signingIdentity = signer ? identity.signingIdentity : nil
+diff --git a/Tests/ZwzCoreTests/ZWZV3/ZwzV3ArchiveInspectionTests.swift b/Tests/ZwzCoreTests/ZWZV3/ZwzV3ArchiveInspectionTests.swift
+new file mode 100644
+index 0000000..d0fa53b
+--- /dev/null
++++ b/Tests/ZwzCoreTests/ZWZV3/ZwzV3ArchiveInspectionTests.swift
+@@ -0,0 +1,269 @@
++import Foundation
++import XCTest
++@testable import ZwzCore
++
++final class ZwzV3ArchiveInspectionTests: XCTestCase {
++    func testUnsignedInspectionExposesRecipientsWithoutAnyKeyLookup() throws {
++        let fixture = try ZwzV3APITestSupport.makeFixture()
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let provider = InspectionTrackingKeyProvider()
++
++        let inspection = try ZwzV3Extractor().inspectArchive(
++            archivePath: fixture.archive.path,
++            keyProvider: provider
++        )
++
++        XCTAssertEqual(inspection.recipients, [
++            ZwzRecipientInfo(
++                name: fixture.identity.recipient.name,
++                fingerprint: fixture.identity.recipient.fingerprint
++            ),
++        ])
++        XCTAssertEqual(
++            inspection.securityInfo,
++            ZwzArchiveSecurityInfo(
++                encryption: .publicKey,
++                recipientFingerprints: [fixture.identity.recipient.fingerprint],
++                signature: .unsigned
++            )
++        )
++        XCTAssertEqual(provider.lookupCounts, .zero)
++    }
++
++    func testSignedInspectionClassifiesExactKnownKeyWithoutPrivateKeyLookup() throws {
++        let fixture = try ZwzV3APITestSupport.makeFixture(signer: true)
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let provider = InspectionTrackingKeyProvider(knownSigningKeys: [
++            fixture.identity.signingFingerprint: fixture.identity.signingIdentity.signingPublicKey,
++        ])
++
++        let inspection = try ZwzV3Extractor().inspectArchive(
++            archivePath: fixture.archive.path,
++            keyProvider: provider
++        )
++
++        XCTAssertEqual(
++            inspection.securityInfo.signature,
++            .validKnownSigner(
++                name: fixture.identity.signingIdentity.name,
++                fingerprint: fixture.identity.signingFingerprint
++            )
++        )
++        XCTAssertEqual(provider.lookupCounts, KeyLookupCounts(agreement: 0, signing: 0, trust: 1))
++    }
++
++    func testSignedInspectionClassifiesUnknownWhenFingerprintKeyBindingDoesNotMatch() throws {
++        let fixture = try ZwzV3APITestSupport.makeFixture(signer: true)
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let provider = InspectionTrackingKeyProvider(knownSigningKeys: [
++            fixture.identity.signingFingerprint: Data(repeating: 0xA5, count: 32),
++        ])
++
++        let inspection = try ZwzV3Extractor().inspectArchive(
++            archivePath: fixture.archive.path,
++            keyProvider: provider
++        )
++
++        XCTAssertEqual(
++            inspection.securityInfo.signature,
++            .validUnknownSigner(
++                name: fixture.identity.signingIdentity.name,
++                fingerprint: fixture.identity.signingFingerprint
++            )
++        )
++        XCTAssertEqual(provider.lookupCounts, KeyLookupCounts(agreement: 0, signing: 0, trust: 1))
++    }
++
++    func testInvalidSignatureIsInspectableButContentOperationStillRejectsBeforeKeyLookup() throws {
++        let fixture = try ZwzV3APITestSupport.makeFixture(signer: true)
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let parsed = try ZwzV3BinaryCodec.parse(Data(contentsOf: fixture.archive))
++        let invalid = try ZwzV3TestSupport.mutate(
++            fixture.archive,
++            at: Int(parsed.header.signatureOffset)
++        )
++        let provider = InspectionTrackingKeyProvider(agreementKeys: [
++            fixture.identity.recipient.fingerprint: fixture.identity.agreementPrivateKey,
++        ])
++
++        let inspection = try ZwzV3Extractor().inspectArchive(
++            archivePath: invalid.path,
++            keyProvider: provider
++        )
++
++        XCTAssertEqual(inspection.securityInfo.signature, .invalid)
++        XCTAssertEqual(inspection.recipients.count, 1)
++        XCTAssertEqual(provider.lookupCounts, .zero)
++        XCTAssertThrowsError(try ZwzV3Extractor().listEntries(
++            archivePath: invalid.path,
++            keyProvider: provider
++        )) { error in
++            XCTAssertEqual(error as? ZwzV3Error, .invalidSignature)
++        }
++        XCTAssertEqual(provider.lookupCounts, .zero)
++    }
++
++    func testInspectionSucceedsWhenMatchingPrivateKeyIsMissing() throws {
++        let fixture = try ZwzV3APITestSupport.makeFixture(signer: true)
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        let provider = InspectionTrackingKeyProvider(knownSigningKeys: [
++            fixture.identity.signingFingerprint: fixture.identity.signingIdentity.signingPublicKey,
++        ])
++
++        let inspection = try ZwzAPI().inspect(
++            archivePath: fixture.archive.path,
++            keyProvider: provider
++        )
++
++        XCTAssertEqual(inspection.securityInfo.signature, .validKnownSigner(
++            name: fixture.identity.signingIdentity.name,
++            fingerprint: fixture.identity.signingFingerprint
++        ))
++        XCTAssertEqual(provider.lookupCounts, KeyLookupCounts(agreement: 0, signing: 0, trust: 1))
++        XCTAssertThrowsError(try ZwzAPI().list(
++            archivePath: fixture.archive.path,
++            password: nil,
++            keyProvider: provider
++        )) { error in
++            guard case ZwzV3Error.noMatchingPrivateKey = error else {
++                return XCTFail("expected noMatchingPrivateKey, got \(error)")
++            }
++        }
++        XCTAssertEqual(provider.lookupCounts.agreement, 1)
++        XCTAssertEqual(provider.lookupCounts.signing, 0)
++    }
++
++    func testPublicInspectionRoutesRenamedAndSplitV3Archives() throws {
++        let renamedFixture = try ZwzV3APITestSupport.makeFixture(name: "original.zwz")
++        defer { try? FileManager.default.removeItem(at: renamedFixture.directory) }
++        let renamed = renamedFixture.directory.appendingPathComponent("renamed.bin")
++        try FileManager.default.moveItem(at: renamedFixture.archive, to: renamed)
++
++        let renamedInspection = try ZwzAPI().inspect(
++            archivePath: renamed.path,
++            keyProvider: nil
++        )
++        XCTAssertEqual(
++            renamedInspection.securityInfo.recipientFingerprints,
++            [renamedFixture.identity.recipient.fingerprint]
++        )
++
++        let splitFixture = try ZwzV3APITestSupport.makeFixture(
++            name: "split.zwz",
++            signer: true,
++            splitVolume: .kiloBytes(1),
++            contents: Data((0..<4_096).map { UInt8(truncatingIfNeeded: $0 &* 31) })
++        )
++        defer { try? FileManager.default.removeItem(at: splitFixture.directory) }
++        XCTAssertTrue(FileManager.default.fileExists(
++            atPath: splitFixture.directory.appendingPathComponent("split.z00").path
++        ))
++
++        let splitInspection = try ZwzAPI().inspect(
++            archivePath: splitFixture.archive.path,
++            keyProvider: nil
++        )
++        XCTAssertEqual(splitInspection.recipients, [ZwzRecipientInfo(
++            name: splitFixture.identity.recipient.name,
++            fingerprint: splitFixture.identity.recipient.fingerprint
++        )])
++        XCTAssertEqual(splitInspection.securityInfo.signature, .validUnknownSigner(
++            name: splitFixture.identity.signingIdentity.name,
++            fingerprint: splitFixture.identity.signingFingerprint
++        ))
++    }
++
++    func testSignedStructuralCorruptionKeepsContentFailureSemantics() throws {
++        let fixture = try ZwzV3APITestSupport.makeFixture(signer: true)
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        var bytes = try Data(contentsOf: fixture.archive)
++        let parsed = try ZwzV3BinaryCodec.parse(bytes)
++        Data.writeUInt32(.max, at: Int(parsed.header.signerRegionOffset), in: &bytes)
++        let malformed = fixture.directory.appendingPathComponent("signed-malformed.zwz")
++        try bytes.write(to: malformed)
++        let provider = InspectionTrackingKeyProvider()
++
++        XCTAssertThrowsError(try ZwzV3Extractor().inspectArchive(
++            archivePath: malformed.path,
++            keyProvider: provider
++        )) { error in
++            XCTAssertEqual(error as? ZwzV3Error, .invalidSignature)
++        }
++        XCTAssertThrowsError(try ZwzV3Extractor().listEntries(
++            archivePath: malformed.path,
++            keyProvider: provider
++        )) { error in
++            XCTAssertEqual(error as? ZwzV3Error, .invalidSignature)
++        }
++        XCTAssertEqual(provider.lookupCounts, .zero)
++    }
++
++    func testUnsignedStructuralCorruptionRemainsMalformed() throws {
++        let fixture = try ZwzV3APITestSupport.makeFixture()
++        defer { try? FileManager.default.removeItem(at: fixture.directory) }
++        var bytes = try Data(contentsOf: fixture.archive)
++        bytes[128] = 1
++        let malformed = fixture.directory.appendingPathComponent("unsigned-malformed.zwz")
++        try bytes.write(to: malformed)
++        let provider = InspectionTrackingKeyProvider()
++
++        XCTAssertThrowsError(try ZwzV3Extractor().inspectArchive(
++            archivePath: malformed.path,
++            keyProvider: provider
++        )) { error in
++            guard case ZwzV3Error.malformedArchive = error else {
++                return XCTFail("expected malformedArchive, got \(error)")
++            }
++        }
++        XCTAssertEqual(provider.lookupCounts, .zero)
++    }
++}
++
++private struct KeyLookupCounts: Equatable {
++    var agreement: Int
++    var signing: Int
++    var trust: Int
++
++    static let zero = Self(agreement: 0, signing: 0, trust: 0)
++}
++
++private final class InspectionTrackingKeyProvider: ZwzPrivateKeyProvider, @unchecked Sendable {
++    private let lock = NSLock()
++    private let agreementKeys: [String: Data]
++    private let knownSigningKeys: [String: Data]
++    private var counts = KeyLookupCounts.zero
++
++    init(
++        agreementKeys: [String: Data] = [:],
++        knownSigningKeys: [String: Data] = [:]
++    ) {
++        self.agreementKeys = agreementKeys
++        self.knownSigningKeys = knownSigningKeys
++    }
++
++    var lookupCounts: KeyLookupCounts {
++        lock.withLock { counts }
++    }
++
++    func agreementPrivateKey(fingerprint: String, reason: String) throws -> Data {
++        try lock.withLock {
++            counts.agreement += 1
++            guard let key = agreementKeys[fingerprint] else {
++                throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++            }
++            return key
++        }
++    }
++
++    func signingPrivateKey(fingerprint: String, reason: String) throws -> Data {
++        lock.withLock { counts.signing += 1 }
++        throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++    }
++
++    func isKnownSigningKey(fingerprint: String, signingPublicKey: Data) -> Bool {
++        lock.withLock {
++            counts.trust += 1
++            return knownSigningKeys[fingerprint] == signingPublicKey
++        }
++    }
++}
+diff --git a/Tests/ZwzGUITests/ArchiveEntryPreviewSupportTests.swift b/Tests/ZwzGUITests/ArchiveEntryPreviewSupportTests.swift
+index e163427..bdedd69 100644
+--- a/Tests/ZwzGUITests/ArchiveEntryPreviewSupportTests.swift
++++ b/Tests/ZwzGUITests/ArchiveEntryPreviewSupportTests.swift
+@@ -306,6 +306,32 @@ final class ArchiveEntryPreviewSupportTests: XCTestCase {
+         XCTAssertFalse(FileManager.default.fileExists(atPath: extractor.secondRoot.path))
+     }
+ 
++    @MainActor
++    func testModelPrivateKeyRestoreRetryCannotRequestAnotherAutomaticRetry() async throws {
++        let extractor = MissingPrivateKeyPreviewExtractor()
++        let recorder = PreviewProtectionEventRecorder()
++        let model = ArchiveEntryPreviewModel(
++            extractor: extractor,
++            onProtectionFailure: { recorder.events.append($0) }
++        )
++
++        model.preview(
++            archivePath: "/archive.zwz",
++            entry: textEntry(path: "protected.txt")
++        )
++        try await waitUntil { recorder.events.count == 1 }
++        XCTAssertTrue(recorder.events[0].allowsPrivateKeyRecovery)
++        XCTAssertEqual(
++            recorder.events[0].failure,
++            .missingPrivateKey(["AA:BB"])
++        )
++
++        recorder.events[0].retryAfterPrivateKeyRestore()
++        try await waitUntil { recorder.events.count == 2 }
++        XCTAssertFalse(recorder.events[1].allowsPrivateKeyRecovery)
++        XCTAssertEqual(extractor.callCount, 2)
++    }
++
+     private func write(_ data: Data, named name: String) throws -> URL {
+         let url = root.appendingPathComponent(name)
+         try data.write(to: url)
+@@ -338,6 +364,29 @@ final class ArchiveEntryPreviewSupportTests: XCTestCase {
+ 
+ private struct PreviewTestTimeout: Error {}
+ 
++@MainActor
++private final class PreviewProtectionEventRecorder {
++    var events: [ArchiveEntryPreviewProtectionEvent] = []
++}
++
++private final class MissingPrivateKeyPreviewExtractor: ArchiveEntryPreviewExtracting, @unchecked Sendable {
++    private let lock = NSLock()
++    private var calls = 0
++
++    var callCount: Int { lock.withLock { calls } }
++
++    func extractEntryToTemp(
++        archivePath: String,
++        entryPath: String,
++        password: String?,
++        maximumBytes: Int64,
++        cancellationToken: CancellationToken
++    ) throws -> URL {
++        lock.withLock { calls += 1 }
++        throw ZwzV3Error.noMatchingPrivateKey(["AA:BB"])
++    }
++}
++
+ private final class BlockingPreviewExtractor: ArchiveEntryPreviewExtracting, @unchecked Sendable {
+     private let condition = NSCondition()
+     private var calls = 0
+diff --git a/Tests/ZwzGUITests/ArchiveViewModelTestSupport.swift b/Tests/ZwzGUITests/ArchiveViewModelTestSupport.swift
+new file mode 100644
+index 0000000..c5aa3a7
+--- /dev/null
++++ b/Tests/ZwzGUITests/ArchiveViewModelTestSupport.swift
+@@ -0,0 +1,601 @@
++import Foundation
++import ZwzCore
++@testable import ZwzGUI
++
++enum PublicKeyArchiveWorkflowTestError: LocalizedError, Equatable {
++    case stoppedAfterRecording
++    case missingRecipient
++    case missingSigner
++
++    var errorDescription: String? {
++        switch self {
++        case .stoppedAfterRecording:
++            return "The test stopped after recording the routed operation."
++        case .missingRecipient:
++            return "An original archive recipient is unavailable."
++        case .missingSigner:
++            return "The original archive signer is unavailable."
++        }
++    }
++}
++
++final class PublicKeyArchiveWorkflowStore: ZwzIdentityStore, @unchecked Sendable {
++    private let lock = NSLock()
++    private var localIdentities: [ZwzIdentityMetadata]
++    private var publicContacts: [ZwzPublicIdentity]
++
++    init(identities: [ZwzIdentityMetadata], contacts: [ZwzPublicIdentity]) {
++        localIdentities = identities
++        publicContacts = contacts
++    }
++
++    func createIdentity(named name: String) throws -> ZwzIdentityMetadata {
++        throw PublicKeyArchiveWorkflowTestError.stoppedAfterRecording
++    }
++
++    func identities() throws -> [ZwzIdentityMetadata] {
++        lock.lock()
++        defer { lock.unlock() }
++        return localIdentities
++    }
++
++    func contacts() throws -> [ZwzPublicIdentity] {
++        lock.lock()
++        defer { lock.unlock() }
++        return publicContacts
++    }
++
++    func importPublicIdentity(
++        _ data: Data,
++        conflict: ZwzIdentityConflictPolicy
++    ) throws -> ZwzPublicIdentity {
++        throw PublicKeyArchiveWorkflowTestError.stoppedAfterRecording
++    }
++
++    func exportPublicIdentity(fingerprint: String) throws -> Data {
++        throw PublicKeyArchiveWorkflowTestError.stoppedAfterRecording
++    }
++
++    func exportPrivateBackup(fingerprint: String, password: String) throws -> Data {
++        throw PublicKeyArchiveWorkflowTestError.stoppedAfterRecording
++    }
++
++    func importPrivateBackup(
++        _ data: Data,
++        password: String,
++        conflict: ZwzIdentityConflictPolicy
++    ) throws -> ZwzIdentityMetadata {
++        throw PublicKeyArchiveWorkflowTestError.stoppedAfterRecording
++    }
++
++    func rename(fingerprint: String, to name: String) throws {
++        lock.lock()
++        defer { lock.unlock() }
++        if let index = localIdentities.firstIndex(where: { $0.fingerprint == fingerprint }) {
++            localIdentities[index].name = name
++            return
++        }
++        if let index = publicContacts.firstIndex(where: { $0.fingerprint == fingerprint }) {
++            publicContacts[index].name = name
++            return
++        }
++        throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++    }
++
++    func delete(fingerprint: String) throws {
++        lock.lock()
++        defer { lock.unlock() }
++        localIdentities.removeAll { $0.fingerprint == fingerprint }
++        publicContacts.removeAll { $0.fingerprint == fingerprint }
++    }
++
++    func agreementPrivateKey(fingerprint: String, reason: String) throws -> Data {
++        lock.lock()
++        defer { lock.unlock() }
++        guard localIdentities.contains(where: { $0.fingerprint == fingerprint }) else {
++            throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++        }
++        return Data(repeating: 0xA1, count: 32)
++    }
++
++    func signingPrivateKey(fingerprint: String, reason: String) throws -> Data {
++        lock.lock()
++        defer { lock.unlock() }
++        guard localIdentities.contains(where: { $0.fingerprint == fingerprint }) else {
++            throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++        }
++        return Data(repeating: 0xB2, count: 32)
++    }
++
++    func isKnownSigningKey(fingerprint: String, signingPublicKey: Data) -> Bool {
++        lock.lock()
++        defer { lock.unlock() }
++        return localIdentities.contains {
++            $0.fingerprint == fingerprint && $0.signingPublicKey == signingPublicKey
++        } || publicContacts.contains {
++            $0.fingerprint == fingerprint && $0.signingPublicKey == signingPublicKey
++        }
++    }
++}
++
++final class ArchiveWorkflowSpy: ArchiveWorkflowClient, @unchecked Sendable {
++    enum Operation: Hashable {
++        case inspect
++        case list
++        case compress
++        case extract
++        case entry
++    }
++
++    struct CompressionRecord {
++        let sourcePath: String
++        let destinationPath: String?
++        let options: CompressionOptions
++        let storeID: ObjectIdentifier
++    }
++
++    private let lock = NSLock()
++    private var operationCounts: [Operation: Int] = [:]
++    private var operationStoreIDs: [Operation: [ObjectIdentifier]] = [:]
++    private var queuedListResults: [Result<ZwzArchiveListing, Error>] = []
++    private var queuedExtractResults: [Result<ZwzExtractionResult, Error>] = []
++    private var _compressionRecords: [CompressionRecord] = []
++
++    var detectedFormat: ExtractionFormat = .zwz
++    var inspectionResult = Result<ZwzV3ArchiveInspection, Error>.success(
++        ZwzV3ArchiveInspection(
++            recipients: [],
++            securityInfo: ZwzArchiveSecurityInfo(encryption: .publicKey)
++        )
++    )
++    var entryResult = Result<URL, Error>.success(
++        FileManager.default.temporaryDirectory.appendingPathComponent("public-key-entry.txt")
++    )
++
++    var compressionRecords: [CompressionRecord] {
++        lock.lock()
++        defer { lock.unlock() }
++        return _compressionRecords
++    }
++
++    func enqueueList(_ result: Result<ZwzArchiveListing, Error>) {
++        lock.lock()
++        queuedListResults.append(result)
++        lock.unlock()
++    }
++
++    func enqueueExtract(_ result: Result<ZwzExtractionResult, Error>) {
++        lock.lock()
++        queuedExtractResults.append(result)
++        lock.unlock()
++    }
++
++    func count(_ operation: Operation) -> Int {
++        lock.lock()
++        defer { lock.unlock() }
++        return operationCounts[operation, default: 0]
++    }
++
++    func storeIDs(for operation: Operation) -> [ObjectIdentifier] {
++        lock.lock()
++        defer { lock.unlock() }
++        return operationStoreIDs[operation, default: []]
++    }
++
++    func detectFormat(archivePath: String) throws -> ExtractionFormat {
++        detectedFormat
++    }
++
++    func inspect(
++        archivePath: String,
++        identityStore: any ZwzIdentityStore
++    ) throws -> ZwzV3ArchiveInspection {
++        record(.inspect, store: identityStore)
++        return try inspectionResult.get()
++    }
++
++    func list(
++        archivePath: String,
++        password: String?,
++        identityStore: any ZwzIdentityStore
++    ) throws -> ZwzArchiveListing {
++        record(.list, store: identityStore)
++        return try nextListResult().get()
++    }
++
++    func compress(
++        sourcePath: String,
++        destinationPath: String?,
++        options: CompressionOptions,
++        identityStore: any ZwzIdentityStore,
++        progress: ProgressHandler?,
++        cancellationToken: CancellationToken?
++    ) throws -> String {
++        record(.compress, store: identityStore)
++        lock.lock()
++        _compressionRecords.append(CompressionRecord(
++            sourcePath: sourcePath,
++            destinationPath: destinationPath,
++            options: options,
++            storeID: ObjectIdentifier(identityStore as AnyObject)
++        ))
++        lock.unlock()
++        progress?(1)
++        return destinationPath ?? sourcePath + ".zwz"
++    }
++
++    func extract(
++        archivePath: String,
++        destinationPath: String?,
++        password: String?,
++        identityStore: any ZwzIdentityStore,
++        progress: ProgressHandler?,
++        cancellationToken: CancellationToken?
++    ) throws -> ZwzExtractionResult {
++        record(.extract, store: identityStore)
++        let result = try nextExtractResult().get()
++        progress?(1)
++        return result
++    }
++
++    func extractEntryToTemp(
++        archivePath: String,
++        entryPath: String,
++        password: String?,
++        identityStore: any ZwzIdentityStore
++    ) throws -> URL {
++        record(.entry, store: identityStore)
++        return try entryResult.get()
++    }
++
++    private func record(_ operation: Operation, store: any ZwzIdentityStore) {
++        lock.lock()
++        operationCounts[operation, default: 0] += 1
++        operationStoreIDs[operation, default: []].append(ObjectIdentifier(store as AnyObject))
++        lock.unlock()
++    }
++
++    private func nextListResult() -> Result<ZwzArchiveListing, Error> {
++        lock.lock()
++        defer { lock.unlock() }
++        if !queuedListResults.isEmpty { return queuedListResults.removeFirst() }
++        return .success(ZwzArchiveListing(
++            entries: ArchiveViewModelTestSupport.entries,
++            version: 3,
++            securityInfo: try? inspectionResult.get().securityInfo
++        ))
++    }
++
++    private func nextExtractResult() -> Result<ZwzExtractionResult, Error> {
++        lock.lock()
++        defer { lock.unlock() }
++        if !queuedExtractResults.isEmpty { return queuedExtractResults.removeFirst() }
++        return .success(ZwzExtractionResult(
++            destinationPath: "/tmp/public-key-output",
++            version: 3,
++            securityInfo: try? inspectionResult.get().securityInfo
++        ))
++    }
++}
++
++final class ArchiveEditWorkflowSpy: ArchiveEditWorkflowClient, @unchecked Sendable {
++    struct SaveRecord {
++        let encryption: ZwzEncryptionMode
++        let storeID: ObjectIdentifier
++    }
++
++    private let lock = NSLock()
++    private var _openCount = 0
++    private var _saveRecords: [SaveRecord] = []
++    private var _openStoreIDs: [ObjectIdentifier] = []
++    private var originalSecurityInfo: ZwzArchiveSecurityInfo?
++    private var originalPassword: String?
++    var openError: Error?
++    var saveError: Error?
++    var openDelay: TimeInterval = 0
++
++    var openCount: Int {
++        lock.withLock { _openCount }
++    }
++
++    var saveRecords: [SaveRecord] {
++        lock.withLock { _saveRecords }
++    }
++
++    var openStoreIDs: [ObjectIdentifier] {
++        lock.withLock { _openStoreIDs }
++    }
++
++    func open(
++        archivePath: String,
++        password: String?,
++        securityInfo: ZwzArchiveSecurityInfo?,
++        identityStore: any ZwzIdentityStore
++    ) throws -> [ArchiveEntry] {
++        lock.lock()
++        _openCount += 1
++        _openStoreIDs.append(ObjectIdentifier(identityStore as AnyObject))
++        originalSecurityInfo = securityInfo
++        originalPassword = password
++        let error = openError
++        let delay = openDelay
++        lock.unlock()
++        if delay > 0 { Thread.sleep(forTimeInterval: delay) }
++        if let error { throw error }
++        return ArchiveViewModelTestSupport.entries
++    }
++
++    func save(identityStore: any ZwzIdentityStore) throws {
++        let protection = lock.withLock { (originalSecurityInfo, originalPassword) }
++        let encryption = try ArchiveEncryptionResolver.resolve(
++            securityInfo: protection.0,
++            password: protection.1,
++            identityStore: identityStore
++        )
++        lock.lock()
++        let error = saveError
++        if error == nil {
++            _saveRecords.append(SaveRecord(
++                encryption: encryption,
++                storeID: ObjectIdentifier(identityStore as AnyObject)
++            ))
++        }
++        lock.unlock()
++        if let error { throw error }
++    }
++}
++
++@MainActor
++final class ArchiveMountWorkflowSpy: ArchiveMountWorkflowClient {
++    struct SaveRecord {
++        let encryption: ZwzEncryptionMode
++        let storeID: ObjectIdentifier
++    }
++
++    private(set) var mountCount = 0
++    private(set) var mountStoreIDs: [ObjectIdentifier] = []
++    private(set) var saveRecords: [SaveRecord] = []
++    private var originalSecurityInfo: ZwzArchiveSecurityInfo?
++    private var originalPassword: String?
++    var mountError: Error?
++    var saveError: Error?
++
++    func mount(
++        archivePath: String,
++        password: String?,
++        capacityMB: Int,
++        securityInfo: ZwzArchiveSecurityInfo?,
++        identityStore: any ZwzIdentityStore
++    ) async throws {
++        mountCount += 1
++        mountStoreIDs.append(ObjectIdentifier(identityStore as AnyObject))
++        originalSecurityInfo = securityInfo
++        originalPassword = password
++        if let mountError { throw mountError }
++    }
++
++    func save(identityStore: any ZwzIdentityStore) async throws {
++        if let saveError { throw saveError }
++        let encryption = try ArchiveEncryptionResolver.resolve(
++            securityInfo: originalSecurityInfo,
++            password: originalPassword,
++            identityStore: identityStore
++        )
++        saveRecords.append(SaveRecord(
++            encryption: encryption,
++            storeID: ObjectIdentifier(identityStore as AnyObject)
++        ))
++    }
++}
++
++@MainActor
++enum ArchiveViewModelTestSupport {
++    struct Fixture {
++        let model: ArchiveViewModel
++        let store: PublicKeyArchiveWorkflowStore
++        let archive: ArchiveWorkflowSpy
++        let editor: ArchiveEditWorkflowSpy
++        let mounter: ArchiveMountWorkflowSpy
++        let signer: ZwzIdentityMetadata
++        let recipients: [ZwzPublicIdentity]
++
++        var storeID: ObjectIdentifier { ObjectIdentifier(store) }
++    }
++
++    nonisolated static let entries = [
++        ArchiveEntry(
++            name: "message.txt",
++            path: "message.txt",
++            size: 7,
++            isDirectory: false,
++            modifiedDate: nil
++        )
++    ]
++
++    static func fixture(
++        identities: [ZwzIdentityMetadata]? = nil,
++        contacts: [ZwzPublicIdentity]? = nil
++    ) async throws -> Fixture {
++        let signer = identity(name: "Local Signer", seed: 1)
++        let recipients = [
++            contact(name: "Recipient B", seed: 4),
++            contact(name: "Recipient A", seed: 2)
++        ]
++        let store = PublicKeyArchiveWorkflowStore(
++            identities: identities ?? [signer],
++            contacts: contacts ?? recipients
++        )
++        let archive = ArchiveWorkflowSpy()
++        let editor = ArchiveEditWorkflowSpy()
++        let mounter = ArchiveMountWorkflowSpy()
++        let model = ArchiveViewModel(
++            identityStore: store,
++            archiveClient: archive,
++            editClient: editor,
++            mountClient: mounter
++        )
++        model.sourcePath = "/tmp/public-key-input.zwz"
++        model.archiveName = "public-key-input.zwz"
++        model.detectedFormat = .zwz
++        model.compressFormat = .zwz
++        try await model.refreshIdentityChoices()
++        return Fixture(
++            model: model,
++            store: store,
++            archive: archive,
++            editor: editor,
++            mounter: mounter,
++            signer: signer,
++            recipients: recipients
++        )
++    }
++
++    static func publicKeyModel() async throws -> ArchiveViewModel {
++        let fixture = try await fixture()
++        fixture.model.selectEncryptionMode(.publicKey)
++        return fixture.model
++    }
++
++    static func selectedPublicKeyModel() async throws -> ArchiveViewModel {
++        let fixture = try await fixture()
++        fixture.model.selectEncryptionMode(.publicKey)
++        fixture.model.selectedRecipientFingerprints = Set(fixture.recipients.map(\.fingerprint))
++        fixture.model.selectedSignerFingerprint = fixture.signer.fingerprint
++        return fixture.model
++    }
++
++    static func inspection(
++        signature: ZwzSignatureVerification,
++        recipients: [ZwzPublicIdentity],
++        signerSigningPublicKey: Data? = nil
++    ) -> ZwzV3ArchiveInspection {
++        ZwzV3ArchiveInspection(
++            recipients: recipients.map {
++                ZwzRecipientInfo(name: $0.name, fingerprint: $0.fingerprint)
++            },
++            securityInfo: ZwzArchiveSecurityInfo(
++                encryption: .publicKey,
++                recipientFingerprints: recipients.map(\.fingerprint),
++                signature: signature,
++                signerSigningPublicKey: signerSigningPublicKey
++            )
++        )
++    }
++
++    static func listing(
++        signature: ZwzSignatureVerification,
++        recipients: [ZwzPublicIdentity]
++    ) -> ZwzArchiveListing {
++        ZwzArchiveListing(
++            entries: entries,
++            version: 3,
++            securityInfo: inspection(signature: signature, recipients: recipients).securityInfo
++        )
++    }
++
++    static func preparePreview(
++        _ fixture: Fixture,
++        signature: ZwzSignatureVerification = .unsigned
++    ) async throws {
++        let signerKey: Data?
++        switch signature {
++        case .validKnownSigner, .validUnknownSigner:
++            signerKey = fixture.signer.signingPublicKey
++        case .unsigned, .invalid:
++            signerKey = nil
++        }
++        fixture.archive.inspectionResult = .success(inspection(
++            signature: signature,
++            recipients: fixture.recipients,
++            signerSigningPublicKey: signerKey
++        ))
++        fixture.archive.enqueueList(.success(ZwzArchiveListing(
++            entries: entries,
++            version: 3,
++            securityInfo: inspection(
++                signature: signature,
++                recipients: fixture.recipients,
++                signerSigningPublicKey: signerKey
++            ).securityInfo
++        )))
++        fixture.model.performPreview(path: fixture.model.sourcePath!)
++        try await waitUntil { fixture.archive.count(.list) == 1 && !fixture.model.isProcessing }
++    }
++
++    static func restoreAndRetryCount() async throws -> Int {
++        let fixture = try await fixture()
++        fixture.archive.inspectionResult = .success(inspection(
++            signature: .unsigned,
++            recipients: fixture.recipients
++        ))
++        let missing = ZwzV3Error.noMatchingPrivateKey(fixture.recipients.map(\.fingerprint))
++        fixture.archive.enqueueList(.failure(missing))
++        fixture.archive.enqueueList(.success(listing(
++            signature: .unsigned,
++            recipients: fixture.recipients
++        )))
++
++        fixture.model.performPreview(path: fixture.model.sourcePath!)
++        try await waitUntil { fixture.model.showMissingPrivateKeyPrompt }
++        fixture.model.resumePendingPrivateKeyOperationAfterRestore()
++        try await waitUntil { fixture.archive.count(.list) == 2 && !fixture.model.isProcessing }
++        fixture.model.resumePendingPrivateKeyOperationAfterRestore()
++        await Task.yield()
++        return fixture.archive.count(.list) - 1
++    }
++
++    static func blockedActionCount(for signature: ZwzSignatureVerification) async throws -> Int {
++        let fixture = try await fixture()
++        fixture.archive.inspectionResult = .success(inspection(
++            signature: signature,
++            recipients: fixture.recipients
++        ))
++        fixture.model.performPreview(path: fixture.model.sourcePath!)
++        try await waitUntil { fixture.archive.count(.inspect) == 1 && !fixture.model.isProcessing }
++
++        fixture.model.performPreview(path: fixture.model.sourcePath!)
++        fixture.model.performExtract()
++        await fixture.model.mountArchive(capacityMB: 256)
++        await Task.yield()
++
++        let downstreamCalls = fixture.archive.count(.list)
++            + fixture.archive.count(.extract)
++            + fixture.mounter.mountCount
++        return 3 - downstreamCalls
++    }
++
++    static func identity(name: String, seed: UInt8) -> ZwzIdentityMetadata {
++        ZwzIdentityMetadata(
++            name: name,
++            fingerprint: fingerprint(seed),
++            agreementPublicKey: Data(repeating: seed, count: 32),
++            signingPublicKey: Data(repeating: seed &+ 0x40, count: 32),
++            creationDate: Date(timeIntervalSince1970: TimeInterval(seed))
++        )
++    }
++
++    static func contact(name: String, seed: UInt8) -> ZwzPublicIdentity {
++        ZwzPublicIdentity(
++            name: name,
++            fingerprint: fingerprint(seed),
++            agreementPublicKey: Data(repeating: seed, count: 32),
++            signingPublicKey: Data(repeating: seed &+ 0x40, count: 32)
++        )
++    }
++
++    static func waitUntil(
++        timeout: Duration = .seconds(2),
++        _ condition: @MainActor () -> Bool
++    ) async throws {
++        let clock = ContinuousClock()
++        let deadline = clock.now + timeout
++        while !condition(), clock.now < deadline {
++            try await Task.sleep(for: .milliseconds(10))
++        }
++        guard condition() else { throw PublicKeyArchiveWorkflowTestError.stoppedAfterRecording }
++    }
++
++    private static func fingerprint(_ seed: UInt8) -> String {
++        String(repeating: String(format: "%02x", seed), count: 32)
++    }
++}
+diff --git a/Tests/ZwzGUITests/PublicKeyArchiveWorkflowTests.swift b/Tests/ZwzGUITests/PublicKeyArchiveWorkflowTests.swift
+new file mode 100644
+index 0000000..b48f695
+--- /dev/null
++++ b/Tests/ZwzGUITests/PublicKeyArchiveWorkflowTests.swift
+@@ -0,0 +1,514 @@
++import Foundation
++import XCTest
++import ZwzCore
++@testable import ZwzGUI
++
++@MainActor
++final class PublicKeyArchiveWorkflowTests: XCTestCase {
++    func testPublicKeyModeRequiresAtLeastOneRecipient() async throws {
++        let fixture = try await ArchiveViewModelTestSupport.fixture()
++        let model = fixture.model
++        model.selectEncryptionMode(.publicKey)
++
++        XCTAssertFalse(model.canStartCompression)
++
++        model.selectedRecipientFingerprints.insert(String(repeating: "ff", count: 32))
++        XCTAssertFalse(model.canStartCompression, "An unknown fingerprint is not a valid recipient")
++
++        model.selectedRecipientFingerprints = [fixture.recipients[0].fingerprint]
++        XCTAssertTrue(model.canStartCompression)
++
++        model.compressFormat = .zip
++        XCTAssertEqual(model.encryptionModeSelection, .none)
++        XCTAssertTrue(model.selectedRecipientFingerprints.isEmpty)
++        XCTAssertNil(model.selectedSignerFingerprint)
++        XCTAssertTrue(model.canStartCompression, "ZIP should remain available after leaving public-key mode")
++    }
++
++    func testChangingToPasswordClearsRecipientsAndSigner() async throws {
++        let fixture = try await ArchiveViewModelTestSupport.fixture()
++        let model = fixture.model
++        selectPublicKeyConfiguration(in: fixture)
++
++        model.selectEncryptionMode(.password)
++
++        XCTAssertEqual(model.encryptionModeSelection, .password)
++        XCTAssertTrue(model.selectedRecipientFingerprints.isEmpty)
++        XCTAssertNil(model.selectedSignerFingerprint)
++    }
++
++    func testChangingToNoneOrZIPClearsPublicKeyStateWithoutReinterpretingIt() async throws {
++        let fixture = try await ArchiveViewModelTestSupport.fixture()
++        let model = fixture.model
++        selectPublicKeyConfiguration(in: fixture)
++
++        model.selectEncryptionMode(.none)
++        XCTAssertEqual(model.encryptionModeSelection, .none)
++        XCTAssertTrue(model.selectedRecipientFingerprints.isEmpty)
++        XCTAssertNil(model.selectedSignerFingerprint)
++
++        selectPublicKeyConfiguration(in: fixture)
++        model.password = "must not become active"
++        model.compressFormat = .zip
++
++        XCTAssertEqual(model.encryptionModeSelection, .none)
++        XCTAssertTrue(model.selectedRecipientFingerprints.isEmpty)
++        XCTAssertNil(model.selectedSignerFingerprint)
++    }
++
++    func testCompressionPassesSortedRecipientsLocalSignerAndExactStore() async throws {
++        let fixture = try await ArchiveViewModelTestSupport.fixture()
++        let model = fixture.model
++        model.selectEncryptionMode(.publicKey)
++        model.selectedRecipientFingerprints = Set(fixture.recipients.map(\.fingerprint))
++
++        model.selectedSignerFingerprint = fixture.recipients[0].fingerprint
++        XCTAssertFalse(model.canStartCompression, "A public contact cannot be used as a signer")
++
++        model.selectedSignerFingerprint = fixture.signer.fingerprint
++        XCTAssertTrue(model.canStartCompression)
++        model.sourcePath = "/tmp/public-key-source"
++        model.performCompress()
++        try await ArchiveViewModelTestSupport.waitUntil {
++            fixture.archive.count(.compress) == 1 && !model.isProcessing
++        }
++
++        let record = try XCTUnwrap(fixture.archive.compressionRecords.first)
++        XCTAssertEqual(record.storeID, fixture.storeID)
++        guard case .publicKey(let recipients, let signer) = record.options.encryption else {
++            return XCTFail("Compression was silently downgraded from public-key mode")
++        }
++        XCTAssertEqual(
++            recipients.map(\.fingerprint),
++            fixture.recipients.map(\.fingerprint).sorted()
++        )
++        XCTAssertEqual(signer?.fingerprint, fixture.signer.fingerprint)
++        XCTAssertEqual(signer?.signingPublicKey, fixture.signer.signingPublicKey)
++    }
++
++    func testPreviewListExtractSmartEntryEditAndMountReceiveExactStore() async throws {
++        let preview = try await ArchiveViewModelTestSupport.fixture()
++        try await ArchiveViewModelTestSupport.preparePreview(preview)
++        assertOnlyStore(preview.storeID, wasPassedTo: preview.archive.storeIDs(for: .inspect))
++        assertOnlyStore(preview.storeID, wasPassedTo: preview.archive.storeIDs(for: .list))
++
++        let extraction = try await ArchiveViewModelTestSupport.fixture()
++        try await ArchiveViewModelTestSupport.preparePreview(extraction)
++        extraction.model.performExtract()
++        try await ArchiveViewModelTestSupport.waitUntil {
++            extraction.archive.count(.extract) == 1 && !extraction.model.isProcessing
++        }
++        assertOnlyStore(extraction.storeID, wasPassedTo: extraction.archive.storeIDs(for: .extract))
++
++        let smartRoot = FileManager.default.temporaryDirectory.appendingPathComponent(
++            "PublicKeySmartExtract-\(UUID().uuidString)",
++            isDirectory: true
++        )
++        defer { try? FileManager.default.removeItem(at: smartRoot) }
++        try FileManager.default.createDirectory(at: smartRoot, withIntermediateDirectories: true)
++        let smart = try await ArchiveViewModelTestSupport.fixture()
++        smart.model.sourcePath = smartRoot.appendingPathComponent("smart.zwz").path
++        try await ArchiveViewModelTestSupport.preparePreview(smart)
++        smart.archive.enqueueExtract(.failure(PublicKeyArchiveWorkflowTestError.stoppedAfterRecording))
++        smart.model.performSmartExtract()
++        try await ArchiveViewModelTestSupport.waitUntil {
++            smart.archive.count(.extract) == 1 && !smart.model.isProcessing
++        }
++        assertOnlyStore(smart.storeID, wasPassedTo: smart.archive.storeIDs(for: .extract))
++
++        let entry = try await ArchiveViewModelTestSupport.fixture()
++        try await ArchiveViewModelTestSupport.preparePreview(entry)
++        _ = entry.model.extractEntryForDrag(entry: ArchiveViewModelTestSupport.entries[0])
++        assertOnlyStore(entry.storeID, wasPassedTo: entry.archive.storeIDs(for: .entry))
++
++        let editing = try await ArchiveViewModelTestSupport.fixture()
++        try await ArchiveViewModelTestSupport.preparePreview(editing)
++        editing.model.beginArchiveEditing()
++        try await ArchiveViewModelTestSupport.waitUntil { editing.editor.openCount == 1 }
++        assertOnlyStore(editing.storeID, wasPassedTo: editing.editor.openStoreIDs)
++
++        let mounting = try await ArchiveViewModelTestSupport.fixture()
++        try await ArchiveViewModelTestSupport.preparePreview(mounting)
++        await mounting.model.mountArchive(capacityMB: 256)
++        XCTAssertEqual(mounting.mounter.mountCount, 1)
++        assertOnlyStore(mounting.storeID, wasPassedTo: mounting.mounter.mountStoreIDs)
++    }
++
++    func testMissingPrivateKeyOffersRestoreAndRetriesOnce() async throws {
++        let retryCount = try await ArchiveViewModelTestSupport.restoreAndRetryCount()
++        XCTAssertEqual(retryCount, 1)
++    }
++
++    func testMissingPrivateKeyPromptShowsUntrustedPublicRecipientLabels() async throws {
++        let fixture = try await ArchiveViewModelTestSupport.fixture()
++        fixture.archive.inspectionResult = .success(ArchiveViewModelTestSupport.inspection(
++            signature: .unsigned,
++            recipients: fixture.recipients
++        ))
++        fixture.archive.enqueueList(.failure(ZwzV3Error.noMatchingPrivateKey(
++            fixture.recipients.map(\.fingerprint)
++        )))
++
++        fixture.model.performPreview(path: fixture.model.sourcePath!)
++        try await ArchiveViewModelTestSupport.waitUntil {
++            fixture.model.showMissingPrivateKeyPrompt
++        }
++
++        XCTAssertEqual(
++            fixture.model.missingPrivateKeyRecipients,
++            fixture.recipients.map {
++                ZwzRecipientInfo(name: $0.name, fingerprint: $0.fingerprint)
++            }
++        )
++        XCTAssertNil(fixture.model.errorMessage)
++    }
++
++    func testSecondMissingKeyFailureCannotCreateAutomaticRetryLoop() async throws {
++        let fixture = try await ArchiveViewModelTestSupport.fixture()
++        fixture.archive.inspectionResult = .success(ArchiveViewModelTestSupport.inspection(
++            signature: .unsigned,
++            recipients: fixture.recipients
++        ))
++        let missing = ZwzV3Error.noMatchingPrivateKey(fixture.recipients.map(\.fingerprint))
++        fixture.archive.enqueueList(.failure(missing))
++        fixture.archive.enqueueList(.failure(missing))
++
++        fixture.model.performPreview(path: fixture.model.sourcePath!)
++        try await ArchiveViewModelTestSupport.waitUntil {
++            fixture.model.showMissingPrivateKeyPrompt && fixture.archive.count(.list) == 1
++        }
++        fixture.model.resumePendingPrivateKeyOperationAfterRestore()
++        try await ArchiveViewModelTestSupport.waitUntil {
++            fixture.archive.count(.list) == 2 && !fixture.model.isProcessing
++        }
++
++        fixture.model.resumePendingPrivateKeyOperationAfterRestore()
++        await Task.yield()
++        XCTAssertEqual(fixture.archive.count(.list), 2)
++    }
++
++    func testDismissingRecoveryClearsPendingOperation() async throws {
++        let fixture = try await ArchiveViewModelTestSupport.fixture()
++        fixture.archive.inspectionResult = .success(ArchiveViewModelTestSupport.inspection(
++            signature: .unsigned,
++            recipients: fixture.recipients
++        ))
++        fixture.archive.enqueueList(.failure(ZwzV3Error.noMatchingPrivateKey(
++            fixture.recipients.map(\.fingerprint)
++        )))
++
++        fixture.model.performPreview(path: fixture.model.sourcePath!)
++        try await ArchiveViewModelTestSupport.waitUntil {
++            fixture.model.showMissingPrivateKeyPrompt
++        }
++        fixture.model.dismissMissingPrivateKeyPrompt()
++        fixture.model.resumePendingPrivateKeyOperationAfterRestore()
++        await Task.yield()
++
++        XCTAssertFalse(fixture.model.showMissingPrivateKeyPrompt)
++        XCTAssertTrue(fixture.model.missingPrivateKeyRecipients.isEmpty)
++        XCTAssertEqual(fixture.archive.count(.list), 1)
++    }
++
++    func testAuthenticationCancellationAndKeychainFailureDoNotOpenRestoreFlow() async throws {
++        let errors: [ZwzV3Error] = [
++            .userAuthenticationCancelled,
++            .keychainFailure(-50)
++        ]
++        for error in errors {
++            let fixture = try await ArchiveViewModelTestSupport.fixture()
++            fixture.archive.inspectionResult = .success(ArchiveViewModelTestSupport.inspection(
++                signature: .unsigned,
++                recipients: fixture.recipients
++            ))
++            fixture.archive.enqueueList(.failure(error))
++
++            fixture.model.performPreview(path: fixture.model.sourcePath!)
++            try await ArchiveViewModelTestSupport.waitUntil {
++                fixture.archive.count(.list) == 1 && !fixture.model.isProcessing
++            }
++
++            XCTAssertFalse(fixture.model.showMissingPrivateKeyPrompt, "\(error)")
++            XCTAssertTrue(fixture.model.missingPrivateKeyRecipients.isEmpty, "\(error)")
++            XCTAssertNotNil(fixture.model.errorMessage, "\(error)")
++        }
++    }
++
++    func testAllFourSignatureBadgesMapFromStructuredSecurityInfo() async throws {
++        let signerFingerprint = ArchiveViewModelTestSupport.identity(name: "Signer", seed: 9).fingerprint
++        let statuses: [ZwzSignatureVerification] = [
++            .unsigned,
++            .validKnownSigner(name: "Known", fingerprint: signerFingerprint),
++            .validUnknownSigner(name: "Unknown", fingerprint: signerFingerprint),
++            .invalid
++        ]
++
++        for status in statuses {
++            let fixture = try await ArchiveViewModelTestSupport.fixture()
++            fixture.archive.inspectionResult = .success(ArchiveViewModelTestSupport.inspection(
++                signature: status,
++                recipients: fixture.recipients
++            ))
++            if status != .invalid {
++                fixture.archive.enqueueList(.success(ArchiveViewModelTestSupport.listing(
++                    signature: status,
++                    recipients: fixture.recipients
++                )))
++            }
++
++            fixture.model.performPreview(path: fixture.model.sourcePath!)
++            try await ArchiveViewModelTestSupport.waitUntil {
++                fixture.archive.count(.inspect) == 1 && !fixture.model.isProcessing
++            }
++
++            XCTAssertEqual(fixture.model.signatureBadge, status)
++            XCTAssertEqual(fixture.model.archiveSecurityInfo?.signature, status)
++        }
++    }
++
++    func testInvalidSignatureBlocksPreviewExtractAndMount() async throws {
++        let blockedCount = try await ArchiveViewModelTestSupport.blockedActionCount(for: .invalid)
++        XCTAssertEqual(blockedCount, 3)
++    }
++
++    func testInvalidSignatureAlsoBlocksSmartEntryAndEditAtMethodBoundary() async throws {
++        let fixture = try await ArchiveViewModelTestSupport.fixture()
++        fixture.archive.inspectionResult = .success(ArchiveViewModelTestSupport.inspection(
++            signature: .invalid,
++            recipients: fixture.recipients
++        ))
++        fixture.model.performPreview(path: fixture.model.sourcePath!)
++        try await ArchiveViewModelTestSupport.waitUntil {
++            fixture.archive.count(.inspect) == 1 && !fixture.model.isProcessing
++        }
++
++        fixture.model.performSmartExtract()
++        _ = fixture.model.extractEntryForDrag(entry: ArchiveViewModelTestSupport.entries[0])
++        fixture.model.openEntry(entry: ArchiveViewModelTestSupport.entries[0])
++        fixture.model.beginArchiveEditing()
++        await Task.yield()
++
++        XCTAssertEqual(fixture.archive.count(.extract), 0)
++        XCTAssertEqual(fixture.archive.count(.entry), 0)
++        XCTAssertEqual(fixture.editor.openCount, 0)
++    }
++
++    func testEditAndVirtualDiskSavePreserveEveryRecipientAndLocalSignature() async throws {
++        let fixture = try await ArchiveViewModelTestSupport.fixture()
++        let security = ZwzSignatureVerification.validKnownSigner(
++            name: fixture.signer.name,
++            fingerprint: fixture.signer.fingerprint
++        )
++        try await ArchiveViewModelTestSupport.preparePreview(fixture, signature: security)
++
++        fixture.model.beginArchiveEditing()
++        try await ArchiveViewModelTestSupport.waitUntil { fixture.editor.openCount == 1 }
++        fixture.model.saveArchiveEdits()
++        try await ArchiveViewModelTestSupport.waitUntil {
++            fixture.editor.saveRecords.count == 1
++                && !fixture.model.isSavingEdits
++                && !fixture.model.isProcessing
++        }
++
++        await fixture.model.mountArchive(capacityMB: 256)
++        await fixture.model.saveMountedArchive()
++        XCTAssertEqual(fixture.mounter.saveRecords.count, 1)
++
++        let expectedRecipients = fixture.recipients.map(\.fingerprint).sorted()
++        try assertPublicKeySave(
++            fixture.editor.saveRecords[0].encryption,
++            expectedRecipients: expectedRecipients,
++            expectedSigner: fixture.signer.fingerprint
++        )
++        try assertPublicKeySave(
++            fixture.mounter.saveRecords[0].encryption,
++            expectedRecipients: expectedRecipients,
++            expectedSigner: fixture.signer.fingerprint
++        )
++        XCTAssertEqual(fixture.editor.saveRecords[0].storeID, fixture.storeID)
++        XCTAssertEqual(fixture.mounter.saveRecords[0].storeID, fixture.storeID)
++    }
++
++    func testPublicKeySaveRefusesMissingRecipientInsteadOfDowngrading() async throws {
++        let allRecipients = [
++            ArchiveViewModelTestSupport.contact(name: "Present", seed: 2),
++            ArchiveViewModelTestSupport.contact(name: "Missing", seed: 4)
++        ]
++        let fixture = try await ArchiveViewModelTestSupport.fixture(contacts: [allRecipients[0]])
++        fixture.archive.inspectionResult = .success(ArchiveViewModelTestSupport.inspection(
++            signature: .unsigned,
++            recipients: allRecipients
++        ))
++        fixture.archive.enqueueList(.success(ArchiveViewModelTestSupport.listing(
++            signature: .unsigned,
++            recipients: allRecipients
++        )))
++        fixture.model.performPreview(path: fixture.model.sourcePath!)
++        try await ArchiveViewModelTestSupport.waitUntil {
++            fixture.archive.count(.list) == 1 && !fixture.model.isProcessing
++        }
++
++        fixture.model.beginArchiveEditing()
++        try await ArchiveViewModelTestSupport.waitUntil { fixture.editor.openCount == 1 }
++        fixture.model.saveArchiveEdits()
++        try await ArchiveViewModelTestSupport.waitUntil {
++            fixture.model.editErrorMessage != nil || fixture.model.errorMessage != nil
++        }
++
++        await fixture.model.mountArchive(capacityMB: 256)
++        await fixture.model.saveMountedArchive()
++
++        XCTAssertTrue(fixture.editor.saveRecords.isEmpty)
++        XCTAssertTrue(fixture.mounter.saveRecords.isEmpty)
++        XCTAssertNotNil(fixture.model.editErrorMessage ?? fixture.model.errorMessage)
++    }
++
++    func testPublicKeySaveRefusesUnavailableOriginalSignerInsteadOfRemovingSignature() async throws {
++        let fixture = try await ArchiveViewModelTestSupport.fixture(identities: [])
++        let signed = ZwzSignatureVerification.validKnownSigner(
++            name: fixture.signer.name,
++            fingerprint: fixture.signer.fingerprint
++        )
++        try await ArchiveViewModelTestSupport.preparePreview(fixture, signature: signed)
++
++        fixture.model.beginArchiveEditing()
++        try await ArchiveViewModelTestSupport.waitUntil { fixture.editor.openCount == 1 }
++        fixture.model.saveArchiveEdits()
++        try await ArchiveViewModelTestSupport.waitUntil {
++            fixture.model.editErrorMessage != nil || fixture.model.errorMessage != nil
++        }
++
++        await fixture.model.mountArchive(capacityMB: 256)
++        await fixture.model.saveMountedArchive()
++
++        XCTAssertTrue(fixture.editor.saveRecords.isEmpty)
++        XCTAssertTrue(fixture.mounter.saveRecords.isEmpty)
++        XCTAssertNotNil(fixture.model.editErrorMessage ?? fixture.model.errorMessage)
++    }
++
++    func testPersistedVirtualDiskSessionContainsNoPrivateOrAuthenticationState() throws {
++        let session = VirtualDiskSession(
++            archivePath: "archive.zwz",
++            imagePath: "workspace.sparsebundle",
++            mountPath: "Mount",
++            capacityMB: 256,
++            baselineFingerprint: "baseline",
++            splitVolumeBytes: nil,
++            isMounted: true
++        )
++        let encoded = try JSONEncoder().encode(session)
++        let text = try XCTUnwrap(String(data: encoded, encoding: .utf8))
++
++        XCTAssertFalse(text.localizedCaseInsensitiveContains("privateKey"))
++        XCTAssertFalse(text.localizedCaseInsensitiveContains("restorePassword"))
++        XCTAssertFalse(text.localizedCaseInsensitiveContains("authenticationContext"))
++        XCTAssertFalse(text.contains("correct horse battery staple"))
++        XCTAssertFalse(text.localizedCaseInsensitiveContains("password"))
++    }
++
++    func testSaveUsesOpenedProtectionInsteadOfCurrentMutablePassword() async throws {
++        let fixture = try await ArchiveViewModelTestSupport.fixture()
++        let signed = ZwzSignatureVerification.validKnownSigner(
++            name: fixture.signer.name,
++            fingerprint: fixture.signer.fingerprint
++        )
++        try await ArchiveViewModelTestSupport.preparePreview(fixture, signature: signed)
++        fixture.model.beginArchiveEditing()
++        try await ArchiveViewModelTestSupport.waitUntil { fixture.editor.openCount == 1 }
++        await fixture.model.mountArchive(capacityMB: 256)
++
++        fixture.model.password = "different tab password"
++        fixture.model.saveArchiveEdits()
++        try await ArchiveViewModelTestSupport.waitUntil { fixture.editor.saveRecords.count == 1 }
++        await fixture.model.saveMountedArchive()
++
++        XCTAssertEqual(fixture.editor.saveRecords.count, 1)
++        XCTAssertEqual(fixture.mounter.saveRecords.count, 1)
++        try assertPublicKeySave(
++            fixture.editor.saveRecords[0].encryption,
++            expectedRecipients: fixture.recipients.map(\.fingerprint).sorted(),
++            expectedSigner: fixture.signer.fingerprint
++        )
++        try assertPublicKeySave(
++            fixture.mounter.saveRecords[0].encryption,
++            expectedRecipients: fixture.recipients.map(\.fingerprint).sorted(),
++            expectedSigner: fixture.signer.fingerprint
++        )
++    }
++
++    func testSaveRejectsSignerFingerprintWithDifferentArchiveSigningKey() async throws {
++        let fixture = try await ArchiveViewModelTestSupport.fixture()
++        let signature = ZwzSignatureVerification.validUnknownSigner(
++            name: "Claimed signer",
++            fingerprint: fixture.signer.fingerprint
++        )
++        let inspection = ArchiveViewModelTestSupport.inspection(
++            signature: signature,
++            recipients: fixture.recipients,
++            signerSigningPublicKey: Data(repeating: 0xEE, count: 32)
++        )
++        fixture.archive.inspectionResult = .success(inspection)
++        fixture.archive.enqueueList(.success(ZwzArchiveListing(
++            entries: ArchiveViewModelTestSupport.entries,
++            version: 3,
++            securityInfo: inspection.securityInfo
++        )))
++        fixture.model.performPreview(path: fixture.model.sourcePath!)
++        try await ArchiveViewModelTestSupport.waitUntil { fixture.archive.count(.list) == 1 }
++
++        fixture.model.beginArchiveEditing()
++        try await ArchiveViewModelTestSupport.waitUntil { fixture.editor.openCount == 1 }
++        fixture.model.saveArchiveEdits()
++        try await ArchiveViewModelTestSupport.waitUntil { fixture.model.editErrorMessage != nil }
++        await fixture.model.mountArchive(capacityMB: 256)
++        await fixture.model.saveMountedArchive()
++
++        XCTAssertTrue(fixture.editor.saveRecords.isEmpty)
++        XCTAssertTrue(fixture.mounter.saveRecords.isEmpty)
++    }
++
++    func testSourceChangeRejectsLateArchiveEditorOpenCallback() async throws {
++        let fixture = try await ArchiveViewModelTestSupport.fixture()
++        try await ArchiveViewModelTestSupport.preparePreview(fixture)
++        fixture.editor.openDelay = 0.08
++
++        fixture.model.beginArchiveEditing()
++        fixture.model.sourcePath = "/tmp/different-archive.zwz"
++        try await Task.sleep(for: .milliseconds(120))
++
++        XCTAssertEqual(fixture.editor.openCount, 1)
++        XCTAssertFalse(fixture.model.showArchiveEditor)
++        XCTAssertTrue(fixture.model.editEntries.isEmpty)
++    }
++
++    private func selectPublicKeyConfiguration(in fixture: ArchiveViewModelTestSupport.Fixture) {
++        fixture.model.compressFormat = .zwz
++        fixture.model.selectEncryptionMode(.publicKey)
++        fixture.model.selectedRecipientFingerprints = Set(fixture.recipients.map(\.fingerprint))
++        fixture.model.selectedSignerFingerprint = fixture.signer.fingerprint
++    }
++
++    private func assertOnlyStore(
++        _ expected: ObjectIdentifier,
++        wasPassedTo identifiers: [ObjectIdentifier],
++        file: StaticString = #filePath,
++        line: UInt = #line
++    ) {
++        XCTAssertFalse(identifiers.isEmpty, file: file, line: line)
++        XCTAssertTrue(identifiers.allSatisfy { $0 == expected }, file: file, line: line)
++    }
++
++    private func assertPublicKeySave(
++        _ encryption: ZwzEncryptionMode,
++        expectedRecipients: [String],
++        expectedSigner: String,
++        file: StaticString = #filePath,
++        line: UInt = #line
++    ) throws {
++        guard case .publicKey(let recipients, let signer) = encryption else {
++            return XCTFail("Save was downgraded from public-key encryption", file: file, line: line)
++        }
++        XCTAssertEqual(recipients.map(\.fingerprint), expectedRecipients, file: file, line: line)
++        XCTAssertEqual(signer?.fingerprint, expectedSigner, file: file, line: line)
++    }
++}
+diff --git a/Tests/ZwzGUITests/VirtualDiskManagerTests.swift b/Tests/ZwzGUITests/VirtualDiskManagerTests.swift
+index 5f957fc..a872fa9 100644
+--- a/Tests/ZwzGUITests/VirtualDiskManagerTests.swift
++++ b/Tests/ZwzGUITests/VirtualDiskManagerTests.swift
+@@ -4,11 +4,18 @@ import XCTest
+ final class VirtualDiskManagerTests: XCTestCase {
+     func testSessionOwnerRoundTripsAndOlderJSONDefaultsToNil() throws {
+         let owner = UUID()
+-        let session = VirtualDiskSession(archivePath: "a.zwz", imagePath: "a", mountPath: "m", password: nil, capacityMB: 256, baselineFingerprint: "x", splitVolumeBytes: nil, isMounted: true, ownerTabID: owner)
++        let session = VirtualDiskSession(archivePath: "a.zwz", imagePath: "a", mountPath: "m", capacityMB: 256, baselineFingerprint: "x", splitVolumeBytes: nil, isMounted: true, ownerTabID: owner)
+         XCTAssertEqual(try JSONDecoder().decode(VirtualDiskSession.self, from: JSONEncoder().encode(session)).ownerTabID, owner)
+ 
+         let oldJSON = #"{"archivePath":"a.zwz","imagePath":"a","mountPath":"m","capacityMB":256,"baselineFingerprint":"x","isMounted":true}"#
+         XCTAssertNil(try JSONDecoder().decode(VirtualDiskSession.self, from: Data(oldJSON.utf8)).ownerTabID)
++
++        let legacyWithPassword = #"{"archivePath":"a.zwz","imagePath":"a","mountPath":"m","password":"legacy secret","capacityMB":256,"baselineFingerprint":"x","isMounted":true}"#
++        let migrated = try JSONDecoder().decode(VirtualDiskSession.self, from: Data(legacyWithPassword.utf8))
++        let migratedJSON = String(decoding: try JSONEncoder().encode(migrated), as: UTF8.self)
++        XCTAssertEqual(migrated.protection?.securityInfo?.encryption, .password)
++        XCTAssertFalse(migratedJSON.contains("legacy secret"))
++        XCTAssertFalse(migratedJSON.localizedCaseInsensitiveContains("password"))
+     }
+     func testRecommendedCapacityAddsHeadroomAndRoundsTo256MB() {
+         XCTAssertEqual(VirtualDiskManager.recommendedCapacityMB(uncompressedBytes: 0), 256)
+@@ -22,7 +29,6 @@ final class VirtualDiskManagerTests: XCTestCase {
+             archivePath: "/tmp/a.zwz",
+             imagePath: "/tmp/a.sparsebundle",
+             mountPath: "/tmp/mount",
+-            password: "secret",
+             capacityMB: 512,
+             baselineFingerprint: "fingerprint",
+             splitVolumeBytes: 262_144,
+@@ -30,5 +36,6 @@ final class VirtualDiskManagerTests: XCTestCase {
+         )
+         let decoded = try JSONDecoder().decode(VirtualDiskSession.self, from: JSONEncoder().encode(session))
+         XCTAssertEqual(decoded, session)
++        XCTAssertFalse(String(decoding: try JSONEncoder().encode(session), as: UTF8.self).contains("password"))
+     }
+ }

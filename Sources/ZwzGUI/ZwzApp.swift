@@ -228,7 +228,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // MARK: - Menu Actions
 
-    private let compressor = ZipCompressor()
 
     @objc func compressFileAction() {
         let panel = NSOpenPanel()
@@ -294,10 +293,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func compressFile(at path: String) {
         let destPath = path.hasSuffix(".zip") ? path : path + ".zip"
-        let compressor = self.compressor
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                try compressor.compress(sourcePath: path, destinationPath: destPath, options: CompressionOptions())
+                try ZipCompressor().compress(
+                    sourcePath: path,
+                    destinationPath: destPath,
+                    options: CompressionOptions()
+                )
                 DispatchQueue.main.async {
                     NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: destPath)
                     Self.notify(title: "压缩完成", body: (destPath as NSString).lastPathComponent)
@@ -701,6 +703,16 @@ struct ZWZArchiveEditorView: View {
                 .buttonStyle(.plain)
                 .disabled(selectedPath == nil)
                 .help("删除")
+                Button {
+                    viewModel.showBatchRenamePanel.toggle()
+                    if viewModel.showBatchRenamePanel {
+                        viewModel.batchSelectedPaths = Set(visibleEditEntries.map(\.path))
+                    }
+                } label: {
+                    editorToolbarIcon("rectangle.and.pencil.and.ellipsis")
+                }
+                .buttonStyle(.plain)
+                .help(L.string("batch_rename"))
             }
             .padding(16)
 
@@ -781,13 +793,33 @@ struct ZWZArchiveEditorView: View {
                     }
                     .padding(.vertical, 3)
                     .contentShape(Rectangle())
+                    .onTapGesture {
+                        selectedPath = entry.path
+                    }
                     .onTapGesture(count: 2) {
                         openEditEntry(entry)
                     }
                     .tag(entry.path)
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(maxWidth: .infinity, maxHeight: viewModel.showBatchRenamePanel ? 180 : .infinity)
+
+            // 批量重命名内嵌面板
+            if viewModel.showBatchRenamePanel {
+                ZWZBatchRenamePanel(
+                    viewModel: viewModel,
+                    currentDirEntries: visibleEditEntries,
+                    onApply: { items in
+                        viewModel.batchRenameInArchive(items: items)
+                        viewModel.showBatchRenamePanel = false
+                    },
+                    onCancel: {
+                        viewModel.showBatchRenamePanel = false
+                    }
+                )
+                .frame(maxHeight: 280)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
 
             if let error = viewModel.editErrorMessage {
                 Text(error).font(.system(size: 11)).foregroundColor(.red).padding(.horizontal, 16).padding(.top, 8)
@@ -2198,6 +2230,7 @@ struct ZWZCompressOptionsView: View {
                         Text(fmt.displayName).tag(fmt)
                     }
                 }
+                .labelsHidden()
                 .pickerStyle(.segmented)
             }
 
@@ -2208,6 +2241,7 @@ struct ZWZCompressOptionsView: View {
                         Text(level.displayName).tag(level)
                     }
                 }
+                .labelsHidden()
                 .pickerStyle(.segmented)
             }
 
@@ -2224,6 +2258,7 @@ struct ZWZCompressOptionsView: View {
                         .tag(EncryptionModeSelection.publicKey)
                         .disabled(viewModel.compressFormat != .zwz)
                 }
+                .labelsHidden()
                 .pickerStyle(.segmented)
             }
 
@@ -2457,6 +2492,7 @@ struct ZWZSheetSection<Content: View>: View {
                 .foregroundColor(.secondary)
             content
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

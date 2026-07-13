@@ -137,6 +137,7 @@ protocol ArchiveEditWorkflowClient: Sendable {
     func add(urls: [URL], into directoryPath: String) throws
     func delete(path: String) throws
     func rename(path: String, to newName: String) throws
+    func batchRename(items: [(sourcePath: String, newName: String)]) throws
     func replace(path: String, with sourceURL: URL) throws
     func text(for path: String) throws -> String
     func writeText(_ text: String, to path: String) throws
@@ -161,6 +162,10 @@ extension ArchiveEditWorkflowClient {
     }
 
     func rename(path: String, to newName: String) throws {
+        throw ArchiveEditWorkflowError.noActiveSession
+    }
+
+    func batchRename(items: [(sourcePath: String, newName: String)]) throws {
         throw ArchiveEditWorkflowError.noActiveSession
     }
 

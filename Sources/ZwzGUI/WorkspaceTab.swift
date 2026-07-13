@@ -21,6 +21,7 @@ final class WorkspaceTab: Identifiable, ObservableObject {
     let id: UUID
     let viewModel: ArchiveViewModel
     @Published var kind: WorkspaceTabKind
+    var onPersistentStateChanged: (@MainActor () -> Void)?
 
     init(
         id: UUID = UUID(),
@@ -30,6 +31,12 @@ final class WorkspaceTab: Identifiable, ObservableObject {
         self.id = id
         self.kind = kind
         self.viewModel = viewModel
+        self.viewModel.onCompressionSucceeded = { [weak self] in
+            guard let self else { return }
+            self.viewModel.clearPreview()
+            self.kind = .empty
+            self.onPersistentStateChanged?()
+        }
     }
 
     var title: String {

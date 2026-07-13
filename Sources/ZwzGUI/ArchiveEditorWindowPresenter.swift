@@ -34,7 +34,6 @@ struct ArchiveEditorWindowPresenter: NSViewRepresentable {
         private var viewModel: ArchiveViewModel
         private var editorWindow: NSWindow?
         private var hostingController: NSHostingController<ZWZArchiveEditorView>?
-        private var isRunningModal = false
         private var isClosingProgrammatically = false
         private var isConfirmingClose = false
 
@@ -85,9 +84,6 @@ struct ArchiveEditorWindowPresenter: NSViewRepresentable {
                 window.contentView?.layoutSubtreeIfNeeded()
                 self.position(window, relativeTo: ownerWindow)
                 window.alphaValue = 1
-                self.isRunningModal = true
-                _ = NSApp.runModal(for: window)
-                self.isRunningModal = false
             }
         }
 
@@ -128,9 +124,6 @@ struct ArchiveEditorWindowPresenter: NSViewRepresentable {
         func windowWillClose(_ notification: Notification) {
             guard let closingWindow = notification.object as? NSWindow,
                   closingWindow === editorWindow else { return }
-            if isRunningModal {
-                NSApp.stopModal()
-            }
             if !isClosingProgrammatically, isPresented.wrappedValue {
                 isPresented.wrappedValue = false
             }
@@ -141,9 +134,6 @@ struct ArchiveEditorWindowPresenter: NSViewRepresentable {
         private func dismiss(window: NSWindow) {
             guard editorWindow === window else { return }
             isClosingProgrammatically = true
-            if isRunningModal {
-                NSApp.stopModal()
-            }
             window.close()
             // NSWindow normally delivers windowWillClose synchronously. Keep the
             // coordinator from retaining a window if AppKit defers that callback.

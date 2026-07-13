@@ -1,0 +1,1631 @@
+diff --git a/Package.swift b/Package.swift
+index 8330ab7..b99e23c 100644
+--- a/Package.swift
++++ b/Package.swift
+@@ -51,6 +51,11 @@ let package = Package(
+             dependencies: ["ZwzGUI"],
+             path: "Tests/ZwzGUITests"
+         ),
++        .testTarget(
++            name: "ZwzCLITests",
++            dependencies: ["zwz", "ZwzCore"],
++            path: "Tests/ZwzCLITests"
++        ),
+     ],
+     swiftLanguageModes: [.v6]
+ )
+diff --git a/Sources/ZwzCore/ZWZV3/ZwzV3Extractor.swift b/Sources/ZwzCore/ZWZV3/ZwzV3Extractor.swift
+index 9971a75..14bd8db 100644
+--- a/Sources/ZwzCore/ZWZV3/ZwzV3Extractor.swift
++++ b/Sources/ZwzCore/ZWZV3/ZwzV3Extractor.swift
+@@ -7,6 +7,15 @@ public final class ZwzV3Extractor {
+ 
+     public init() {}
+ 
++    public func recipientInfo(archivePath: String) throws -> [ZwzRecipientInfo] {
++        let urls = try Self.archiveURLs(for: archivePath)
++        let archive = try Self.loadLogicalArchive(from: urls)
++        let parsed = try ZwzV3BinaryCodec.parse(archive)
++        return parsed.recipients.map {
++            ZwzRecipientInfo(name: $0.recipientName, fingerprint: $0.recipientFingerprint)
++        }
++    }
++
+     public func listEntries(
+         archivePath: String,
+         keyProvider: ZwzPrivateKeyProvider
+diff --git a/Sources/ZwzCore/ZWZV3/ZwzV3Types.swift b/Sources/ZwzCore/ZWZV3/ZwzV3Types.swift
+index 1980ec5..8fb7fbc 100644
+--- a/Sources/ZwzCore/ZWZV3/ZwzV3Types.swift
++++ b/Sources/ZwzCore/ZWZV3/ZwzV3Types.swift
+@@ -31,6 +31,17 @@ public struct ZwzRecipient: Equatable, Sendable {
+     }
+ }
+ 
++/// Public, untrusted recipient labels embedded in an archive.
++public struct ZwzRecipientInfo: Equatable, Sendable {
++    public let name: String
++    public let fingerprint: String
++
++    public init(name: String, fingerprint: String) {
++        self.name = name
++        self.fingerprint = fingerprint
++    }
++}
++
+ public struct ZwzSigningIdentity: Equatable, Sendable {
+     public let name: String
+     public let fingerprint: String
+diff --git a/Sources/zwz/CLIArguments.swift b/Sources/zwz/CLIArguments.swift
+new file mode 100644
+index 0000000..9925c4d
+--- /dev/null
++++ b/Sources/zwz/CLIArguments.swift
+@@ -0,0 +1,683 @@
++import Darwin
++import Foundation
++import ZwzCore
++
++enum CLIParseError: LocalizedError, Equatable {
++    case invalid(String)
++
++    var errorDescription: String? {
++        guard case .invalid(let message) = self else { return nil }
++        return message
++    }
++}
++
++enum CLIArguments: Equatable {
++    case help
++    case compress(CompressArguments)
++    case extract(ExtractArguments)
++    case list(ListArguments)
++    case key(KeyArguments)
++
++    static func parse(_ arguments: [String]) throws -> CLIArguments {
++        guard let first = arguments.first else { return .help }
++        let rest = Array(arguments.dropFirst())
++        if ["c", "compress", "x", "extract", "l", "list"].contains(first.lowercased()),
++           rest == ["-h"] || rest == ["--help"] {
++            return .help
++        }
++        switch first.lowercased() {
++        case "h", "help", "-h", "--help":
++            guard rest.isEmpty else { throw CLIParseError.invalid("help accepts no arguments") }
++            return .help
++        case "c", "compress": return .compress(try CompressArguments.parse(rest))
++        case "x", "extract": return .extract(try ExtractArguments.parse(rest))
++        case "l", "list": return .list(try ListArguments.parse(rest))
++        case "key": return .key(try KeyArguments.parse(rest))
++        default: throw CLIParseError.invalid("Unknown command '\(first)'")
++        }
++    }
++}
++
++struct CompressArguments: Equatable {
++    var source: String
++    var output: String?
++    var level: CompressionLevel
++    var password: String?
++    var aes256: Bool
++    var splitVolume: SplitVolume?
++    var format: CompressionFormat
++    var threadCount: Int
++    var recipients: [String]
++    var signer: String?
++
++    fileprivate static func parse(_ arguments: [String]) throws -> Self {
++        var positionals: [String] = []
++        var level: CompressionLevel = .normal
++        var password: String?
++        var aes256 = true
++        var splitVolume: SplitVolume?
++        var format: CompressionFormat = .zip
++        var threadCount = 0
++        var recipients: [String] = []
++        var signer: String?
++        var seen = Set<String>()
++        var index = 0
++        while index < arguments.count {
++            let argument = arguments[index]
++            func value() throws -> String {
++                guard index + 1 < arguments.count, !arguments[index + 1].hasPrefix("-") else {
++                    throw CLIParseError.invalid("\(argument) requires a value")
++                }
++                return arguments[index + 1]
++            }
++            func singleton(_ name: String) throws {
++                guard seen.insert(name).inserted else {
++                    throw CLIParseError.invalid("\(argument) may only be specified once")
++                }
++            }
++            switch argument {
++            case "-f", "--format":
++                try singleton("format")
++                let raw = try value().lowercased()
++                guard let parsed = CompressionFormat(rawValue: raw) else {
++                    throw CLIParseError.invalid("Unknown format '\(raw)'")
++                }
++                format = parsed; index += 1
++            case "-l", "--level":
++                try singleton("level")
++                switch try value().lowercased() {
++                case "none": level = .none
++                case "fastest": level = .fastest
++                case "normal": level = .normal
++                case "max": level = .max
++                default: throw CLIParseError.invalid("Unknown compression level")
++                }
++                index += 1
++            case "-p", "--password":
++                try singleton("password"); password = try value(); index += 1
++            case "--no-aes":
++                try singleton("aes"); aes256 = false
++            case "-s", "--split":
++                try singleton("split")
++                guard let parsed = parseSplitSize(try value()) else {
++                    throw CLIParseError.invalid("Invalid split size. Use a positive value such as 100MB or 500KB")
++                }
++                splitVolume = parsed; index += 1
++            case "-t", "--threads":
++                try singleton("threads")
++                guard let parsed = Int(try value()), parsed >= 0 else {
++                    throw CLIParseError.invalid("Invalid thread count. Use a non-negative integer")
++                }
++                threadCount = parsed; index += 1
++            case "--recipient":
++                recipients.append(try value()); index += 1
++            case "--sign":
++                try singleton("sign"); signer = try value(); index += 1
++            case "-h", "--help": throw CLIParseError.invalid("Use 'zwz help' for help")
++            default:
++                guard !argument.hasPrefix("-") else {
++                    throw CLIParseError.invalid("Unknown option '\(argument)'")
++                }
++                positionals.append(argument)
++            }
++            index += 1
++        }
++        guard (1...2).contains(positionals.count) else {
++            throw CLIParseError.invalid(positionals.isEmpty ? "No source path specified" : "Too many positional arguments")
++        }
++        if password != nil && (!recipients.isEmpty || signer != nil) {
++            throw CLIParseError.invalid("Password and public-key encryption are mutually exclusive")
++        }
++        if signer != nil && recipients.isEmpty {
++            throw CLIParseError.invalid("--sign requires at least one --recipient")
++        }
++        if !recipients.isEmpty || signer != nil {
++            guard format == .zwz else {
++                throw CLIParseError.invalid("--recipient and --sign require -f zwz")
++            }
++        }
++        return Self(
++            source: positionals[0], output: positionals.count == 2 ? positionals[1] : nil,
++            level: level, password: password, aes256: aes256, splitVolume: splitVolume,
++            format: format, threadCount: threadCount, recipients: recipients, signer: signer
++        )
++    }
++}
++
++struct ExtractArguments: Equatable {
++    var archive: String
++    var output: String?
++    var password: String?
++
++    fileprivate static func parse(_ arguments: [String]) throws -> Self {
++        var positionals: [String] = []
++        let password = try parseArchiveArguments(arguments, positionals: &positionals)
++        guard (1...2).contains(positionals.count) else {
++            throw CLIParseError.invalid(positionals.isEmpty ? "No archive path specified" : "Too many positional arguments")
++        }
++        return Self(archive: positionals[0], output: positionals.count == 2 ? positionals[1] : nil, password: password)
++    }
++}
++
++struct ListArguments: Equatable {
++    var archive: String
++    var password: String?
++
++    fileprivate static func parse(_ arguments: [String]) throws -> Self {
++        var positionals: [String] = []
++        let password = try parseArchiveArguments(arguments, positionals: &positionals)
++        guard positionals.count == 1 else {
++            throw CLIParseError.invalid(positionals.isEmpty ? "No archive path specified" : "Too many positional arguments")
++        }
++        return Self(archive: positionals[0], password: password)
++    }
++}
++
++private func parseArchiveArguments(_ arguments: [String], positionals: inout [String]) throws -> String? {
++    var password: String?
++    var index = 0
++    while index < arguments.count {
++        let argument = arguments[index]
++        switch argument {
++        case "-p", "--password":
++            guard password == nil else { throw CLIParseError.invalid("Password may only be specified once") }
++            guard index + 1 < arguments.count, !arguments[index + 1].hasPrefix("-") else {
++                throw CLIParseError.invalid("\(argument) requires a value")
++            }
++            password = arguments[index + 1]; index += 1
++        default:
++            guard !argument.hasPrefix("-") else { throw CLIParseError.invalid("Unknown option '\(argument)'") }
++            positionals.append(argument)
++        }
++        index += 1
++    }
++    return password
++}
++
++enum KeyArguments: Equatable {
++    case create(name: String)
++    case list
++    case rename(identity: String, newName: String)
++    case delete(identity: String, confirmed: Bool)
++    case exportPublic(identity: String, output: String)
++    case importPublic(input: String, replace: Bool)
++    case backup(identity: String, output: String)
++    case restore(input: String, replace: Bool)
++
++    fileprivate static func parse(_ arguments: [String]) throws -> Self {
++        guard let operation = arguments.first else { throw CLIParseError.invalid("Missing key command") }
++        let rest = Array(arguments.dropFirst())
++        switch operation {
++        case "create": guard validPositionals(rest, count: 1) else { throw arity(operation) }; return .create(name: rest[0])
++        case "list": guard rest.isEmpty else { throw arity(operation) }; return .list
++        case "rename": guard validPositionals(rest, count: 2) else { throw arity(operation) }; return .rename(identity: rest[0], newName: rest[1])
++        case "export-public": guard validPositionals(rest, count: 2) else { throw arity(operation) }; return .exportPublic(identity: rest[0], output: rest[1])
++        case "backup":
++            guard rest.count == 2, !rest.contains(where: { $0.hasPrefix("-") }) else { throw arity(operation) }
++            return .backup(identity: rest[0], output: rest[1])
++        case "delete":
++            let parsed = try flag("--yes", in: rest)
++            guard parsed.values.count == 1 else { throw arity(operation) }
++            return .delete(identity: parsed.values[0], confirmed: parsed.present)
++        case "import-public":
++            let parsed = try flag("--replace", in: rest)
++            guard parsed.values.count == 1 else { throw arity(operation) }
++            return .importPublic(input: parsed.values[0], replace: parsed.present)
++        case "restore":
++            let parsed = try flag("--replace", in: rest)
++            guard parsed.values.count == 1 else { throw arity(operation) }
++            return .restore(input: parsed.values[0], replace: parsed.present)
++        default: throw CLIParseError.invalid("Unknown key command '\(operation)'")
++        }
++    }
++
++    private static func flag(_ flag: String, in arguments: [String]) throws -> (present: Bool, values: [String]) {
++        var present = false
++        var values: [String] = []
++        for argument in arguments {
++            if argument == flag {
++                guard !present else { throw CLIParseError.invalid("\(flag) may only be specified once") }
++                present = true
++            } else {
++                guard !argument.hasPrefix("-") else { throw CLIParseError.invalid("Unknown option '\(argument)'") }
++                values.append(argument)
++            }
++        }
++        return (present, values)
++    }
++
++    private static func arity(_ operation: String) -> CLIParseError {
++        .invalid("Invalid arguments for key \(operation)")
++    }
++
++    private static func validPositionals(_ arguments: [String], count: Int) -> Bool {
++        arguments.count == count && !arguments.contains(where: { $0.hasPrefix("-") })
++    }
++}
++
++func parseSplitSize(_ value: String) -> SplitVolume? {
++    let upper = value.uppercased()
++    let suffix: String
++    let multiplier: Int64
++    if upper.hasSuffix("MB") {
++        suffix = "MB"; multiplier = 1_024 * 1_024
++    } else if upper.hasSuffix("KB") {
++        suffix = "KB"; multiplier = 1_024
++    } else {
++        return nil
++    }
++    guard let amount = Int(upper.dropLast(suffix.count)), amount > 0,
++          let amount64 = Int64(exactly: amount),
++          !amount64.multipliedReportingOverflow(by: multiplier).overflow else {
++        return nil
++    }
++    if suffix == "MB" { return .megaBytes(amount) }
++    if suffix == "KB" { return .kiloBytes(amount) }
++    return nil
++}
++
++protocol ZwzCLIArchiveOperations {
++    func compress(source: String, destination: String?, options: CompressionOptions, keyProvider: ZwzPrivateKeyProvider?) throws -> String
++    func extract(archive: String, destination: String?, password: String?, keyProvider: ZwzPrivateKeyProvider?) throws -> ZwzExtractionResult
++    func list(archive: String, password: String?, keyProvider: ZwzPrivateKeyProvider?) throws -> ZwzArchiveListing
++    func recipientInfo(archive: String) throws -> [ZwzRecipientInfo]
++}
++
++struct ZwzAPIArchiveOperations: ZwzCLIArchiveOperations {
++    private let api = ZwzAPI()
++
++    func compress(source: String, destination: String?, options: CompressionOptions, keyProvider: ZwzPrivateKeyProvider?) throws -> String {
++        try api.compress(sourcePath: source, destinationPath: destination, options: options, keyProvider: keyProvider)
++    }
++
++    func extract(archive: String, destination: String?, password: String?, keyProvider: ZwzPrivateKeyProvider?) throws -> ZwzExtractionResult {
++        try api.extract(archivePath: archive, destinationPath: destination, password: password, keyProvider: keyProvider)
++    }
++
++    func list(archive: String, password: String?, keyProvider: ZwzPrivateKeyProvider?) throws -> ZwzArchiveListing {
++        try api.list(archivePath: archive, password: password, keyProvider: keyProvider)
++    }
++
++    func recipientInfo(archive: String) throws -> [ZwzRecipientInfo] {
++        try ZwzV3Extractor().recipientInfo(archivePath: archive)
++    }
++}
++
++struct ZwzCLIDependencies {
++    var output: (String) -> Void
++    var error: (String) -> Void
++    var passwordReader: (_ prompt: String) throws -> String
++    var confirmationReader: (_ prompt: String) -> String?
++    var identityStore: any ZwzIdentityStore
++    var archives: any ZwzCLIArchiveOperations
++    var fileManager: FileManager
++
++    static func production() -> Self {
++        let terminal = TerminalSecretReader(
++            session: DarwinTerminalSession(),
++            output: { FileHandle.standardError.write(Data($0.utf8)) }
++        )
++        return Self(
++            output: { print($0) },
++            error: { FileHandle.standardError.write(Data(($0 + "\n").utf8)) },
++            passwordReader: { try terminal.read(prompt: $0) },
++            confirmationReader: { prompt in
++                FileHandle.standardError.write(Data(prompt.utf8))
++                return readLine()
++            },
++            identityStore: MacKeychainIdentityStore(),
++            archives: ZwzAPIArchiveOperations(),
++            fileManager: .default
++        )
++    }
++}
++
++protocol TerminalSession: AnyObject {
++    func disableEcho() throws -> () -> Void
++    func readLine() -> String?
++    var isTerminal: Bool { get }
++}
++
++final class DarwinTerminalSession: TerminalSession {
++    var isTerminal: Bool { isatty(STDIN_FILENO) == 1 }
++
++    func disableEcho() throws -> () -> Void {
++        var original = termios()
++        guard tcgetattr(STDIN_FILENO, &original) == 0 else {
++            throw CLIParseError.invalid("Unable to read terminal state")
++        }
++        var hidden = original
++        hidden.c_lflag &= ~tcflag_t(ECHO)
++        guard tcsetattr(STDIN_FILENO, TCSAFLUSH, &hidden) == 0 else {
++            throw CLIParseError.invalid("Unable to disable terminal echo")
++        }
++        return {
++            var restored = original
++            _ = tcsetattr(STDIN_FILENO, TCSAFLUSH, &restored)
++        }
++    }
++
++    func readLine() -> String? { Swift.readLine() }
++}
++
++final class TerminalSecretReader {
++    private let session: any TerminalSession
++    private let output: (String) -> Void
++
++    init(session: any TerminalSession, output: @escaping (String) -> Void) {
++        self.session = session
++        self.output = output
++    }
++
++    func read(prompt: String) throws -> String {
++        output(prompt)
++        if session.isTerminal {
++            let restore = try session.disableEcho()
++            defer {
++                restore()
++                output("\n")
++            }
++            return session.readLine() ?? ""
++        }
++        return session.readLine() ?? ""
++    }
++}
++
++enum ZwzCLI {
++    static func run(arguments: [String], dependencies: ZwzCLIDependencies) -> Int32 {
++        do {
++            let command = try CLIArguments.parse(arguments)
++            try execute(command, dependencies: dependencies)
++            return 0
++        } catch {
++            report(error, dependencies: dependencies, archive: archivePath(from: arguments))
++            return 1
++        }
++    }
++
++    private static func execute(_ command: CLIArguments, dependencies: ZwzCLIDependencies) throws {
++        switch command {
++        case .help:
++            dependencies.output(usage)
++        case .key(let command):
++            try executeKey(command, dependencies: dependencies)
++        case .compress(let arguments):
++            try executeCompress(arguments, dependencies: dependencies)
++        case .extract(let arguments):
++            let result = try dependencies.archives.extract(
++                archive: arguments.archive, destination: arguments.output,
++                password: arguments.password, keyProvider: dependencies.identityStore
++            )
++            dependencies.output("Extracted to: \(result.destinationPath)")
++            printSignature(result.securityInfo?.signature, output: dependencies.output)
++        case .list(let arguments):
++            let listing = try dependencies.archives.list(
++                archive: arguments.archive, password: arguments.password,
++                keyProvider: dependencies.identityStore
++            )
++            for entry in listing.entries {
++                dependencies.output("\(entry.isDirectory ? "directory" : "file")\t\(entry.size)\t\(entry.path)")
++            }
++            dependencies.output("Total: \(listing.entries.count)")
++            printSignature(listing.securityInfo?.signature, output: dependencies.output)
++        }
++    }
++
++    private static func executeCompress(_ arguments: CompressArguments, dependencies: ZwzCLIDependencies) throws {
++        let encryption: ZwzEncryptionMode
++        if !arguments.recipients.isEmpty {
++            let resolved = try resolveRecipients(arguments.recipients, store: dependencies.identityStore)
++            let recipients = resolved.map {
++                ZwzRecipient(name: $0.name, fingerprint: $0.fingerprint, agreementPublicKey: $0.agreementPublicKey)
++            }
++            let signer: ZwzSigningIdentity?
++            if let requested = arguments.signer {
++                let identity = try resolveLocal(requested, store: dependencies.identityStore)
++                signer = ZwzSigningIdentity(
++                    name: identity.name, fingerprint: identity.fingerprint,
++                    agreementPublicKey: identity.agreementPublicKey,
++                    signingPublicKey: identity.signingPublicKey
++                )
++            } else {
++                signer = nil
++            }
++            encryption = .publicKey(recipients: recipients, signer: signer)
++        } else if let password = arguments.password {
++            encryption = .password(password)
++        } else {
++            encryption = .none
++        }
++        let options = CompressionOptions(
++            level: arguments.level, encryption: encryption, aes256: arguments.aes256,
++            splitVolume: arguments.splitVolume, format: arguments.format,
++            threadCount: arguments.threadCount
++        )
++        let output = try dependencies.archives.compress(
++            source: arguments.source, destination: arguments.output,
++            options: options, keyProvider: dependencies.identityStore
++        )
++        dependencies.output("Created: \(output)")
++    }
++
++    private static func executeKey(_ command: KeyArguments, dependencies: ZwzCLIDependencies) throws {
++        let store = dependencies.identityStore
++        switch command {
++        case .create(let name):
++            let identity = try store.createIdentity(named: name)
++            dependencies.output("Created identity: \(identity.name) \(identity.fingerprint)")
++        case .list:
++            for identity in try store.identities() {
++                dependencies.output("local\t\(identity.name)\t\(identity.fingerprint)")
++            }
++            for contact in try store.contacts() {
++                dependencies.output("contact\t\(contact.name)\t\(contact.fingerprint)")
++            }
++        case .rename(let requested, let name):
++            let identity = try resolveAny(requested, store: store)
++            try store.rename(fingerprint: identity.fingerprint, to: name)
++            dependencies.output("Renamed: \(identity.fingerprint)")
++        case .delete(let requested, let confirmed):
++            let identity = try resolveAny(requested, store: store)
++            dependencies.error("Warning: deleting '\(identity.name)' permanently removes any associated private keys.")
++            if !confirmed {
++                let answer = dependencies.confirmationReader(
++                    "Permanently delete '\(identity.name)' and any private keys? [y/N] "
++                )?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
++                guard answer == "y" || answer == "yes" else {
++                    throw CLIParseError.invalid("Deletion cancelled")
++                }
++            }
++            try store.delete(fingerprint: identity.fingerprint)
++            dependencies.output("Deleted: \(identity.fingerprint)")
++        case .exportPublic(let requested, let output):
++            try requireNewOutput(output, dependencies: dependencies)
++            let identity = try resolveAny(requested, store: store)
++            let data = try store.exportPublicIdentity(fingerprint: identity.fingerprint)
++            try writeNewFileAtomically(data, path: output, dependencies: dependencies)
++            dependencies.output("Exported public identity: \(output)")
++        case .importPublic(let input, let replace):
++            let data = try Data(contentsOf: URL(fileURLWithPath: input))
++            let identity = try store.importPublicIdentity(
++                data, conflict: replace ? .replaceExisting : .requireConfirmation
++            )
++            dependencies.output("Imported public identity: \(identity.name) \(identity.fingerprint)")
++        case .backup(let requested, let output):
++            try requireNewOutput(output, dependencies: dependencies)
++            let identity = try resolveLocal(requested, store: store)
++            let password = try readNonemptyPassword("Backup password: ", dependencies: dependencies)
++            let confirmation = try readNonemptyPassword("Confirm backup password: ", dependencies: dependencies)
++            guard password == confirmation else { throw CLIParseError.invalid("Backup passwords do not match") }
++            let data = try store.exportPrivateBackup(fingerprint: identity.fingerprint, password: password)
++            try writeNewFileAtomically(data, path: output, dependencies: dependencies)
++            dependencies.output("Created encrypted backup: \(output)")
++        case .restore(let input, let replace):
++            let password = try readNonemptyPassword("Backup password: ", dependencies: dependencies)
++            let data = try Data(contentsOf: URL(fileURLWithPath: input))
++            let identity = try store.importPrivateBackup(
++                data, password: password,
++                conflict: replace ? .replaceExisting : .requireConfirmation
++            )
++            dependencies.output("Restored identity: \(identity.name) \(identity.fingerprint)")
++        }
++    }
++
++    private static func readNonemptyPassword(_ prompt: String, dependencies: ZwzCLIDependencies) throws -> String {
++        let password = try dependencies.passwordReader(prompt)
++        guard !password.isEmpty else { throw CLIParseError.invalid("Password must not be empty") }
++        return password
++    }
++
++    private static func writeNewFileAtomically(_ data: Data, path: String, dependencies: ZwzCLIDependencies) throws {
++        let output = URL(fileURLWithPath: path)
++        try requireNewOutput(path, dependencies: dependencies)
++        let temporary = output.deletingLastPathComponent()
++            .appendingPathComponent(".\(output.lastPathComponent).\(UUID().uuidString).tmp")
++        defer { try? dependencies.fileManager.removeItem(at: temporary) }
++        try data.write(to: temporary, options: .withoutOverwriting)
++        try dependencies.fileManager.moveItem(at: temporary, to: output)
++    }
++
++    private static func requireNewOutput(_ path: String, dependencies: ZwzCLIDependencies) throws {
++        guard !dependencies.fileManager.fileExists(atPath: path) else {
++            throw CLIParseError.invalid("Output already exists: \(path)")
++        }
++    }
++
++    private static func resolveRecipients(_ requests: [String], store: any ZwzIdentityStore) throws -> [ZwzPublicIdentity] {
++        var result: [ZwzPublicIdentity] = []
++        var seen = Set<String>()
++        for request in requests {
++            let identity = try resolveAny(request, store: store)
++            if seen.insert(identity.fingerprint).inserted { result.append(identity) }
++        }
++        return result
++    }
++
++    private static func resolveLocal(_ request: String, store: any ZwzIdentityStore) throws -> ZwzPublicIdentity {
++        try resolve(request, candidates: try store.identities().map(\.publicIdentity))
++    }
++
++    private static func resolveAny(_ request: String, store: any ZwzIdentityStore) throws -> ZwzPublicIdentity {
++        try resolve(request, candidates: try store.identities().map(\.publicIdentity) + store.contacts())
++    }
++
++    private static func resolve(_ request: String, candidates: [ZwzPublicIdentity]) throws -> ZwzPublicIdentity {
++        if request.count == 64,
++           request.unicodeScalars.allSatisfy({ (48...57).contains($0.value) || (97...102).contains($0.value) }) {
++            guard let exact = candidates.first(where: { $0.fingerprint == request }) else {
++                throw CLIResolutionError.notFound(request)
++            }
++            return exact
++        }
++        let matches = candidates.filter { $0.name.caseInsensitiveCompare(request) == .orderedSame }
++        guard !matches.isEmpty else { throw CLIResolutionError.notFound(request) }
++        guard matches.count == 1 else { throw CLIResolutionError.ambiguous(request, matches.map(\.fingerprint)) }
++        return matches[0]
++    }
++
++    private static func printSignature(_ signature: ZwzSignatureVerification?, output: (String) -> Void) {
++        guard let signature else { return }
++        switch signature {
++        case .unsigned: output("Signature: unsigned")
++        case .validKnownSigner(let name, let fingerprint): output("Signature: valid known signer \(name) \(fingerprint)")
++        case .validUnknownSigner(let name, let fingerprint): output("Signature: valid unknown signer \(name) \(fingerprint)")
++        case .invalid: output("Signature: invalid")
++        }
++    }
++
++    private static func report(_ error: Error, dependencies: ZwzCLIDependencies, archive: String?) {
++        if case CLIResolutionError.ambiguous(let name, let fingerprints) = error {
++            dependencies.error("Ambiguous identity '\(name)'. Matching fingerprints:")
++            fingerprints.forEach(dependencies.error)
++            return
++        }
++        if case ZwzV3Error.noMatchingPrivateKey(let fingerprints) = error {
++            dependencies.error("No matching private key is available. Archive recipients:")
++            let info = archive.flatMap { try? dependencies.archives.recipientInfo(archive: $0) } ?? []
++            if info.isEmpty {
++                fingerprints.forEach(dependencies.error)
++            } else {
++                info.forEach { dependencies.error("\($0.name) \($0.fingerprint)") }
++            }
++            dependencies.error("zwz key restore <backup.zwzkey>")
++            return
++        }
++        dependencies.error(error.localizedDescription)
++    }
++
++    private static func archivePath(from arguments: [String]) -> String? {
++        guard let command = arguments.first?.lowercased(), ["x", "extract", "l", "list"].contains(command) else { return nil }
++        var index = 1
++        while index < arguments.count {
++            if ["-p", "--password"].contains(arguments[index]) { index += 2; continue }
++            if !arguments[index].hasPrefix("-") { return arguments[index] }
++            index += 1
++        }
++        return nil
++    }
++
++    static let usage = """
++    zwz - archive and public-key identity tool
++    Usage:
++      zwz compress [options] <source-path> [output-path]
++      zwz extract [options] <archive-path> [output-directory]
++      zwz list [options] <archive-path>
++      zwz key <operation> [options]
++
++    Commands:
++      c, compress    Create an archive
++      x, extract     Extract an archive
++      l, list        List archive contents
++      h, help        Show this help
++
++    Compression options:
++      -f, --format <zip|zwz>                    Archive format (default: zip)
++      -l, --level <none|fastest|normal|max>     Compression level (default: normal)
++      -p, --password <password>                 Password encryption
++      --no-aes                                  Disable AES-256 for supported legacy formats
++      -s, --split <positive-size>               Split size in MB or KB, for example 100MB
++      -t, --threads <nonnegative-count>         Worker count; 0 selects automatically
++      --recipient <name-or-fingerprint>         Repeat for multiple recipients; requires -f zwz
++      --sign <local-identity-or-fingerprint>    Requires -f zwz and at least one --recipient
++
++    Password encryption and --recipient/--sign public-key encryption are mutually exclusive.
++
++    Extract and list options:
++      -p, --password <password>                 Password for a password-encrypted archive
++
++    Key commands:
++      key create <name>
++      key list
++      key rename <identity-or-fingerprint> <new-name>
++      key delete [--yes] <identity-or-fingerprint>
++      key export-public <identity-or-fingerprint> <output.zwzpub>
++      key import-public [--replace] <input.zwzpub>
++      key backup <identity-or-fingerprint> <output.zwzkey>
++      key restore [--replace] <input.zwzkey>
++
++    Backup and restore passwords are read from stdin. On a TTY, input is hidden; backup asks
++    for confirmation. Backup passwords are never accepted as command arguments or environment options.
++
++    Examples:
++      zwz c -f zip -l max Documents documents.zip
++      zwz c -f zwz -s 100MB Source source.zwz
++      zwz c -f zwz --recipient Alice --recipient Bob --sign Me Source shared.zwz
++      zwz x -p secret archive.zwz extracted
++      zwz l archive.zwz
++      zwz key export-public Alice alice.zwzpub
++      zwz key backup Me me.zwzkey
++      zwz key restore me.zwzkey
++    """
++}
++
++private enum CLIResolutionError: LocalizedError {
++    case notFound(String)
++    case ambiguous(String, [String])
++
++    var errorDescription: String? {
++        switch self {
++        case .notFound(let value): return "No identity matches '\(value)'"
++        case .ambiguous(let value, _): return "Multiple identities match '\(value)'"
++        }
++    }
++}
+diff --git a/Sources/zwz/main.swift b/Sources/zwz/main.swift
+index de3d7c6..53c64ef 100644
+--- a/Sources/zwz/main.swift
++++ b/Sources/zwz/main.swift
+@@ -1,382 +1,6 @@
++import Darwin
+ import Foundation
+ import ZwzCore
+ 
+-// MARK: - Usage
+-
+-func printUsage() {
+-    print("""
+-    zwz - 统一压缩/解压工具
+-    用法: zwz <子命令> [选项] <路径> [输出路径]
+-
+-    子命令:
+-      c, compress    压缩文件或文件夹
+-      x, extract     解压压缩包
+-      l, list        列出压缩包内容（不解压）
+-      h, help        显示帮助
+-
+-    压缩选项 (compress):
+-      -f, --format <fmt>      输出格式: zip (默认) 或 zwz
+-      -l, --level <level>     压缩等级: none, fastest, normal (默认), max
+-      -p, --password <pwd>    设置密码
+-      --no-aes                不使用 AES-256 加密 (默认启用)
+-      -s, --split <size>      分卷大小, 如 100MB 或 500KB
+-      -t, --threads <n>       线程数 (0=自动检测CPU核心数, 默认0)
+-
+-    解压选项 (extract):
+-      -p, --password <pwd>    解压密码
+-
+-    通用选项:
+-      -h, --help              显示帮助
+-
+-    示例:
+-      zwz c /path/to/folder
+-      zwz c -f zwz /path/to/folder
+-      zwz c /path/to/folder /output/archive.zip
+-      zwz c -l max /path/to/file.txt
+-      zwz c -p mypassword /path/to/folder
+-      zwz c -s 100MB /path/to/largefile
+-      zwz c -t 4 /path/to/folder
+-      zwz x /path/to/archive.zip
+-      zwz x /path/to/archive.zwz /output/folder
+-      zwz x -p mypassword /path/to/archive.zip
+-      zwz l /path/to/archive.rar
+-    """)
+-}
+-
+-// MARK: - Helpers
+-
+-func formatBytes(_ bytes: Int64) -> String {
+-    let b = Double(bytes)
+-    if b < 1024 { return "\(Int64(b)) B" }
+-    if b < 1024 * 1024 { return String(format: "%.1f KB", b / 1024) }
+-    if b < 1024 * 1024 * 1024 { return String(format: "%.1f MB", b / (1024 * 1024)) }
+-    return String(format: "%.2f GB", b / (1024 * 1024 * 1024))
+-}
+-
+-func formatDate(_ date: Date) -> String {
+-    let formatter = DateFormatter()
+-    formatter.dateFormat = "yyyy-MM-dd HH:mm"
+-    return formatter.string(from: date)
+-}
+-
+-func pad(_ str: String, to width: Int) -> String {
+-    let count = str.count
+-    if count >= width { return str }
+-    return str + String(repeating: " ", count: width - count)
+-}
+-
+-func parseSplitSize(_ str: String) -> SplitVolume? {
+-    let s = str.uppercased()
+-    if s.hasSuffix("MB") {
+-        let value = Int(s.dropLast(2)) ?? 0
+-        return .megaBytes(value)
+-    } else if s.hasSuffix("KB") {
+-        let value = Int(s.dropLast(2)) ?? 0
+-        return .kiloBytes(value)
+-    }
+-    return nil
+-}
+-
+-func printProgress(_ progress: Double) {
+-    let percent = Int(progress * 100)
+-    let bar = String(repeating: "█", count: percent / 2) + String(repeating: "░", count: 50 - percent / 2)
+-    FileHandle.standardError.write("\r\u{1B}[2K [\u{1B}[32m\(bar)\u{1B}[0m] \(percent)%".data(using: .utf8)!)
+-}
+-
+-func errExit(_ msg: String, code: Int32 = 1) -> Never {
+-    FileHandle.standardError.write("❌ \(msg)\n".data(using: .utf8)!)
+-    exit(code)
+-}
+-
+-// MARK: - Main
+-
+-let api = ZwzAPI()
+-let args = CommandLine.arguments
+-
+-guard args.count >= 2 else {
+-    printUsage()
+-    exit(0)
+-}
+-
+-let subcommand = args[1].lowercased()
+-
+-switch subcommand {
+-case "h", "-h", "--help", "help":
+-    printUsage()
+-    exit(0)
+-case "c", "compress":
+-    runCompress(args: Array(args.dropFirst(2)))
+-case "x", "extract":
+-    runExtract(args: Array(args.dropFirst(2)))
+-case "l", "list":
+-    runList(args: Array(args.dropFirst(2)))
+-default:
+-    FileHandle.standardError.write("Error: Unknown command '\(subcommand)'\n".data(using: .utf8)!)
+-    printUsage()
+-    exit(1)
+-}
+-
+-// MARK: - Compress
+-
+-@MainActor func runCompress(args: [String]) {
+-    var sourcePath: String?
+-    var outputPath: String?
+-    var level: CompressionLevel = .normal
+-    var password: String?
+-    var aes256 = true
+-    var splitVolume: SplitVolume?
+-    var format: CompressionFormat = .zip
+-    var threadCount = 0
+-
+-    var i = 0
+-    while i < args.count {
+-        let arg = args[i]
+-        switch arg {
+-        case "-h", "--help":
+-            printUsage()
+-            exit(0)
+-        case "-f", "--format":
+-            guard i + 1 < args.count else { errExit("--format requires a value") }
+-            i += 1
+-            switch args[i].lowercased() {
+-            case "zip": format = .zip
+-            case "zwz": format = .zwz
+-            default: errExit("Unknown format '\(args[i])'. Use: zip, zwz")
+-            }
+-        case "-l", "--level":
+-            guard i + 1 < args.count else { errExit("--level requires a value") }
+-            i += 1
+-            switch args[i].lowercased() {
+-            case "none": level = .none
+-            case "fastest": level = .fastest
+-            case "normal": level = .normal
+-            case "max": level = .max
+-            default: errExit("Unknown compression level '\(args[i])'. Use: none, fastest, normal, max")
+-            }
+-        case "-p", "--password":
+-            guard i + 1 < args.count else { errExit("--password requires a value") }
+-            i += 1
+-            password = args[i]
+-        case "--no-aes":
+-            aes256 = false
+-        case "-s", "--split":
+-            guard i + 1 < args.count else { errExit("--split requires a value") }
+-            i += 1
+-            guard let vol = parseSplitSize(args[i]) else {
+-                errExit("Invalid split size. Use format like '100MB' or '500KB'")
+-            }
+-            splitVolume = vol
+-        case "-t", "--threads":
+-            guard i + 1 < args.count else { errExit("--threads requires a value") }
+-            i += 1
+-            guard let n = Int(args[i]), n >= 0 else {
+-                errExit("Invalid thread count. Use a non-negative integer (0=auto)")
+-            }
+-            threadCount = n
+-        default:
+-            if arg.hasPrefix("-") {
+-                errExit("Unknown option '\(arg)'")
+-            }
+-            if sourcePath == nil {
+-                sourcePath = arg
+-            } else if outputPath == nil {
+-                outputPath = arg
+-            }
+-        }
+-        i += 1
+-    }
+-
+-    guard let srcPath = sourcePath else {
+-        errExit("No source path specified")
+-    }
+-    guard FileManager.default.fileExists(atPath: srcPath) else {
+-        errExit("Source path not found: \(srcPath)")
+-    }
+-
+-    let options = CompressionOptions(
+-        level: level,
+-        password: password,
+-        aes256: aes256,
+-        splitVolume: splitVolume,
+-        format: format,
+-        threadCount: threadCount
+-    )
+-
+-    let threads = resolveThreadCount(threadCount)
+-    print("📦 正在压缩: \(srcPath)")
+-    print("   格式: \(format.displayName), 线程数: \(threads)")
+-    if let pwd = password, !pwd.isEmpty {
+-        print("🔒 加密: AES-256-GCM")
+-    }
+-    if let split = splitVolume {
+-        print("📏 分卷: \(split.displayName)")
+-    }
+-
+-    let startTime = Date()
+-    do {
+-        let finalDestPath = try api.compress(
+-            sourcePath: srcPath,
+-            destinationPath: outputPath,
+-            options: options
+-        ) { progress in
+-            printProgress(progress)
+-        }
+-        let elapsed = Date().timeIntervalSince(startTime)
+-        FileHandle.standardError.write("\n".data(using: .utf8)!)
+-
+-        if let attrs = try? FileManager.default.attributesOfItem(atPath: finalDestPath),
+-           let size = attrs[.size] as? Int64 {
+-            let sizeStr = formatBytes(size)
+-            print("✅ 压缩完成! (\(sizeStr), 耗时 \(String(format: "%.2f", elapsed))s)")
+-            print("   输出: \(finalDestPath)")
+-        } else {
+-            print("✅ 压缩完成! (耗时 \(String(format: "%.2f", elapsed))s)")
+-        }
+-
+-        // 如果有分卷，列出所有分卷
+-        if splitVolume != nil {
+-            let destURL = URL(fileURLWithPath: finalDestPath)
+-            let dirURL = destURL.deletingLastPathComponent()
+-            let baseName = destURL.deletingPathExtension().lastPathComponent
+-            if let files = try? FileManager.default.contentsOfDirectory(atPath: dirURL.path) {
+-                let splitFiles = files.filter { $0.hasPrefix(baseName) }.sorted()
+-                print("   分卷文件:")
+-                for f in splitFiles {
+-                    print("     - \(dirURL.appendingPathComponent(f).path)")
+-                }
+-            }
+-        }
+-    } catch {
+-        FileHandle.standardError.write("\n".data(using: .utf8)!)
+-        errExit("压缩失败: \(error.localizedDescription)")
+-    }
+-}
+-
+-// MARK: - Extract
+-
+-@MainActor func runExtract(args: [String]) {
+-    var archivePath: String?
+-    var destinationPath: String?
+-    var password: String?
+-
+-    var i = 0
+-    while i < args.count {
+-        let arg = args[i]
+-        switch arg {
+-        case "-h", "--help":
+-            printUsage()
+-            exit(0)
+-        case "-p", "--password":
+-            guard i + 1 < args.count else { errExit("--password requires a value") }
+-            i += 1
+-            password = args[i]
+-        default:
+-            if arg.hasPrefix("-") {
+-                errExit("Unknown option '\(arg)'")
+-            }
+-            if archivePath == nil {
+-                archivePath = arg
+-            } else if destinationPath == nil {
+-                destinationPath = arg
+-            }
+-        }
+-        i += 1
+-    }
+-
+-    guard let archPath = archivePath else {
+-        errExit("No archive path specified")
+-    }
+-    guard FileManager.default.fileExists(atPath: archPath) else {
+-        errExit("Archive not found: \(archPath)")
+-    }
+-
+-    do {
+-        let format = try api.detectFormat(archivePath: archPath)
+-        print("📂 格式: \(format.displayName)")
+-        print("📂 正在解压: \(URL(fileURLWithPath: archPath).lastPathComponent)")
+-
+-        let startTime = Date()
+-        let destPath = try api.extract(
+-            archivePath: archPath,
+-            destinationPath: destinationPath,
+-            password: password
+-        ) { progress in
+-            printProgress(progress)
+-        }
+-        let elapsed = Date().timeIntervalSince(startTime)
+-        FileHandle.standardError.write("\n".data(using: .utf8)!)
+-
+-        print("✅ 解压完成! (耗时 \(String(format: "%.2f", elapsed))s)")
+-        print("   输出: \(destPath)")
+-    } catch let error as ZwzError {
+-        switch error {
+-        case .passwordRequired:
+-            errExit("此压缩包需要密码. 请使用 -p 参数提供密码.")
+-        case .wrongPassword:
+-            errExit("密码错误. 请检查密码后重试.")
+-        default:
+-            errExit("解压失败: \(error.localizedDescription)")
+-        }
+-    } catch {
+-        errExit("解压失败: \(error.localizedDescription)")
+-    }
+-}
+-
+-// MARK: - List
+-
+-@MainActor func runList(args: [String]) {
+-    var archivePath: String?
+-
+-    var i = 0
+-    while i < args.count {
+-        let arg = args[i]
+-        switch arg {
+-        case "-h", "--help":
+-            printUsage()
+-            exit(0)
+-        default:
+-            if arg.hasPrefix("-") {
+-                errExit("Unknown option '\(arg)'")
+-            }
+-            if archivePath == nil {
+-                archivePath = arg
+-            }
+-        }
+-        i += 1
+-    }
+-
+-    guard let archPath = archivePath else {
+-        errExit("No archive path specified")
+-    }
+-    guard FileManager.default.fileExists(atPath: archPath) else {
+-        errExit("Archive not found: \(archPath)")
+-    }
+-
+-    print("📋 压缩包内容: \(URL(fileURLWithPath: archPath).lastPathComponent)")
+-    print(String(repeating: "─", count: 60))
+-
+-    do {
+-        let entries = try api.list(archivePath: archPath)
+-        if entries.isEmpty {
+-            print("  (空)")
+-        } else {
+-            print("  \(pad("名称", to: 40)) \(pad("大小", to: 10))  修改日期")
+-            print(String(repeating: "─", count: 60))
+-
+-            for entry in entries {
+-                let sizeStr = formatBytes(entry.size)
+-                let dateStr = entry.modifiedDate != nil
+-                    ? formatDate(entry.modifiedDate!)
+-                    : "-"
+-                let prefix = entry.isDirectory ? "📁" : "📄"
+-                print("  \(prefix) \(pad(entry.name, to: 38)) \(pad(sizeStr, to: 10))  \(dateStr)")
+-            }
+-
+-            print(String(repeating: "─", count: 60))
+-            let totalSize = entries.reduce(Int64(0)) { $0 + $1.size }
+-            print("  共 \(entries.count) 个项目, 总大小: \(formatBytes(totalSize))")
+-        }
+-    } catch {
+-        errExit("读取失败: \(error.localizedDescription)")
+-    }
+-}
++let dependencies = ZwzCLIDependencies.production()
++exit(ZwzCLI.run(arguments: Array(CommandLine.arguments.dropFirst()), dependencies: dependencies))
+diff --git a/Tests/ZwzCLITests/CLIArgumentsTests.swift b/Tests/ZwzCLITests/CLIArgumentsTests.swift
+new file mode 100644
+index 0000000..460878a
+--- /dev/null
++++ b/Tests/ZwzCLITests/CLIArgumentsTests.swift
+@@ -0,0 +1,69 @@
++import XCTest
++@testable import zwz
++
++final class CLIArgumentsTests: XCTestCase {
++    func testParsesKeyCommands() throws {
++        XCTAssertEqual(try CLIArguments.parse(["key", "create", "Alice"]), .key(.create(name: "Alice")))
++        XCTAssertEqual(try CLIArguments.parse(["key", "list"]), .key(.list))
++        XCTAssertEqual(try CLIArguments.parse(["key", "rename", "Alice", "Alicia"]), .key(.rename(identity: "Alice", newName: "Alicia")))
++        XCTAssertEqual(try CLIArguments.parse(["key", "delete", "--yes", "Alice"]), .key(.delete(identity: "Alice", confirmed: true)))
++        XCTAssertEqual(try CLIArguments.parse(["key", "export-public", "Alice", "alice.zwzpub"]), .key(.exportPublic(identity: "Alice", output: "alice.zwzpub")))
++        XCTAssertEqual(try CLIArguments.parse(["key", "import-public", "--replace", "alice.zwzpub"]), .key(.importPublic(input: "alice.zwzpub", replace: true)))
++        XCTAssertEqual(try CLIArguments.parse(["key", "backup", "Alice", "alice.zwzkey"]), .key(.backup(identity: "Alice", output: "alice.zwzkey")))
++        XCTAssertEqual(try CLIArguments.parse(["key", "restore", "--replace", "alice.zwzkey"]), .key(.restore(input: "alice.zwzkey", replace: true)))
++    }
++
++    func testCompressParsesRecipientsSignerAndLegacyOptions() throws {
++        let command = try CLIArguments.parse([
++            "compress", "-f", "zwz", "--recipient", "Alice", "--recipient", "Bob",
++            "--sign", "Me", "-l", "max", "-s", "500KB", "-t", "4", "input", "output.zwz"
++        ])
++        guard case .compress(let options) = command else { return XCTFail("wrong command") }
++        XCTAssertEqual(options.recipients, ["Alice", "Bob"])
++        XCTAssertEqual(options.signer, "Me")
++        XCTAssertEqual(options.source, "input")
++        XCTAssertEqual(options.output, "output.zwz")
++        XCTAssertEqual(options.threadCount, 4)
++    }
++
++    func testAliasesRemainSupported() throws {
++        guard case .compress = try CLIArguments.parse(["c", "input"]) else { return XCTFail() }
++        guard case .extract = try CLIArguments.parse(["x", "archive.zip"]) else { return XCTFail() }
++        guard case .list = try CLIArguments.parse(["l", "archive.zip"]) else { return XCTFail() }
++        XCTAssertEqual(try CLIArguments.parse(["h"]), .help)
++        XCTAssertEqual(try CLIArguments.parse(["compress", "--help"]), .help)
++    }
++
++    func testRejectsInvalidCompressionArguments() {
++        assertInvalid(["compress", "-p", "secret", "--recipient", "Alice", "input"])
++        assertInvalid(["compress", "--sign", "Me", "input"])
++        assertInvalid(["compress", "--recipient", "Alice", "input"])
++        assertInvalid(["compress", "-f", "zip", "--recipient", "Alice", "input"])
++        assertInvalid(["compress", "-f", "zwz", "--recipient"])
++        assertInvalid(["compress", "-f", "zip", "--format", "zwz", "input"])
++        assertInvalid(["compress", "-p", "one", "-p", "two", "input"])
++        assertInvalid(["compress", "-s", "0MB", "input"])
++        assertInvalid(["compress", "-s", "-1MB", "input"])
++        assertInvalid(["compress", "-s", "9223372036854775807MB", "input"])
++        assertInvalid(["compress", "-t", "-1", "input"])
++        assertInvalid(["compress", "input", "output", "extra"])
++        assertInvalid(["compress", "--unknown", "input"])
++    }
++
++    func testRejectsInvalidKeyAndArchiveArguments() {
++        assertInvalid(["key", "list", "extra"])
++        assertInvalid(["key", "delete", "--yes", "--yes", "Alice"])
++        assertInvalid(["key", "import-public", "--replace", "--replace", "file"])
++        assertInvalid(["key", "backup", "--password", "secret", "Alice", "file"])
++        assertInvalid(["key", "restore", "--password-file", "p", "file"])
++        assertInvalid(["key", "create", "--unknown"])
++        assertInvalid(["key", "rename", "Alice", "--unknown"])
++        assertInvalid(["extract", "-p"])
++        assertInvalid(["extract", "a", "b", "c"])
++        assertInvalid(["list", "-p", "one", "--password", "two", "a"])
++    }
++
++    private func assertInvalid(_ arguments: [String], file: StaticString = #filePath, line: UInt = #line) {
++        XCTAssertThrowsError(try CLIArguments.parse(arguments), file: file, line: line)
++    }
++}
+diff --git a/Tests/ZwzCLITests/ZwzCLIRunnerTests.swift b/Tests/ZwzCLITests/ZwzCLIRunnerTests.swift
+new file mode 100644
+index 0000000..4483f03
+--- /dev/null
++++ b/Tests/ZwzCLITests/ZwzCLIRunnerTests.swift
+@@ -0,0 +1,311 @@
++import Foundation
++import XCTest
++import ZwzCore
++@testable import zwz
++
++final class ZwzCLIRunnerTests: XCTestCase {
++    func testCreateListRenameAndDeleteConfirmation() throws {
++        let harness = Harness()
++        XCTAssertEqual(harness.run(["key", "create", "Alice"]), 0)
++        XCTAssertEqual(harness.run(["key", "list"]), 0)
++        XCTAssertTrue(harness.output.text.contains("Alice"))
++
++        XCTAssertEqual(harness.run(["key", "rename", "alice", "Alicia"]), 0)
++        harness.confirmations.values = ["no"]
++        XCTAssertEqual(harness.run(["key", "delete", "Alicia"]), 1)
++        XCTAssertEqual(try harness.store.identities().count, 1)
++        harness.confirmations.values = ["yes"]
++        XCTAssertEqual(harness.run(["key", "delete", "Alicia"]), 0)
++        XCTAssertTrue(try harness.store.identities().isEmpty)
++    }
++
++    func testAmbiguousNamesPrintEveryFingerprint() throws {
++        let harness = Harness()
++        let first = try harness.store.createIdentity(named: "Same")
++        let second = try harness.store.createIdentity(named: "same")
++        XCTAssertEqual(harness.run(["key", "rename", "SAME", "Other"]), 1)
++        XCTAssertTrue(harness.errors.text.contains(first.fingerprint))
++        XCTAssertTrue(harness.errors.text.contains(second.fingerprint))
++    }
++
++    func testContactsResolveAsRecipientsSignerMustBeLocalAndDuplicatesCollapse() throws {
++        let remote = InMemoryZwzIdentityStore()
++        let contact = try remote.createIdentity(named: "Remote")
++        let publicData = try remote.exportPublicIdentity(fingerprint: contact.fingerprint)
++        let harness = Harness()
++        _ = try harness.store.importPublicIdentity(publicData, conflict: .requireConfirmation)
++        let source = try harness.makeFile("source.txt", contents: "data")
++
++        XCTAssertEqual(harness.run(["compress", "-f", "zwz", "--recipient", "Remote", "--recipient", contact.fingerprint, source.path]), 0)
++        guard case .publicKey(let recipients, _) = try XCTUnwrap(harness.archives.lastOptions).encryption else {
++            return XCTFail("expected public-key mode")
++        }
++        XCTAssertEqual(recipients.map(\.fingerprint), [contact.fingerprint])
++
++        XCTAssertEqual(harness.run(["compress", "-f", "zwz", "--recipient", "Remote", "--sign", "Remote", source.path]), 1)
++        XCTAssertEqual(harness.archives.compressCalls, 1)
++    }
++
++    func testPublicExportImportConflictAndEncryptedBackupRestore() throws {
++        let harness = Harness(passwords: ["strong backup password", "strong backup password"])
++        let identity = try harness.store.createIdentity(named: "Alice")
++        let publicURL = harness.root.appendingPathComponent("alice.zwzpub")
++        let backupURL = harness.root.appendingPathComponent("alice.zwzkey")
++
++        XCTAssertEqual(harness.run(["key", "export-public", identity.fingerprint, publicURL.path]), 0)
++        XCTAssertTrue(FileManager.default.fileExists(atPath: publicURL.path))
++        XCTAssertEqual(harness.run(["key", "export-public", identity.fingerprint, publicURL.path]), 1)
++
++        XCTAssertEqual(harness.run(["key", "backup", "Alice", backupURL.path]), 0)
++        XCTAssertFalse(harness.output.text.contains("strong backup password"))
++        XCTAssertFalse(harness.errors.text.contains("strong backup password"))
++
++        let restore = Harness(passwords: ["strong backup password"])
++        defer { restore.cleanup() }
++        XCTAssertEqual(restore.run(["key", "restore", backupURL.path]), 0)
++        XCTAssertEqual(try restore.store.identities().first?.fingerprint, identity.fingerprint)
++
++        let contactHarness = Harness()
++        defer { contactHarness.cleanup() }
++        XCTAssertEqual(contactHarness.run(["key", "import-public", publicURL.path]), 0)
++        XCTAssertEqual(contactHarness.run(["key", "import-public", publicURL.path]), 1)
++        XCTAssertEqual(contactHarness.run(["key", "import-public", "--replace", publicURL.path]), 0)
++    }
++
++    func testExistingExportAndBackupOutputsFailBeforeEncodingOrPrivateKeyAccess() throws {
++        let backing = InMemoryZwzIdentityStore()
++        _ = try backing.createIdentity(named: "Alice")
++        let counting = CountingIdentityStore(backing: backing)
++        let harness = Harness(passwords: ["must not be read"], store: backing, identityStore: counting)
++        let output = harness.root.appendingPathComponent("existing")
++        try Data("keep".utf8).write(to: output)
++
++        XCTAssertEqual(harness.run(["key", "export-public", "Alice", output.path]), 1)
++        XCTAssertEqual(harness.run(["key", "backup", "Alice", output.path]), 1)
++        XCTAssertEqual(counting.exportPublicCalls, 0)
++        XCTAssertEqual(counting.exportBackupCalls, 0)
++        XCTAssertEqual(harness.passwords.values, ["must not be read"])
++        XCTAssertEqual(try Data(contentsOf: output), Data("keep".utf8))
++    }
++
++    func testBackupRejectsEmptyAndMismatchedPasswordsWithoutPartialOutput() throws {
++        let mismatch = Harness(passwords: ["first password", "second password"])
++        _ = try mismatch.store.createIdentity(named: "Alice")
++        let output = mismatch.root.appendingPathComponent("backup.zwzkey")
++        XCTAssertEqual(mismatch.run(["key", "backup", "Alice", output.path]), 1)
++        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
++        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: mismatch.root.path).contains { $0.hasSuffix(".tmp") })
++
++        let empty = Harness(passwords: [""])
++        defer { empty.cleanup() }
++        _ = try empty.store.createIdentity(named: "Alice")
++        XCTAssertEqual(empty.run(["key", "backup", "Alice", empty.root.appendingPathComponent("b").path]), 1)
++    }
++
++    func testTerminalSecretReaderRestoresStateOnSuccessAndEOF() throws {
++        let session = FakeTerminalSession(lines: ["secret", nil])
++        let reader = TerminalSecretReader(session: session, output: { _ in })
++        XCTAssertEqual(try reader.read(prompt: "Password: "), "secret")
++        XCTAssertEqual(try reader.read(prompt: "Password: "), "")
++        XCTAssertEqual(session.disableCount, 2)
++        XCTAssertEqual(session.restoreCount, 2)
++    }
++
++    func testMissingKeyGuidanceAndConcreteErrorsRemainDistinct() {
++        let harness = Harness()
++        let fingerprint = String(repeating: "a", count: 64)
++        harness.archives.recipientLabels = [ZwzRecipientInfo(name: "Archive Alice", fingerprint: fingerprint)]
++        harness.archives.failure = ZwzV3Error.noMatchingPrivateKey([fingerprint])
++        XCTAssertEqual(harness.run(["list", "archive.zwz"]), 1)
++        XCTAssertTrue(harness.errors.text.contains("Archive Alice \(fingerprint)"))
++        XCTAssertTrue(harness.errors.text.contains("zwz key restore <backup.zwzkey>"))
++
++        for error in [ZwzV3Error.userAuthenticationCancelled, .keychainFailure(-50), .invalidSignature, .authenticationFailed] {
++            harness.errors.values = []
++            harness.archives.failure = error
++            XCTAssertEqual(harness.run(["list", "archive.zwz"]), 1)
++            XCTAssertEqual(harness.errors.values.last, error.localizedDescription)
++        }
++    }
++
++    func testHelpDocumentsLegacyAndPublicKeyWorkflows() {
++        let harness = Harness()
++        XCTAssertEqual(harness.run(["help"]), 0)
++        let help = harness.output.text
++        for expected in [
++            "compress [options] <source-path> [output-path]",
++            "extract [options] <archive-path> [output-directory]",
++            "c, compress", "x, extract", "l, list", "h, help",
++            "-f, --format <zip|zwz>",
++            "-l, --level <none|fastest|normal|max>",
++            "-p, --password <password>", "--no-aes",
++            "-s, --split <positive-size>", "MB or KB",
++            "-t, --threads <nonnegative-count>",
++            "key create", "key list", "key rename", "key delete",
++            "key export-public", "key import-public", "key backup", "key restore",
++            "--recipient <name-or-fingerprint>", "Repeat for multiple recipients; requires -f zwz",
++            "--sign <local-identity-or-fingerprint>",
++            "Requires -f zwz and at least one --recipient",
++            "mutually exclusive", "read from stdin", "On a TTY, input is hidden",
++            "never accepted as command arguments or environment options",
++            "zwz c -f zwz --recipient Alice --recipient Bob --sign Me Source shared.zwz"
++        ] {
++            XCTAssertTrue(help.contains(expected), "help is missing: \(expected)")
++        }
++    }
++
++    func testActualUnsignedAndSignedMultiRecipientV3RoundTrips() throws {
++        let store = InMemoryZwzIdentityStore()
++        _ = try store.createIdentity(named: "Alice")
++        _ = try store.createIdentity(named: "Bob")
++        _ = try store.createIdentity(named: "Sender")
++        let harness = Harness(store: store, archives: ZwzAPIArchiveOperations())
++        let sourceRoot = harness.root.appendingPathComponent("source", isDirectory: true)
++        try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
++        let source = sourceRoot.appendingPathComponent("payload.txt")
++        try "public-key cli round trip".write(to: source, atomically: true, encoding: .utf8)
++
++        for (name, signing) in [("unsigned.zwz", false), ("signed.zwz", true)] {
++            let archive = harness.root.appendingPathComponent(name)
++            var arguments = ["compress", "-f", "zwz", "--recipient", "Alice", "--recipient", "Bob"]
++            if signing { arguments += ["--sign", "Sender"] }
++            arguments += [sourceRoot.path, archive.path]
++            XCTAssertEqual(harness.run(arguments), 0, harness.errors.text)
++            XCTAssertEqual(harness.run(["list", archive.path]), 0, harness.errors.text)
++            let destination = harness.root.appendingPathComponent(name + "-out")
++            XCTAssertEqual(harness.run(["extract", archive.path, destination.path]), 0, harness.errors.text)
++            XCTAssertEqual(try String(contentsOf: destination.appendingPathComponent("payload.txt"), encoding: .utf8), "public-key cli round trip")
++            XCTAssertTrue(harness.output.text.contains(signing ? "Signature: valid known signer Sender" : "Signature: unsigned"))
++        }
++    }
++
++    func testActualLegacyZIPAndV2CommandsStillRun() throws {
++        let harness = Harness(archives: ZwzAPIArchiveOperations())
++        let sourceRoot = harness.root.appendingPathComponent("legacy-source", isDirectory: true)
++        try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
++        try "legacy".write(to: sourceRoot.appendingPathComponent("file.txt"), atomically: true, encoding: .utf8)
++
++        for (name, formatArguments) in [("legacy.zip", [String]()), ("legacy.zwz", ["-f", "zwz"])] {
++            let archive = harness.root.appendingPathComponent(name)
++            XCTAssertEqual(harness.run(["c"] + formatArguments + [sourceRoot.path, archive.path]), 0, harness.errors.text)
++            XCTAssertEqual(harness.run(["l", archive.path]), 0, harness.errors.text)
++            let destination = harness.root.appendingPathComponent(name + "-out")
++            XCTAssertEqual(harness.run(["x", archive.path, destination.path]), 0, harness.errors.text)
++            XCTAssertEqual(try String(contentsOf: destination.appendingPathComponent("file.txt"), encoding: .utf8), "legacy")
++        }
++    }
++}
++
++private final class Harness {
++    let root: URL
++    let store: InMemoryZwzIdentityStore
++    let archives: FakeArchiveOperations
++    let output = StringBox()
++    let errors = StringBox()
++    let passwords: ValueBox<String>
++    let confirmations = ValueBox<String>()
++    private let archiveOperations: any ZwzCLIArchiveOperations
++    private let identityStore: any ZwzIdentityStore
++
++    init(passwords: [String] = [], store: InMemoryZwzIdentityStore = InMemoryZwzIdentityStore(), identityStore: (any ZwzIdentityStore)? = nil, archives: (any ZwzCLIArchiveOperations)? = nil) {
++        root = FileManager.default.temporaryDirectory.appendingPathComponent("ZwzCLITests-\(UUID().uuidString)", isDirectory: true)
++        try! FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
++        self.store = store
++        self.identityStore = identityStore ?? store
++        let fake = archives as? FakeArchiveOperations ?? FakeArchiveOperations()
++        self.archives = fake
++        archiveOperations = archives ?? fake
++        self.passwords = ValueBox(passwords)
++    }
++
++    deinit { cleanup() }
++    func cleanup() { try? FileManager.default.removeItem(at: root) }
++
++    func run(_ arguments: [String]) -> Int32 {
++        ZwzCLI.run(arguments: arguments, dependencies: ZwzCLIDependencies(
++            output: { self.output.values.append($0) },
++            error: { self.errors.values.append($0) },
++            passwordReader: { _ in self.passwords.next() ?? "" },
++            confirmationReader: { _ in self.confirmations.next() },
++            identityStore: identityStore,
++            archives: archiveOperations,
++            fileManager: .default
++        ))
++    }
++
++    func makeFile(_ name: String, contents: String) throws -> URL {
++        let url = root.appendingPathComponent(name)
++        try contents.write(to: url, atomically: true, encoding: .utf8)
++        return url
++    }
++}
++
++private final class CountingIdentityStore: ZwzIdentityStore, @unchecked Sendable {
++    let backing: InMemoryZwzIdentityStore
++    var exportPublicCalls = 0
++    var exportBackupCalls = 0
++    init(backing: InMemoryZwzIdentityStore) { self.backing = backing }
++    func createIdentity(named name: String) throws -> ZwzIdentityMetadata { try backing.createIdentity(named: name) }
++    func identities() throws -> [ZwzIdentityMetadata] { try backing.identities() }
++    func contacts() throws -> [ZwzPublicIdentity] { try backing.contacts() }
++    func importPublicIdentity(_ data: Data, conflict: ZwzIdentityConflictPolicy) throws -> ZwzPublicIdentity { try backing.importPublicIdentity(data, conflict: conflict) }
++    func exportPublicIdentity(fingerprint: String) throws -> Data { exportPublicCalls += 1; return try backing.exportPublicIdentity(fingerprint: fingerprint) }
++    func exportPrivateBackup(fingerprint: String, password: String) throws -> Data { exportBackupCalls += 1; return try backing.exportPrivateBackup(fingerprint: fingerprint, password: password) }
++    func importPrivateBackup(_ data: Data, password: String, conflict: ZwzIdentityConflictPolicy) throws -> ZwzIdentityMetadata { try backing.importPrivateBackup(data, password: password, conflict: conflict) }
++    func rename(fingerprint: String, to name: String) throws { try backing.rename(fingerprint: fingerprint, to: name) }
++    func delete(fingerprint: String) throws { try backing.delete(fingerprint: fingerprint) }
++    func agreementPrivateKey(fingerprint: String, reason: String) throws -> Data { try backing.agreementPrivateKey(fingerprint: fingerprint, reason: reason) }
++    func signingPrivateKey(fingerprint: String, reason: String) throws -> Data { try backing.signingPrivateKey(fingerprint: fingerprint, reason: reason) }
++    func isKnownSigningKey(fingerprint: String, signingPublicKey: Data) -> Bool { backing.isKnownSigningKey(fingerprint: fingerprint, signingPublicKey: signingPublicKey) }
++}
++
++private final class StringBox {
++    var values: [String] = []
++    var text: String { values.joined(separator: "\n") }
++}
++
++private final class ValueBox<Value> {
++    var values: [Value]
++    init(_ values: [Value] = []) { self.values = values }
++    func next() -> Value? { values.isEmpty ? nil : values.removeFirst() }
++}
++
++private final class FakeArchiveOperations: ZwzCLIArchiveOperations {
++    var failure: Error?
++    var recipientLabels: [ZwzRecipientInfo] = []
++    var lastOptions: CompressionOptions?
++    var compressCalls = 0
++
++    func compress(source: String, destination: String?, options: CompressionOptions, keyProvider: ZwzPrivateKeyProvider?) throws -> String {
++        if let failure { throw failure }
++        compressCalls += 1
++        lastOptions = options
++        return destination ?? source + ".zip"
++    }
++
++    func extract(archive: String, destination: String?, password: String?, keyProvider: ZwzPrivateKeyProvider?) throws -> ZwzExtractionResult {
++        if let failure { throw failure }
++        return ZwzExtractionResult(destinationPath: destination ?? "out", version: nil, securityInfo: nil)
++    }
++
++    func list(archive: String, password: String?, keyProvider: ZwzPrivateKeyProvider?) throws -> ZwzArchiveListing {
++        if let failure { throw failure }
++        return ZwzArchiveListing(entries: [], version: nil, securityInfo: nil)
++    }
++
++    func recipientInfo(archive: String) throws -> [ZwzRecipientInfo] { recipientLabels }
++}
++
++private final class FakeTerminalSession: TerminalSession {
++    let isTerminal = true
++    var lines: [String?]
++    var disableCount = 0
++    var restoreCount = 0
++
++    init(lines: [String?]) { self.lines = lines }
++    func disableEcho() throws -> () -> Void {
++        disableCount += 1
++        return { self.restoreCount += 1 }
++    }
++    func readLine() -> String? { lines.isEmpty ? nil : lines.removeFirst() }
++}
+diff --git a/Tests/ZwzCoreTests/ZWZV3/ZwzV3RecipientInfoTests.swift b/Tests/ZwzCoreTests/ZWZV3/ZwzV3RecipientInfoTests.swift
+new file mode 100644
+index 0000000..0f6144b
+--- /dev/null
++++ b/Tests/ZwzCoreTests/ZWZV3/ZwzV3RecipientInfoTests.swift
+@@ -0,0 +1,96 @@
++import Foundation
++import XCTest
++@testable import ZwzCore
++
++final class ZwzV3RecipientInfoTests: XCTestCase {
++    func testRecipientInfoReadsPublicLabelsWithoutPrivateKey() throws {
++        let fixture = try makeFixture(split: false)
++        defer { fixture.cleanup() }
++
++        XCTAssertEqual(
++            try ZwzV3Extractor().recipientInfo(archivePath: fixture.finalArchive.path),
++            [fixture.info]
++        )
++    }
++
++    func testRecipientInfoReadsSplitArchiveFromFinalZwzVolume() throws {
++        let fixture = try makeFixture(split: true)
++        defer { fixture.cleanup() }
++        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent("archive.z00").path))
++
++        XCTAssertEqual(
++            try ZwzV3Extractor().recipientInfo(archivePath: fixture.finalArchive.path),
++            [fixture.info]
++        )
++    }
++
++    func testRecipientInfoFailsStructurallyWhenSplitVolumeIsMissing() throws {
++        let fixture = try makeFixture(split: true)
++        defer { fixture.cleanup() }
++        try FileManager.default.removeItem(at: fixture.root.appendingPathComponent("archive.z00"))
++
++        XCTAssertThrowsError(try ZwzV3Extractor().recipientInfo(archivePath: fixture.finalArchive.path)) { error in
++            guard case ZwzV2Error.missingVolume(0) = error else {
++                return XCTFail("expected missingVolume(0), got \(error)")
++            }
++        }
++    }
++
++    func testRecipientInfoRejectsTruncatedArchive() throws {
++        let fixture = try makeFixture(split: false)
++        defer { fixture.cleanup() }
++        try Data([0x5A, 0x57]).write(to: fixture.finalArchive)
++
++        XCTAssertThrowsError(try ZwzV3Extractor().recipientInfo(archivePath: fixture.finalArchive.path)) { error in
++            guard case ZwzV3Error.malformedArchive = error else {
++                return XCTFail("expected malformedArchive, got \(error)")
++            }
++        }
++    }
++
++    private func makeFixture(split: Bool) throws -> RecipientFixture {
++        let root = FileManager.default.temporaryDirectory
++            .appendingPathComponent("ZwzV3RecipientInfoTests-\(UUID().uuidString)", isDirectory: true)
++        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
++        do {
++            let sourceRoot = root.appendingPathComponent("source", isDirectory: true)
++            try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
++            let payload = Data((0..<4_096).map { UInt8($0 % 251) })
++            try payload.write(to: sourceRoot.appendingPathComponent("payload.bin"))
++            let archive = root.appendingPathComponent("archive.zwz")
++            let recipient = ZwzV3IdentityFixture.make(name: "Untrusted Label")
++            try ZwzV3Compressor().compress(
++                sourcePath: sourceRoot.path,
++                destinationPath: archive.path,
++                options: CompressionOptions(
++                    level: .none,
++                    encryption: .publicKey(recipients: [recipient.recipient], signer: nil),
++                    splitVolume: split ? .kiloBytes(1) : nil,
++                    format: .zwz
++                ),
++                keyProvider: nil,
++                progress: nil,
++                cancellationToken: nil
++            )
++            return RecipientFixture(
++                root: root,
++                finalArchive: archive,
++                info: ZwzRecipientInfo(
++                    name: "Untrusted Label",
++                    fingerprint: recipient.recipient.fingerprint
++                )
++            )
++        } catch {
++            try? FileManager.default.removeItem(at: root)
++            throw error
++        }
++    }
++}
++
++private struct RecipientFixture {
++    let root: URL
++    let finalArchive: URL
++    let info: ZwzRecipientInfo
++
++    func cleanup() { try? FileManager.default.removeItem(at: root) }
++}

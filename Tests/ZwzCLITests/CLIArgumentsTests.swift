@@ -32,6 +32,7 @@ final class CLIArgumentsTests: XCTestCase {
         guard case .list = try CLIArguments.parse(["l", "archive.zip"]) else { return XCTFail() }
         XCTAssertEqual(try CLIArguments.parse(["h"]), .help)
         XCTAssertEqual(try CLIArguments.parse(["compress", "--help"]), .help)
+        XCTAssertEqual(try CLIArguments.parse(["rename", "--help"]), .help)
     }
 
     func testRejectsInvalidCompressionArguments() {

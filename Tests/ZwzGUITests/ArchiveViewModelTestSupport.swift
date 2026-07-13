@@ -139,6 +139,7 @@ final class ArchiveWorkflowSpy: ArchiveWorkflowClient, @unchecked Sendable {
     private var operationStoreIDs: [Operation: [ObjectIdentifier]] = [:]
     private var queuedListResults: [Result<ZwzArchiveListing, Error>] = []
     private var queuedExtractResults: [Result<ZwzExtractionResult, Error>] = []
+    private var queuedCompressionResults: [Result<String, Error>] = []
     private var _compressionRecords: [CompressionRecord] = []
 
     var detectedFormat: ExtractionFormat = .zwz
@@ -167,6 +168,12 @@ final class ArchiveWorkflowSpy: ArchiveWorkflowClient, @unchecked Sendable {
     func enqueueExtract(_ result: Result<ZwzExtractionResult, Error>) {
         lock.lock()
         queuedExtractResults.append(result)
+        lock.unlock()
+    }
+
+    func enqueueCompression(_ result: Result<String, Error>) {
+        lock.lock()
+        queuedCompressionResults.append(result)
         lock.unlock()
     }
 
@@ -219,9 +226,12 @@ final class ArchiveWorkflowSpy: ArchiveWorkflowClient, @unchecked Sendable {
             options: options,
             storeID: ObjectIdentifier(identityStore as AnyObject)
         ))
+        let result = queuedCompressionResults.isEmpty
+            ? .success(destinationPath ?? sourcePath + ".zwz")
+            : queuedCompressionResults.removeFirst()
         lock.unlock()
         progress?(1)
-        return destinationPath ?? sourcePath + ".zwz"
+        return try result.get()
     }
 
     func extract(

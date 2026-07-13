@@ -1,0 +1,1891 @@
+diff --git a/Sources/ZwzCore/ZWZV3/MacKeychainIdentityStore.swift b/Sources/ZwzCore/ZWZV3/MacKeychainIdentityStore.swift
+new file mode 100644
+index 0000000..13137ce
+--- /dev/null
++++ b/Sources/ZwzCore/ZWZV3/MacKeychainIdentityStore.swift
+@@ -0,0 +1,524 @@
++import CryptoKit
++import Foundation
++import LocalAuthentication
++import Security
++
++enum ZwzKeychainItemKind: String, Hashable, Sendable {
++    case identity = "com.zwz.identity.metadata"
++    case contact = "com.zwz.contact.metadata"
++    case agreement = "com.zwz.identity.agreement-private"
++    case signing = "com.zwz.identity.signing-private"
++
++    var isPrivate: Bool { self == .agreement || self == .signing }
++}
++
++struct ZwzKeychainReadResult: Sendable {
++    let status: OSStatus
++    let items: [Data]
++}
++
++protocol ZwzKeychainBackend: AnyObject, Sendable {
++    func add(kind: ZwzKeychainItemKind, fingerprint: String, data: Data) -> OSStatus
++    func update(kind: ZwzKeychainItemKind, fingerprint: String, data: Data) -> OSStatus
++    func read(
++        kind: ZwzKeychainItemKind,
++        fingerprint: String,
++        authenticationReason: String?
++    ) -> ZwzKeychainReadResult
++    func readAll(kind: ZwzKeychainItemKind) -> ZwzKeychainReadResult
++    func delete(kind: ZwzKeychainItemKind, fingerprint: String) -> OSStatus
++}
++
++final class SecurityZwzKeychainBackend: ZwzKeychainBackend, @unchecked Sendable {
++    private let accessGroup: String?
++
++    init(accessGroup: String?) {
++        self.accessGroup = accessGroup
++    }
++
++    func add(kind: ZwzKeychainItemKind, fingerprint: String, data: Data) -> OSStatus {
++        var query = baseQuery(kind: kind, fingerprint: fingerprint)
++        query[kSecValueData] = data
++        if kind.isPrivate {
++            var accessError: Unmanaged<CFError>?
++            guard let access = SecAccessControlCreateWithFlags(
++                nil,
++                kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
++                .userPresence,
++                &accessError
++            ) else { return errSecParam }
++            query[kSecAttrAccessControl] = access
++        } else {
++            query[kSecAttrAccessible] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
++        }
++        return SecItemAdd(query as CFDictionary, nil)
++    }
++
++    func update(kind: ZwzKeychainItemKind, fingerprint: String, data: Data) -> OSStatus {
++        guard !kind.isPrivate else { return errSecParam }
++        return SecItemUpdate(
++            baseQuery(kind: kind, fingerprint: fingerprint) as CFDictionary,
++            [kSecValueData: data] as CFDictionary
++        )
++    }
++
++    func read(
++        kind: ZwzKeychainItemKind,
++        fingerprint: String,
++        authenticationReason: String?
++    ) -> ZwzKeychainReadResult {
++        var query = baseQuery(kind: kind, fingerprint: fingerprint)
++        query[kSecReturnData] = true
++        query[kSecMatchLimit] = kSecMatchLimitOne
++        if kind.isPrivate {
++            guard let authenticationReason, !authenticationReason.isEmpty else {
++                return ZwzKeychainReadResult(status: errSecParam, items: [])
++            }
++            let context = LAContext()
++            context.localizedReason = authenticationReason
++            query[kSecUseAuthenticationContext] = context
++        }
++        var item: CFTypeRef?
++        let status = SecItemCopyMatching(query as CFDictionary, &item)
++        guard status == errSecSuccess, let data = item as? Data else {
++            return ZwzKeychainReadResult(
++                status: status == errSecSuccess ? errSecDecode : status,
++                items: []
++            )
++        }
++        return ZwzKeychainReadResult(status: status, items: [data])
++    }
++
++    func readAll(kind: ZwzKeychainItemKind) -> ZwzKeychainReadResult {
++        guard !kind.isPrivate else {
++            return ZwzKeychainReadResult(status: errSecParam, items: [])
++        }
++        var query = baseQuery(kind: kind, fingerprint: nil)
++        query[kSecReturnData] = true
++        query[kSecMatchLimit] = kSecMatchLimitAll
++        var item: CFTypeRef?
++        let status = SecItemCopyMatching(query as CFDictionary, &item)
++        guard status == errSecSuccess else {
++            return ZwzKeychainReadResult(status: status, items: [])
++        }
++        if let values = item as? [Data] {
++            return ZwzKeychainReadResult(status: status, items: values)
++        }
++        if let value = item as? Data {
++            return ZwzKeychainReadResult(status: status, items: [value])
++        }
++        return ZwzKeychainReadResult(status: errSecDecode, items: [])
++    }
++
++    func delete(kind: ZwzKeychainItemKind, fingerprint: String) -> OSStatus {
++        SecItemDelete(baseQuery(kind: kind, fingerprint: fingerprint) as CFDictionary)
++    }
++
++    private func baseQuery(
++        kind: ZwzKeychainItemKind,
++        fingerprint: String?
++    ) -> [CFString: Any] {
++        var query: [CFString: Any] = [
++            kSecClass: kSecClassGenericPassword,
++            kSecAttrService: kind.rawValue
++        ]
++        if let fingerprint { query[kSecAttrAccount] = fingerprint }
++        if let accessGroup { query[kSecAttrAccessGroup] = accessGroup }
++        return query
++    }
++}
++
++/// User-presence prompts, password fallback, and cancellation mapping require a signed app.
++/// They are manual integration checks and intentionally cannot run under `swift test`.
++public final class MacKeychainIdentityStore: ZwzIdentityStore, @unchecked Sendable {
++    private let backend: any ZwzKeychainBackend
++    private let lock = NSRecursiveLock()
++
++    public convenience init(accessGroup: String? = nil) {
++        self.init(backend: SecurityZwzKeychainBackend(accessGroup: accessGroup))
++    }
++
++    init(backend: any ZwzKeychainBackend) {
++        self.backend = backend
++    }
++
++    public func createIdentity(named name: String) throws -> ZwzIdentityMetadata {
++        let validatedName = try validateIdentityName(name)
++        let agreement = Curve25519.KeyAgreement.PrivateKey()
++        let signing = Curve25519.Signing.PrivateKey()
++        let fingerprint = ZwzV3Crypto.fingerprint(
++            agreement: agreement.publicKey.rawRepresentation,
++            signing: signing.publicKey.rawRepresentation
++        )
++        let identity = ZwzPrivateIdentity(
++            name: validatedName,
++            fingerprint: fingerprint,
++            agreementPrivateKey: agreement.rawRepresentation,
++            signingPrivateKey: signing.rawRepresentation
++        )
++        return try lock.withLock {
++            try writeIdentity(identity, conflict: .requireConfirmation)
++        }
++    }
++
++    public func identities() throws -> [ZwzIdentityMetadata] {
++        return try lock.withLock {
++            try readAll(kind: .identity, as: ZwzIdentityMetadata.self)
++                .sorted { $0.creationDate < $1.creationDate }
++        }
++    }
++
++    public func contacts() throws -> [ZwzPublicIdentity] {
++        return try lock.withLock {
++            try readAll(kind: .contact, as: ZwzPublicIdentity.self)
++                .sorted { $0.name < $1.name }
++        }
++    }
++
++    public func importPublicIdentity(
++        _ data: Data,
++        conflict: ZwzIdentityConflictPolicy
++    ) throws -> ZwzPublicIdentity {
++        let incoming = try ZwzKeyFileCodec.decodePublic(data)
++        return try lock.withLock {
++            if let existing: ZwzIdentityMetadata = try readOptional(
++                kind: .identity,
++                fingerprint: incoming.fingerprint
++            ) {
++                guard conflict == .replaceExisting else {
++                    throw ZwzV3Error.identityConflict(incoming.fingerprint)
++                }
++                try validateBinding(existing.publicIdentity, incoming)
++                let updated = ZwzIdentityMetadata(
++                    name: incoming.name,
++                    fingerprint: existing.fingerprint,
++                    agreementPublicKey: existing.agreementPublicKey,
++                    signingPublicKey: existing.signingPublicKey,
++                    creationDate: existing.creationDate
++                )
++                try updatePublic(.identity, fingerprint: incoming.fingerprint, value: updated)
++                return incoming
++            }
++            if let existing: ZwzPublicIdentity = try readOptional(
++                kind: .contact,
++                fingerprint: incoming.fingerprint
++            ) {
++                guard conflict == .replaceExisting else {
++                    throw ZwzV3Error.identityConflict(incoming.fingerprint)
++                }
++                try validateBinding(existing, incoming)
++                try updatePublic(.contact, fingerprint: incoming.fingerprint, value: incoming)
++                return incoming
++            }
++            try addPublic(.contact, fingerprint: incoming.fingerprint, value: incoming)
++            return incoming
++        }
++    }
++
++    public func exportPublicIdentity(fingerprint: String) throws -> Data {
++        let identity: ZwzPublicIdentity = try lock.withLock {
++            if let metadata: ZwzIdentityMetadata = try readOptional(
++                kind: .identity,
++                fingerprint: fingerprint
++            ) {
++                return metadata.publicIdentity
++            }
++            if let contact: ZwzPublicIdentity = try readOptional(
++                kind: .contact,
++                fingerprint: fingerprint
++            ) {
++                return contact
++            }
++            throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++        }
++        return try ZwzKeyFileCodec.encodePublic(identity)
++    }
++
++    public func exportPrivateBackup(fingerprint: String, password: String) throws -> Data {
++        let identity = try lock.withLock {
++            guard let metadata: ZwzIdentityMetadata = try readOptional(
++                kind: .identity,
++                fingerprint: fingerprint
++            ) else { throw ZwzV3Error.noMatchingPrivateKey([fingerprint]) }
++            let agreement = try privateData(
++                kind: .agreement,
++                fingerprint: fingerprint,
++                reason: "Authenticate to export the agreement key backup"
++            )
++            let signing = try privateData(
++                kind: .signing,
++                fingerprint: fingerprint,
++                reason: "Authenticate to export the signing key backup"
++            )
++            return ZwzPrivateIdentity(
++                name: metadata.name,
++                fingerprint: fingerprint,
++                agreementPrivateKey: agreement,
++                signingPrivateKey: signing
++            )
++        }
++        return try ZwzKeyFileCodec.encodeBackup(identity, password: password)
++    }
++
++    public func importPrivateBackup(
++        _ data: Data,
++        password: String,
++        conflict: ZwzIdentityConflictPolicy
++    ) throws -> ZwzIdentityMetadata {
++        let identity = try ZwzKeyFileCodec.decodeBackup(data, password: password)
++        return try lock.withLock {
++            try writeIdentity(identity, conflict: conflict)
++        }
++    }
++
++    func importPrivateIdentity(
++        _ identity: ZwzPrivateIdentity,
++        conflict: ZwzIdentityConflictPolicy
++    ) throws -> ZwzIdentityMetadata {
++        try lock.withLock { try writeIdentity(identity, conflict: conflict) }
++    }
++
++    public func rename(fingerprint: String, to name: String) throws {
++        try lock.withLock {
++            let validatedName = try validateIdentityName(name)
++            if let metadata: ZwzIdentityMetadata = try readOptional(
++                kind: .identity,
++                fingerprint: fingerprint
++            ) {
++                let updated = ZwzIdentityMetadata(
++                    name: validatedName,
++                    fingerprint: metadata.fingerprint,
++                    agreementPublicKey: metadata.agreementPublicKey,
++                    signingPublicKey: metadata.signingPublicKey,
++                    creationDate: metadata.creationDate
++                )
++                try updatePublic(.identity, fingerprint: fingerprint, value: updated)
++                return
++            }
++            if let contact: ZwzPublicIdentity = try readOptional(
++                kind: .contact,
++                fingerprint: fingerprint
++            ) {
++                let updated = ZwzPublicIdentity(
++                    name: validatedName,
++                    fingerprint: contact.fingerprint,
++                    agreementPublicKey: contact.agreementPublicKey,
++                    signingPublicKey: contact.signingPublicKey
++                )
++                try updatePublic(.contact, fingerprint: fingerprint, value: updated)
++                return
++            }
++            throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++        }
++    }
++
++    public func delete(fingerprint: String) throws {
++        try lock.withLock {
++            var firstError: Error?
++            for kind in [
++                ZwzKeychainItemKind.identity, .contact, .agreement, .signing
++            ] {
++                let status = backend.delete(kind: kind, fingerprint: fingerprint)
++                if status != errSecSuccess, status != errSecItemNotFound, firstError == nil {
++                    firstError = mappedError(status, fingerprint: fingerprint)
++                }
++            }
++            if let firstError { throw firstError }
++        }
++    }
++
++    public func agreementPrivateKey(fingerprint: String, reason: String) throws -> Data {
++        try lock.withLock {
++            try privateData(kind: .agreement, fingerprint: fingerprint, reason: reason)
++        }
++    }
++
++    public func signingPrivateKey(fingerprint: String, reason: String) throws -> Data {
++        try lock.withLock {
++            try privateData(kind: .signing, fingerprint: fingerprint, reason: reason)
++        }
++    }
++
++    public func isKnownSigningKey(fingerprint: String, signingPublicKey: Data) -> Bool {
++        lock.withLock {
++            if let metadata: ZwzIdentityMetadata = try? readOptional(
++                kind: .identity,
++                fingerprint: fingerprint
++            ), metadata.signingPublicKey == signingPublicKey {
++                return true
++            }
++            if let contact: ZwzPublicIdentity = try? readOptional(
++                kind: .contact,
++                fingerprint: fingerprint
++            ), contact.signingPublicKey == signingPublicKey {
++                return true
++            }
++            return false
++        }
++    }
++
++    private func writeIdentity(
++        _ identity: ZwzPrivateIdentity,
++        conflict: ZwzIdentityConflictPolicy
++    ) throws -> ZwzIdentityMetadata {
++        let incomingPublic = try identity.publicIdentity
++        if let existing: ZwzIdentityMetadata = try readOptional(
++            kind: .identity,
++            fingerprint: identity.fingerprint
++        ) {
++            guard conflict == .replaceExisting else {
++                throw ZwzV3Error.identityConflict(identity.fingerprint)
++            }
++            try validateBinding(existing.publicIdentity, incomingPublic)
++            let updated = ZwzIdentityMetadata(
++                name: try validateIdentityName(identity.name),
++                fingerprint: existing.fingerprint,
++                agreementPublicKey: existing.agreementPublicKey,
++                signingPublicKey: existing.signingPublicKey,
++                creationDate: existing.creationDate
++            )
++            try updatePublic(.identity, fingerprint: identity.fingerprint, value: updated)
++            return updated
++        }
++
++        let contact: ZwzPublicIdentity? = try readOptional(
++            kind: .contact,
++            fingerprint: identity.fingerprint
++        )
++        if let contact {
++            guard conflict == .replaceExisting else {
++                throw ZwzV3Error.identityConflict(identity.fingerprint)
++            }
++            try validateBinding(contact, incomingPublic)
++        }
++
++        let metadata = ZwzIdentityMetadata(
++            name: try validateIdentityName(identity.name),
++            fingerprint: identity.fingerprint,
++            agreementPublicKey: incomingPublic.agreementPublicKey,
++            signingPublicKey: incomingPublic.signingPublicKey,
++            creationDate: Date()
++        )
++        var written: [ZwzKeychainItemKind] = []
++        do {
++            try addPrivate(.agreement, fingerprint: identity.fingerprint, data: identity.agreementPrivateKey)
++            written.append(.agreement)
++            try addPrivate(.signing, fingerprint: identity.fingerprint, data: identity.signingPrivateKey)
++            written.append(.signing)
++            try addPublic(.identity, fingerprint: identity.fingerprint, value: metadata)
++            written.append(.identity)
++            if contact != nil {
++                let status = backend.delete(kind: .contact, fingerprint: identity.fingerprint)
++                guard status == errSecSuccess || status == errSecItemNotFound else {
++                    throw mappedError(status, fingerprint: identity.fingerprint)
++                }
++            }
++            return metadata
++        } catch {
++            for kind in written.reversed() {
++                _ = backend.delete(kind: kind, fingerprint: identity.fingerprint)
++            }
++            throw error
++        }
++    }
++
++    private func addPrivate(
++        _ kind: ZwzKeychainItemKind,
++        fingerprint: String,
++        data: Data
++    ) throws {
++        try check(backend.add(kind: kind, fingerprint: fingerprint, data: data), fingerprint: fingerprint)
++    }
++
++    private func addPublic<T: Encodable>(
++        _ kind: ZwzKeychainItemKind,
++        fingerprint: String,
++        value: T
++    ) throws {
++        let data = try JSONEncoder().encode(value)
++        try check(backend.add(kind: kind, fingerprint: fingerprint, data: data), fingerprint: fingerprint)
++    }
++
++    private func updatePublic<T: Encodable>(
++        _ kind: ZwzKeychainItemKind,
++        fingerprint: String,
++        value: T
++    ) throws {
++        let data = try JSONEncoder().encode(value)
++        try check(backend.update(kind: kind, fingerprint: fingerprint, data: data), fingerprint: fingerprint)
++    }
++
++    private func privateData(
++        kind: ZwzKeychainItemKind,
++        fingerprint: String,
++        reason: String
++    ) throws -> Data {
++        let result = backend.read(
++            kind: kind,
++            fingerprint: fingerprint,
++            authenticationReason: reason
++        )
++        try check(result.status, fingerprint: fingerprint)
++        guard result.items.count == 1 else { throw ZwzV3Error.keychainFailure(errSecDecode) }
++        return result.items[0]
++    }
++
++    private func readOptional<T: Decodable>(
++        kind: ZwzKeychainItemKind,
++        fingerprint: String
++    ) throws -> T? {
++        let result = backend.read(
++            kind: kind,
++            fingerprint: fingerprint,
++            authenticationReason: nil
++        )
++        if result.status == errSecItemNotFound { return nil }
++        try check(result.status, fingerprint: fingerprint)
++        guard result.items.count == 1 else { throw ZwzV3Error.keychainFailure(errSecDecode) }
++        return try decode(T.self, from: result.items[0])
++    }
++
++    private func readAll<T: Decodable>(
++        kind: ZwzKeychainItemKind,
++        as: T.Type
++    ) throws -> [T] {
++        let result = backend.readAll(kind: kind)
++        if result.status == errSecItemNotFound { return [] }
++        try check(result.status, fingerprint: "")
++        return try result.items.map { try decode(T.self, from: $0) }
++    }
++
++    private func decode<T: Decodable>(_ type: T.Type, from data: Data) throws -> T {
++        do {
++            return try JSONDecoder().decode(T.self, from: data)
++        } catch {
++            throw ZwzV3Error.keychainFailure(errSecDecode)
++        }
++    }
++
++    private func validateBinding(
++        _ existing: ZwzPublicIdentity,
++        _ incoming: ZwzPublicIdentity
++    ) throws {
++        guard existing.fingerprint == incoming.fingerprint,
++              existing.agreementPublicKey == incoming.agreementPublicKey,
++              existing.signingPublicKey == incoming.signingPublicKey else {
++            throw ZwzV3Error.identityConflict(incoming.fingerprint)
++        }
++    }
++
++    private func check(_ status: OSStatus, fingerprint: String) throws {
++        guard status == errSecSuccess else { throw mappedError(status, fingerprint: fingerprint) }
++    }
++
++    private func mappedError(_ status: OSStatus, fingerprint: String) -> ZwzV3Error {
++        switch status {
++        case errSecUserCanceled:
++            return .userAuthenticationCancelled
++        case errSecItemNotFound:
++            return .noMatchingPrivateKey([fingerprint])
++        default:
++            return .keychainFailure(status)
++        }
++    }
++}
+diff --git a/Sources/ZwzCore/ZWZV3/ZwzIdentityStore.swift b/Sources/ZwzCore/ZWZV3/ZwzIdentityStore.swift
+new file mode 100644
+index 0000000..4faa093
+--- /dev/null
++++ b/Sources/ZwzCore/ZWZV3/ZwzIdentityStore.swift
+@@ -0,0 +1,310 @@
++import CryptoKit
++import Foundation
++
++public struct ZwzPublicIdentity: Codable, Equatable, Sendable {
++    public var name: String
++    public let fingerprint: String
++    public let agreementPublicKey: Data
++    public let signingPublicKey: Data
++
++    public init(
++        name: String,
++        fingerprint: String,
++        agreementPublicKey: Data,
++        signingPublicKey: Data
++    ) {
++        self.name = name
++        self.fingerprint = fingerprint
++        self.agreementPublicKey = agreementPublicKey
++        self.signingPublicKey = signingPublicKey
++    }
++}
++
++public struct ZwzIdentityMetadata: Codable, Equatable, Sendable {
++    public var name: String
++    public let fingerprint: String
++    public let agreementPublicKey: Data
++    public let signingPublicKey: Data
++    public let creationDate: Date
++
++    public init(
++        name: String,
++        fingerprint: String,
++        agreementPublicKey: Data,
++        signingPublicKey: Data,
++        creationDate: Date
++    ) {
++        self.name = name
++        self.fingerprint = fingerprint
++        self.agreementPublicKey = agreementPublicKey
++        self.signingPublicKey = signingPublicKey
++        self.creationDate = creationDate
++    }
++
++    public var publicIdentity: ZwzPublicIdentity {
++        ZwzPublicIdentity(
++            name: name,
++            fingerprint: fingerprint,
++            agreementPublicKey: agreementPublicKey,
++            signingPublicKey: signingPublicKey
++        )
++    }
++}
++
++public enum ZwzIdentityConflictPolicy: Sendable {
++    case requireConfirmation
++    case replaceExisting
++}
++
++public protocol ZwzIdentityStore: ZwzPrivateKeyProvider {
++    func createIdentity(named name: String) throws -> ZwzIdentityMetadata
++    func identities() throws -> [ZwzIdentityMetadata]
++    func contacts() throws -> [ZwzPublicIdentity]
++    func importPublicIdentity(
++        _ data: Data, conflict: ZwzIdentityConflictPolicy
++    ) throws -> ZwzPublicIdentity
++    func exportPublicIdentity(fingerprint: String) throws -> Data
++    func exportPrivateBackup(fingerprint: String, password: String) throws -> Data
++    func importPrivateBackup(
++        _ data: Data, password: String, conflict: ZwzIdentityConflictPolicy
++    ) throws -> ZwzIdentityMetadata
++    func rename(fingerprint: String, to name: String) throws
++    func delete(fingerprint: String) throws
++}
++
++public final class InMemoryZwzIdentityStore: ZwzIdentityStore, @unchecked Sendable {
++    enum ImportFailurePoint: Sendable { case afterAgreementPrivateKey }
++
++    private struct StoredIdentity: Sendable {
++        var metadata: ZwzIdentityMetadata
++        let agreementPrivateKey: Data
++        let signingPrivateKey: Data
++    }
++
++    private let lock = NSLock()
++    private var storedIdentities: [String: StoredIdentity] = [:]
++    private var storedContacts: [String: ZwzPublicIdentity] = [:]
++    private let importFailurePoint: ImportFailurePoint?
++    private let providerFailure: ZwzV3Error?
++
++    public init() {
++        importFailurePoint = nil
++        providerFailure = nil
++    }
++
++    init(importFailurePoint: ImportFailurePoint? = nil, providerFailure: ZwzV3Error? = nil) {
++        self.importFailurePoint = importFailurePoint
++        self.providerFailure = providerFailure
++    }
++
++    public func createIdentity(named name: String) throws -> ZwzIdentityMetadata {
++        let validatedName = try validateIdentityName(name)
++        let agreement = Curve25519.KeyAgreement.PrivateKey()
++        let signing = Curve25519.Signing.PrivateKey()
++        let fingerprint = ZwzV3Crypto.fingerprint(
++            agreement: agreement.publicKey.rawRepresentation,
++            signing: signing.publicKey.rawRepresentation
++        )
++        let identity = ZwzPrivateIdentity(
++            name: validatedName,
++            fingerprint: fingerprint,
++            agreementPrivateKey: agreement.rawRepresentation,
++            signingPrivateKey: signing.rawRepresentation
++        )
++        return try insert(identity, conflict: .requireConfirmation)
++    }
++
++    public func identities() throws -> [ZwzIdentityMetadata] {
++        lock.withLock {
++            storedIdentities.values.map(\.metadata).sorted { $0.creationDate < $1.creationDate }
++        }
++    }
++
++    public func contacts() throws -> [ZwzPublicIdentity] {
++        lock.withLock { storedContacts.values.sorted { $0.name < $1.name } }
++    }
++
++    public func importPublicIdentity(
++        _ data: Data, conflict: ZwzIdentityConflictPolicy
++    ) throws -> ZwzPublicIdentity {
++        let identity = try ZwzKeyFileCodec.decodePublic(data)
++        try lock.withLock {
++            if var stored = storedIdentities[identity.fingerprint] {
++                guard conflict == .replaceExisting else {
++                    throw ZwzV3Error.identityConflict(identity.fingerprint)
++                }
++                try validateBinding(stored.metadata.publicIdentity, identity)
++                stored.metadata.name = identity.name
++                storedIdentities[identity.fingerprint] = stored
++                return
++            }
++            if let contact = storedContacts[identity.fingerprint] {
++                guard conflict == .replaceExisting else {
++                    throw ZwzV3Error.identityConflict(identity.fingerprint)
++                }
++                try validateBinding(contact, identity)
++            }
++            storedContacts[identity.fingerprint] = identity
++        }
++        return identity
++    }
++
++    public func exportPublicIdentity(fingerprint: String) throws -> Data {
++        let identity = try lock.withLock {
++            if let metadata = storedIdentities[fingerprint]?.metadata {
++                return metadata.publicIdentity
++            }
++            if let contact = storedContacts[fingerprint] { return contact }
++            throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++        }
++        return try ZwzKeyFileCodec.encodePublic(identity)
++    }
++
++    public func exportPrivateBackup(fingerprint: String, password: String) throws -> Data {
++        let identity = try lock.withLock { try privateIdentity(fingerprint: fingerprint) }
++        return try ZwzKeyFileCodec.encodeBackup(identity, password: password)
++    }
++
++    public func importPrivateBackup(
++        _ data: Data,
++        password: String,
++        conflict: ZwzIdentityConflictPolicy
++    ) throws -> ZwzIdentityMetadata {
++        let identity = try ZwzKeyFileCodec.decodeBackup(data, password: password)
++        return try insert(identity, conflict: conflict)
++    }
++
++    public func rename(fingerprint: String, to name: String) throws {
++        let validatedName = try validateIdentityName(name)
++        try lock.withLock {
++            if var stored = storedIdentities[fingerprint] {
++                stored.metadata.name = validatedName
++                storedIdentities[fingerprint] = stored
++                return
++            }
++            if var contact = storedContacts[fingerprint] {
++                contact.name = validatedName
++                storedContacts[fingerprint] = contact
++                return
++            }
++            throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++        }
++    }
++
++    public func delete(fingerprint: String) throws {
++        lock.withLock {
++            storedIdentities.removeValue(forKey: fingerprint)
++            storedContacts.removeValue(forKey: fingerprint)
++        }
++    }
++
++    public func agreementPrivateKey(fingerprint: String, reason: String) throws -> Data {
++        try lock.withLock {
++            if let providerFailure { throw providerFailure }
++            guard let data = storedIdentities[fingerprint]?.agreementPrivateKey else {
++                throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++            }
++            return data
++        }
++    }
++
++    public func signingPrivateKey(fingerprint: String, reason: String) throws -> Data {
++        try lock.withLock {
++            if let providerFailure { throw providerFailure }
++            guard let data = storedIdentities[fingerprint]?.signingPrivateKey else {
++                throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++            }
++            return data
++        }
++    }
++
++    public func isKnownSigningKey(fingerprint: String, signingPublicKey: Data) -> Bool {
++        lock.withLock {
++            storedIdentities[fingerprint]?.metadata.signingPublicKey == signingPublicKey
++                || storedContacts[fingerprint]?.signingPublicKey == signingPublicKey
++        }
++    }
++
++    private func insert(
++        _ identity: ZwzPrivateIdentity, conflict: ZwzIdentityConflictPolicy
++    ) throws -> ZwzIdentityMetadata {
++        let publicIdentity = try identity.publicIdentity
++        let metadata = ZwzIdentityMetadata(
++            name: try validateIdentityName(identity.name),
++            fingerprint: identity.fingerprint,
++            agreementPublicKey: publicIdentity.agreementPublicKey,
++            signingPublicKey: publicIdentity.signingPublicKey,
++            creationDate: Date()
++        )
++        return try lock.withLock {
++            if var existing = storedIdentities[identity.fingerprint] {
++                guard conflict == .replaceExisting else {
++                    throw ZwzV3Error.identityConflict(identity.fingerprint)
++                }
++                try validateBinding(existing.metadata.publicIdentity, publicIdentity)
++                existing.metadata.name = metadata.name
++                storedIdentities[identity.fingerprint] = existing
++                return existing.metadata
++            }
++            if let contact = storedContacts[identity.fingerprint] {
++                guard conflict == .replaceExisting else {
++                    throw ZwzV3Error.identityConflict(identity.fingerprint)
++                }
++                try validateBinding(contact, publicIdentity)
++            }
++            let oldIdentity = storedIdentities[identity.fingerprint]
++            let oldContact = storedContacts[identity.fingerprint]
++            do {
++                storedContacts.removeValue(forKey: identity.fingerprint)
++                storedIdentities[identity.fingerprint] = StoredIdentity(
++                    metadata: metadata,
++                    agreementPrivateKey: identity.agreementPrivateKey,
++                    signingPrivateKey: Data()
++                )
++                if importFailurePoint == .afterAgreementPrivateKey {
++                    throw ZwzV3Error.keychainFailure(-1)
++                }
++                storedIdentities[identity.fingerprint] = StoredIdentity(
++                    metadata: metadata,
++                    agreementPrivateKey: identity.agreementPrivateKey,
++                    signingPrivateKey: identity.signingPrivateKey
++                )
++                return metadata
++            } catch {
++                storedIdentities[identity.fingerprint] = oldIdentity
++                storedContacts[identity.fingerprint] = oldContact
++                throw error
++            }
++        }
++    }
++
++    private func privateIdentity(fingerprint: String) throws -> ZwzPrivateIdentity {
++        guard let stored = storedIdentities[fingerprint] else {
++            throw ZwzV3Error.noMatchingPrivateKey([fingerprint])
++        }
++        return ZwzPrivateIdentity(
++            name: stored.metadata.name,
++            fingerprint: fingerprint,
++            agreementPrivateKey: stored.agreementPrivateKey,
++            signingPrivateKey: stored.signingPrivateKey
++        )
++    }
++
++    private func validateBinding(
++        _ existing: ZwzPublicIdentity,
++        _ incoming: ZwzPublicIdentity
++    ) throws {
++        guard existing.fingerprint == incoming.fingerprint,
++              existing.agreementPublicKey == incoming.agreementPublicKey,
++              existing.signingPublicKey == incoming.signingPublicKey else {
++            throw ZwzV3Error.identityConflict(incoming.fingerprint)
++        }
++    }
++}
++
++func validateIdentityName(_ name: String) throws -> String {
++    guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
++        throw ZwzV3Error.invalidIdentityName
++    }
++    return name
++}
+diff --git a/Sources/ZwzCore/ZWZV3/ZwzKeyFileCodec.swift b/Sources/ZwzCore/ZWZV3/ZwzKeyFileCodec.swift
+new file mode 100644
+index 0000000..2bc9510
+--- /dev/null
++++ b/Sources/ZwzCore/ZWZV3/ZwzKeyFileCodec.swift
+@@ -0,0 +1,381 @@
++import CryptoKit
++import CryptoSwift
++import Foundation
++import Security
++
++struct ZwzPrivateIdentity: Equatable, Sendable {
++    let name: String
++    let fingerprint: String
++    let agreementPrivateKey: Data
++    let signingPrivateKey: Data
++
++    var publicIdentity: ZwzPublicIdentity {
++        get throws {
++            let agreement = try Curve25519.KeyAgreement.PrivateKey(
++                rawRepresentation: agreementPrivateKey
++            )
++            let signing = try Curve25519.Signing.PrivateKey(rawRepresentation: signingPrivateKey)
++            return ZwzPublicIdentity(
++                name: name,
++                fingerprint: fingerprint,
++                agreementPublicKey: agreement.publicKey.rawRepresentation,
++                signingPublicKey: signing.publicKey.rawRepresentation
++            )
++        }
++    }
++}
++
++public enum ZwzKeyFileCodec {
++    private static let publicHeaderLength = 32
++    private static let backupHeaderLength = 64
++    private static let backupSaltLength = 16
++    private static let backupNonceLength = 12
++    private static let backupTagLength = 16
++    private static let privateHeaderLength = 24
++
++    public static func encodePublic(_ identity: ZwzPublicIdentity) throws -> Data {
++        do {
++            let name = Data(identity.name.utf8)
++            guard !name.isEmpty,
++                  identity.agreementPublicKey.count == 32,
++                  identity.signingPublicKey.count == 32,
++                  name.count <= Int(UInt32.max) else {
++                throw ZwzV3Error.invalidKeyFile
++            }
++            _ = try Curve25519.KeyAgreement.PublicKey(
++                rawRepresentation: identity.agreementPublicKey
++            )
++            _ = try Curve25519.Signing.PublicKey(rawRepresentation: identity.signingPublicKey)
++            let fingerprint = ZwzV3Crypto.fingerprint(
++                agreement: identity.agreementPublicKey,
++                signing: identity.signingPublicKey
++            )
++            let fingerprintData = Data(fingerprint.utf8)
++            var header = Data(repeating: 0, count: publicHeaderLength)
++            header.replaceSubrange(0..<4, with: Data("ZWZP".utf8))
++            write(UInt16(1), to: &header, at: 4)
++            write(UInt16(publicHeaderLength), to: &header, at: 6)
++            header[8] = 1
++            header[9] = 1
++            header[10] = 1
++            write(UInt32(name.count), to: &header, at: 12)
++            write(UInt32(fingerprintData.count), to: &header, at: 16)
++            write(UInt32(32), to: &header, at: 20)
++            write(UInt32(32), to: &header, at: 24)
++            return header + name + fingerprintData + identity.agreementPublicKey
++                + identity.signingPublicKey
++        } catch {
++            throw ZwzV3Error.invalidKeyFile
++        }
++    }
++
++    public static func decodePublic(_ input: Data) throws -> ZwzPublicIdentity {
++        do {
++            let data = Data(input)
++            guard data.count >= publicHeaderLength,
++                  data.prefix(4) == Data("ZWZP".utf8),
++                  try readUInt16(data, at: 4) == 1,
++                  try readUInt16(data, at: 6) == UInt16(publicHeaderLength),
++                  data[8] == 1, data[9] == 1, data[10] == 1, data[11] == 0,
++                  data[28..<32].allSatisfy({ $0 == 0 }) else {
++                throw ZwzV3Error.invalidKeyFile
++            }
++            let nameLength = UInt64(try readUInt32(data, at: 12))
++            let fingerprintLength = UInt64(try readUInt32(data, at: 16))
++            let agreementLength = UInt64(try readUInt32(data, at: 20))
++            let signingLength = UInt64(try readUInt32(data, at: 24))
++            guard nameLength > 0, fingerprintLength == 64,
++                  agreementLength == 32, signingLength == 32 else {
++                throw ZwzV3Error.invalidKeyFile
++            }
++            let end = try checkedSum([
++                UInt64(publicHeaderLength), nameLength, fingerprintLength,
++                agreementLength, signingLength
++            ])
++            guard end == UInt64(data.count) else { throw ZwzV3Error.invalidKeyFile }
++
++            var offset = publicHeaderLength
++            let nameData = try take(data, offset: &offset, count: nameLength)
++            let fingerprintData = try take(data, offset: &offset, count: fingerprintLength)
++            let agreement = try take(data, offset: &offset, count: agreementLength)
++            let signing = try take(data, offset: &offset, count: signingLength)
++            guard let name = String(data: nameData, encoding: .utf8), !name.isEmpty,
++                  let fingerprint = String(data: fingerprintData, encoding: .utf8),
++                  isCanonicalFingerprint(fingerprint) else {
++                throw ZwzV3Error.invalidKeyFile
++            }
++            _ = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: agreement)
++            _ = try Curve25519.Signing.PublicKey(rawRepresentation: signing)
++            guard fingerprint == ZwzV3Crypto.fingerprint(
++                agreement: agreement, signing: signing
++            ) else { throw ZwzV3Error.invalidKeyFile }
++            return ZwzPublicIdentity(
++                name: name,
++                fingerprint: fingerprint,
++                agreementPublicKey: agreement,
++                signingPublicKey: signing
++            )
++        } catch {
++            throw ZwzV3Error.invalidKeyFile
++        }
++    }
++
++    static func encodeBackup(_ identity: ZwzPrivateIdentity, password: String) throws -> Data {
++        var salt = Data(repeating: 0, count: backupSaltLength)
++        let randomStatus = salt.withUnsafeMutableBytes { bytes in
++            SecRandomCopyBytes(kSecRandomDefault, bytes.count, bytes.baseAddress!)
++        }
++        guard randomStatus == errSecSuccess else {
++            throw ZwzV3Error.invalidBackup
++        }
++        return try encodeBackup(
++            identity,
++            password: password,
++            salt: salt,
++            nonce: Data(AES.GCM.Nonce()),
++            deriveKey: deriveBackupKey
++        )
++    }
++
++    static func encodeBackup(
++        _ identity: ZwzPrivateIdentity,
++        password: String,
++        salt: Data,
++        nonce: Data
++    ) throws -> Data {
++        try encodeBackup(
++            identity,
++            password: password,
++            salt: salt,
++            nonce: nonce,
++            deriveKey: deriveBackupKey
++        )
++    }
++
++    static func encodeBackup(
++        _ identity: ZwzPrivateIdentity,
++        password: String,
++        salt: Data,
++        nonce: Data,
++        deriveKey: (_ password: String, _ salt: Data) throws -> Data
++    ) throws -> Data {
++        do {
++            guard !password.isEmpty, salt.count == backupSaltLength,
++                  nonce.count == backupNonceLength else { throw ZwzV3Error.invalidBackup }
++            let plaintext = try encodePrivateIdentity(identity)
++            var header = Data(repeating: 0, count: backupHeaderLength)
++            header.replaceSubrange(0..<4, with: Data("ZWZB".utf8))
++            write(UInt16(1), to: &header, at: 4)
++            write(UInt16(backupHeaderLength), to: &header, at: 6)
++            header[8] = 1
++            header[9] = 1
++            header[10] = 1
++            header[11] = 1
++            write(UInt32(65_536), to: &header, at: 12)
++            write(UInt32(8), to: &header, at: 16)
++            write(UInt32(1), to: &header, at: 20)
++            write(UInt16(backupSaltLength), to: &header, at: 24)
++            write(UInt16(backupNonceLength), to: &header, at: 26)
++            write(UInt64(plaintext.count), to: &header, at: 28)
++            let aad = header + salt + nonce
++            let key = try deriveKey(password, salt)
++            guard key.count == 32 else { throw ZwzV3Error.invalidBackup }
++            let sealed = try AES.GCM.seal(
++                plaintext,
++                using: SymmetricKey(data: key),
++                nonce: AES.GCM.Nonce(data: nonce),
++                authenticating: aad
++            )
++            guard sealed.ciphertext.count == plaintext.count,
++                  sealed.tag.count == backupTagLength else { throw ZwzV3Error.invalidBackup }
++            return aad + sealed.ciphertext + sealed.tag
++        } catch {
++            throw ZwzV3Error.invalidBackup
++        }
++    }
++
++    static func decodeBackup(_ input: Data, password: String) throws -> ZwzPrivateIdentity {
++        try decodeBackup(input, password: password, deriveKey: deriveBackupKey)
++    }
++
++    static func decodeBackup(
++        _ input: Data,
++        password: String,
++        deriveKey: (_ password: String, _ salt: Data) throws -> Data
++    ) throws -> ZwzPrivateIdentity {
++        do {
++            let data = Data(input)
++            guard !password.isEmpty, data.count >= backupHeaderLength,
++                  data.prefix(4) == Data("ZWZB".utf8),
++                  try readUInt16(data, at: 4) == 1,
++                  try readUInt16(data, at: 6) == UInt16(backupHeaderLength),
++                  data[8] == 1, data[9] == 1, data[10] == 1, data[11] == 1,
++                  try readUInt32(data, at: 12) == 65_536,
++                  try readUInt32(data, at: 16) == 8,
++                  try readUInt32(data, at: 20) == 1,
++                  try readUInt16(data, at: 24) == UInt16(backupSaltLength),
++                  try readUInt16(data, at: 26) == UInt16(backupNonceLength),
++                  data[36..<64].allSatisfy({ $0 == 0 }) else {
++                throw ZwzV3Error.invalidBackup
++            }
++            let ciphertextLength = try readUInt64(data, at: 28)
++            let minimumPlaintextLength = UInt64(privateHeaderLength + 1 + 64 + 32 + 32)
++            guard ciphertextLength >= minimumPlaintextLength else {
++                throw ZwzV3Error.invalidBackup
++            }
++            let expectedLength = try checkedSum([
++                UInt64(backupHeaderLength), UInt64(backupSaltLength),
++                UInt64(backupNonceLength), ciphertextLength, UInt64(backupTagLength)
++            ])
++            guard expectedLength == UInt64(data.count) else { throw ZwzV3Error.invalidBackup }
++
++            var offset = backupHeaderLength
++            let salt = try take(data, offset: &offset, count: UInt64(backupSaltLength))
++            let nonceData = try take(data, offset: &offset, count: UInt64(backupNonceLength))
++            let ciphertext = try take(data, offset: &offset, count: ciphertextLength)
++            let tag = try take(data, offset: &offset, count: UInt64(backupTagLength))
++            let keyData = try deriveKey(password, salt)
++            guard keyData.count == 32 else { throw ZwzV3Error.invalidBackup }
++            let sealed = try AES.GCM.SealedBox(
++                nonce: AES.GCM.Nonce(data: nonceData), ciphertext: ciphertext, tag: tag
++            )
++            let aadEnd = backupHeaderLength + backupSaltLength + backupNonceLength
++            let plaintext = try AES.GCM.open(
++                sealed,
++                using: SymmetricKey(data: keyData),
++                authenticating: data.subdata(in: 0..<aadEnd)
++            )
++            return try decodePrivateIdentity(plaintext)
++        } catch {
++            throw ZwzV3Error.invalidBackup
++        }
++    }
++
++    private static func encodePrivateIdentity(_ identity: ZwzPrivateIdentity) throws -> Data {
++        let name = Data(identity.name.utf8)
++        guard !name.isEmpty, name.count <= Int(UInt32.max),
++              isCanonicalFingerprint(identity.fingerprint),
++              identity.agreementPrivateKey.count == 32,
++              identity.signingPrivateKey.count == 32 else { throw ZwzV3Error.invalidBackup }
++        let agreement = try Curve25519.KeyAgreement.PrivateKey(
++            rawRepresentation: identity.agreementPrivateKey
++        )
++        let signing = try Curve25519.Signing.PrivateKey(
++            rawRepresentation: identity.signingPrivateKey
++        )
++        let fingerprint = ZwzV3Crypto.fingerprint(
++            agreement: agreement.publicKey.rawRepresentation,
++            signing: signing.publicKey.rawRepresentation
++        )
++        guard fingerprint == identity.fingerprint else { throw ZwzV3Error.invalidBackup }
++
++        var header = Data(repeating: 0, count: privateHeaderLength)
++        header.replaceSubrange(0..<4, with: Data("ZWZI".utf8))
++        write(UInt16(1), to: &header, at: 4)
++        write(UInt32(name.count), to: &header, at: 8)
++        write(UInt32(64), to: &header, at: 12)
++        write(UInt32(32), to: &header, at: 16)
++        write(UInt32(32), to: &header, at: 20)
++        return header + name + Data(fingerprint.utf8)
++            + identity.agreementPrivateKey + identity.signingPrivateKey
++    }
++
++    private static func decodePrivateIdentity(_ input: Data) throws -> ZwzPrivateIdentity {
++        let data = Data(input)
++        guard data.count >= privateHeaderLength,
++              data.prefix(4) == Data("ZWZI".utf8),
++              try readUInt16(data, at: 4) == 1,
++              try readUInt16(data, at: 6) == 0 else { throw ZwzV3Error.invalidBackup }
++        let nameLength = UInt64(try readUInt32(data, at: 8))
++        let fingerprintLength = UInt64(try readUInt32(data, at: 12))
++        let agreementLength = UInt64(try readUInt32(data, at: 16))
++        let signingLength = UInt64(try readUInt32(data, at: 20))
++        guard nameLength > 0, fingerprintLength == 64,
++              agreementLength == 32, signingLength == 32,
++              try checkedSum([
++                UInt64(privateHeaderLength), nameLength, fingerprintLength,
++                agreementLength, signingLength
++              ]) == UInt64(data.count) else { throw ZwzV3Error.invalidBackup }
++        var offset = privateHeaderLength
++        let nameData = try take(data, offset: &offset, count: nameLength)
++        let fingerprintData = try take(data, offset: &offset, count: fingerprintLength)
++        let agreementData = try take(data, offset: &offset, count: agreementLength)
++        let signingData = try take(data, offset: &offset, count: signingLength)
++        guard let name = String(data: nameData, encoding: .utf8), !name.isEmpty,
++              let fingerprint = String(data: fingerprintData, encoding: .utf8),
++              isCanonicalFingerprint(fingerprint) else { throw ZwzV3Error.invalidBackup }
++        let agreement = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: agreementData)
++        let signing = try Curve25519.Signing.PrivateKey(rawRepresentation: signingData)
++        guard fingerprint == ZwzV3Crypto.fingerprint(
++            agreement: agreement.publicKey.rawRepresentation,
++            signing: signing.publicKey.rawRepresentation
++        ) else { throw ZwzV3Error.invalidBackup }
++        return ZwzPrivateIdentity(
++            name: name,
++            fingerprint: fingerprint,
++            agreementPrivateKey: agreementData,
++            signingPrivateKey: signingData
++        )
++    }
++
++    private static func deriveBackupKey(password: String, salt: Data) throws -> Data {
++        Data(try Scrypt(
++            password: Array(password.utf8), salt: Array(salt), dkLen: 32,
++            N: 65_536, r: 8, p: 1
++        ).calculate())
++    }
++
++    private static func isCanonicalFingerprint(_ value: String) -> Bool {
++        value.utf8.count == 64 && value.utf8.allSatisfy {
++            ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)
++        }
++    }
++
++    private static func checkedSum(_ values: [UInt64]) throws -> UInt64 {
++        try values.reduce(0) { partial, value in
++            let (result, overflow) = partial.addingReportingOverflow(value)
++            guard !overflow else { throw ZwzV3Error.invalidBackup }
++            return result
++        }
++    }
++
++    private static func take(_ data: Data, offset: inout Int, count: UInt64) throws -> Data {
++        guard count <= UInt64(Int.max) else { throw ZwzV3Error.invalidBackup }
++        let intCount = Int(count)
++        let (end, overflow) = offset.addingReportingOverflow(intCount)
++        guard !overflow, end <= data.count else { throw ZwzV3Error.invalidBackup }
++        defer { offset = end }
++        return data.subdata(in: offset..<end)
++    }
++
++    private static func readUInt16(_ data: Data, at offset: Int) throws -> UInt16 {
++        try readInteger(data, at: offset, as: UInt16.self)
++    }
++
++    private static func readUInt32(_ data: Data, at offset: Int) throws -> UInt32 {
++        try readInteger(data, at: offset, as: UInt32.self)
++    }
++
++    private static func readUInt64(_ data: Data, at offset: Int) throws -> UInt64 {
++        try readInteger(data, at: offset, as: UInt64.self)
++    }
++
++    private static func readInteger<T: FixedWidthInteger>(
++        _ data: Data, at offset: Int, as: T.Type
++    ) throws -> T {
++        let (end, overflow) = offset.addingReportingOverflow(MemoryLayout<T>.size)
++        guard !overflow, offset >= 0, end <= data.count else { throw ZwzV3Error.invalidBackup }
++        var value: T = 0
++        _ = withUnsafeMutableBytes(of: &value) { destination in
++            data.copyBytes(to: destination, from: offset..<end)
++        }
++        return T(littleEndian: value)
++    }
++
++    private static func write<T: FixedWidthInteger>(_ value: T, to data: inout Data, at offset: Int) {
++        var littleEndian = value.littleEndian
++        withUnsafeBytes(of: &littleEndian) { bytes in
++            data.replaceSubrange(offset..<(offset + bytes.count), with: bytes)
++        }
++    }
++}
+diff --git a/Sources/ZwzCore/ZWZV3/ZwzV3Types.swift b/Sources/ZwzCore/ZWZV3/ZwzV3Types.swift
+index 6050564..1980ec5 100644
+--- a/Sources/ZwzCore/ZWZV3/ZwzV3Types.swift
++++ b/Sources/ZwzCore/ZWZV3/ZwzV3Types.swift
+@@ -98,8 +98,11 @@ public enum ZwzV3Error: LocalizedError, Equatable, Sendable {
+     case noMatchingPrivateKey([String])
+     case userAuthenticationCancelled
+     case invalidSignature
++    case invalidKeyFile
+     case invalidBackup
++    case invalidIdentityName
+     case identityConflict(String)
++    case keychainFailure(Int32)
+     case unsupportedVersion(UInt16)
+ 
+     public var errorDescription: String? {
+@@ -120,10 +123,16 @@ public enum ZwzV3Error: LocalizedError, Equatable, Sendable {
+             return "User authentication was cancelled"
+         case .invalidSignature:
+             return "The archive signature is invalid"
++        case .invalidKeyFile:
++            return "The public identity file is invalid"
+         case .invalidBackup:
+             return "The identity backup is invalid"
++        case .invalidIdentityName:
++            return "The identity name must not be empty"
+         case .identityConflict:
+             return "An identity conflict was detected"
++        case .keychainFailure(let status):
++            return "Keychain operation failed with status: \(status)"
+         case .unsupportedVersion(let version):
+             return "Unsupported ZWZ version: \(version)"
+         }
+diff --git a/Tests/ZwzCoreTests/ZWZV3/ZwzIdentityStoreTests.swift b/Tests/ZwzCoreTests/ZWZV3/ZwzIdentityStoreTests.swift
+new file mode 100644
+index 0000000..f3fa3ff
+--- /dev/null
++++ b/Tests/ZwzCoreTests/ZWZV3/ZwzIdentityStoreTests.swift
+@@ -0,0 +1,311 @@
++import CryptoKit
++import Foundation
++import Security
++import XCTest
++@testable import ZwzCore
++
++final class ZwzIdentityStoreTests: XCTestCase {
++    func testCreateRenameExportAndDeletePreserveKeyBinding() throws {
++        let store = InMemoryZwzIdentityStore()
++        XCTAssertThrowsError(try store.createIdentity(named: "   ")) {
++            XCTAssertEqual($0 as? ZwzV3Error, .invalidIdentityName)
++        }
++        let created = try store.createIdentity(named: "Alice")
++        XCTAssertEqual(try store.identities().map(\.fingerprint), [created.fingerprint])
++
++        let exported = try store.exportPublicIdentity(fingerprint: created.fingerprint)
++        let publicIdentity = try ZwzKeyFileCodec.decodePublic(exported)
++        XCTAssertEqual(publicIdentity.fingerprint, created.fingerprint)
++
++        try store.rename(fingerprint: created.fingerprint, to: "Alice Renamed")
++        let renamed = try XCTUnwrap(try store.identities().first)
++        XCTAssertEqual(renamed.name, "Alice Renamed")
++        XCTAssertEqual(renamed.fingerprint, created.fingerprint)
++        XCTAssertEqual(renamed.agreementPublicKey, created.agreementPublicKey)
++        XCTAssertEqual(renamed.signingPublicKey, created.signingPublicKey)
++
++        try store.delete(fingerprint: created.fingerprint)
++        XCTAssertTrue(try store.identities().isEmpty)
++        XCTAssertThrowsError(try store.agreementPrivateKey(
++            fingerprint: created.fingerprint, reason: "Decrypt"
++        )) { XCTAssertEqual($0 as? ZwzV3Error, .noMatchingPrivateKey([created.fingerprint])) }
++    }
++
++    func testDuplicateIdentityRequiresExplicitReplacement() throws {
++        let store = InMemoryZwzIdentityStore()
++        let backup = try ZwzKeyFileTestSupport.backup()
++        _ = try store.importPrivateBackup(
++            backup, password: "correct horse battery staple", conflict: .requireConfirmation
++        )
++        let original = try XCTUnwrap(try store.identities().first)
++        XCTAssertThrowsError(try store.importPrivateBackup(
++            backup, password: "correct horse battery staple", conflict: .requireConfirmation
++        )) { XCTAssertEqual($0 as? ZwzV3Error, .identityConflict(
++            try! ZwzKeyFileTestSupport.privateIdentity().fingerprint
++        )) }
++        _ = try store.importPrivateBackup(
++            backup, password: "correct horse battery staple", conflict: .replaceExisting
++        )
++        let preserved = try XCTUnwrap(try store.identities().first)
++        XCTAssertEqual(preserved.creationDate, original.creationDate)
++        let agreementPrivate = try store.agreementPrivateKey(
++            fingerprint: preserved.fingerprint, reason: "Decrypt"
++        )
++        let renamedPublic = ZwzPublicIdentity(
++            name: "Alice Public Rename",
++            fingerprint: preserved.fingerprint,
++            agreementPublicKey: preserved.agreementPublicKey,
++            signingPublicKey: preserved.signingPublicKey
++        )
++        _ = try store.importPublicIdentity(
++            ZwzKeyFileCodec.encodePublic(renamedPublic), conflict: .replaceExisting
++        )
++        let renamed = try XCTUnwrap(try store.identities().first)
++        XCTAssertEqual(renamed.name, "Alice Public Rename")
++        XCTAssertEqual(renamed.creationDate, preserved.creationDate)
++        XCTAssertTrue(try store.contacts().isEmpty)
++        XCTAssertEqual(
++            try store.agreementPrivateKey(fingerprint: preserved.fingerprint, reason: "Decrypt"),
++            agreementPrivate
++        )
++    }
++
++    func testContactTrustRequiresFingerprintAndSigningKeyBinding() throws {
++        let store = InMemoryZwzIdentityStore()
++        let identity = try ZwzKeyFileTestSupport.publicIdentity()
++        let encoded = try ZwzKeyFileCodec.encodePublic(identity)
++        _ = try store.importPublicIdentity(encoded, conflict: .requireConfirmation)
++
++        XCTAssertTrue(store.isKnownSigningKey(
++            fingerprint: identity.fingerprint, signingPublicKey: identity.signingPublicKey
++        ))
++        XCTAssertFalse(store.isKnownSigningKey(
++            fingerprint: identity.fingerprint, signingPublicKey: Data(repeating: 7, count: 32)
++        ))
++        XCTAssertFalse(store.isKnownSigningKey(
++            fingerprint: String(repeating: "0", count: 64),
++            signingPublicKey: identity.signingPublicKey
++        ))
++
++        try store.rename(fingerprint: identity.fingerprint, to: "Alice Contact")
++        let renamed = try XCTUnwrap(try store.contacts().first)
++        XCTAssertEqual(renamed.name, "Alice Contact")
++        XCTAssertEqual(renamed.fingerprint, identity.fingerprint)
++        XCTAssertEqual(renamed.signingPublicKey, identity.signingPublicKey)
++        XCTAssertThrowsError(try store.agreementPrivateKey(
++            fingerprint: identity.fingerprint, reason: "Decrypt"
++        ))
++
++        try store.delete(fingerprint: identity.fingerprint)
++        XCTAssertTrue(try store.contacts().isEmpty)
++        XCTAssertFalse(store.isKnownSigningKey(
++            fingerprint: identity.fingerprint, signingPublicKey: identity.signingPublicKey
++        ))
++    }
++
++    func testRestoredIdentityDecryptsAndSigns() throws {
++        let store = InMemoryZwzIdentityStore()
++        let metadata = try store.importPrivateBackup(
++            ZwzKeyFileTestSupport.backup(),
++            password: "correct horse battery staple",
++            conflict: .requireConfirmation
++        )
++        let agreement = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation:
++            store.agreementPrivateKey(fingerprint: metadata.fingerprint, reason: "Decrypt")
++        )
++        let signing = try Curve25519.Signing.PrivateKey(rawRepresentation:
++            store.signingPrivateKey(fingerprint: metadata.fingerprint, reason: "Sign")
++        )
++        XCTAssertEqual(agreement.publicKey.rawRepresentation, metadata.agreementPublicKey)
++        let message = Data("message".utf8)
++        XCTAssertTrue(signing.publicKey.isValidSignature(try signing.signature(for: message), for: message))
++    }
++
++    func testFailedTransactionalImportLeavesNoPartialIdentity() throws {
++        let store = InMemoryZwzIdentityStore(importFailurePoint: .afterAgreementPrivateKey)
++        XCTAssertThrowsError(try store.importPrivateBackup(
++            ZwzKeyFileTestSupport.backup(),
++            password: "correct horse battery staple",
++            conflict: .requireConfirmation
++        ))
++        XCTAssertTrue(try store.identities().isEmpty)
++    }
++
++    func testProviderCancellationAndFailureRemainDistinct() throws {
++        let cancelled = InMemoryZwzIdentityStore(providerFailure: .userAuthenticationCancelled)
++        XCTAssertThrowsError(try cancelled.agreementPrivateKey(
++            fingerprint: "fingerprint", reason: "Decrypt"
++        )) { XCTAssertEqual($0 as? ZwzV3Error, .userAuthenticationCancelled) }
++
++        let failed = InMemoryZwzIdentityStore(providerFailure: .keychainFailure(-50))
++        XCTAssertThrowsError(try failed.signingPrivateKey(
++            fingerprint: "fingerprint", reason: "Sign"
++        )) { XCTAssertEqual($0 as? ZwzV3Error, .keychainFailure(-50)) }
++    }
++
++    func testMacReplaceIdentityUpdateFailurePreservesMetadataAndPrivateKeys() throws {
++        let fixture = try ZwzKeyFileTestSupport.privateIdentity(name: "Old Name")
++        let publicIdentity = try fixture.publicIdentity
++        let oldMetadata = ZwzIdentityMetadata(
++            name: "Old Name",
++            fingerprint: fixture.fingerprint,
++            agreementPublicKey: publicIdentity.agreementPublicKey,
++            signingPublicKey: publicIdentity.signingPublicKey,
++            creationDate: Date(timeIntervalSince1970: 123)
++        )
++        let backend = FakeZwzKeychainBackend()
++        backend.seed(
++            kind: .identity,
++            fingerprint: fixture.fingerprint,
++            data: try JSONEncoder().encode(oldMetadata)
++        )
++        backend.seed(
++            kind: .agreement,
++            fingerprint: fixture.fingerprint,
++            data: fixture.agreementPrivateKey
++        )
++        backend.seed(
++            kind: .signing,
++            fingerprint: fixture.fingerprint,
++            data: fixture.signingPrivateKey
++        )
++        backend.updateFailures[.identity] = errSecInteractionNotAllowed
++        let store = MacKeychainIdentityStore(backend: backend)
++
++        var replacement = fixture
++        replacement = ZwzPrivateIdentity(
++            name: "New Name",
++            fingerprint: replacement.fingerprint,
++            agreementPrivateKey: replacement.agreementPrivateKey,
++            signingPrivateKey: replacement.signingPrivateKey
++        )
++        XCTAssertThrowsError(try store.importPrivateIdentity(
++            replacement, conflict: .replaceExisting
++        )) { XCTAssertEqual($0 as? ZwzV3Error, .keychainFailure(errSecInteractionNotAllowed)) }
++
++        XCTAssertEqual(try store.identities(), [oldMetadata])
++        XCTAssertEqual(
++            try store.agreementPrivateKey(fingerprint: fixture.fingerprint, reason: "Decrypt"),
++            fixture.agreementPrivateKey
++        )
++        XCTAssertEqual(
++            try store.signingPrivateKey(fingerprint: fixture.fingerprint, reason: "Sign"),
++            fixture.signingPrivateKey
++        )
++
++        backend.updateFailures.removeValue(forKey: .identity)
++        let replacementPublic = try replacement.publicIdentity
++        let priorWriteCount = backend.transactionWrites.count
++        _ = try store.importPublicIdentity(
++            ZwzKeyFileCodec.encodePublic(replacementPublic),
++            conflict: .replaceExisting
++        )
++        XCTAssertEqual(
++            Array(backend.transactionWrites.dropFirst(priorWriteCount)),
++            [.update(.identity)]
++        )
++        let renamed = try XCTUnwrap(try store.identities().first)
++        XCTAssertEqual(renamed.name, "New Name")
++        XCTAssertEqual(renamed.creationDate, oldMetadata.creationDate)
++        XCTAssertTrue(try store.contacts().isEmpty)
++        XCTAssertEqual(
++            try store.agreementPrivateKey(fingerprint: fixture.fingerprint, reason: "Decrypt"),
++            fixture.agreementPrivateKey
++        )
++    }
++
++    func testMacContactUpgradeFailuresRollbackNewItemsAndPreserveContact() throws {
++        let identity = try ZwzKeyFileTestSupport.privateIdentity()
++        let contact = try identity.publicIdentity
++
++        for failureKind in [ZwzKeychainItemKind.signing, .identity] {
++            let backend = FakeZwzKeychainBackend()
++            backend.seed(
++                kind: .contact,
++                fingerprint: identity.fingerprint,
++                data: try JSONEncoder().encode(contact)
++            )
++            backend.addFailures[failureKind] = errSecInteractionNotAllowed
++            let store = MacKeychainIdentityStore(backend: backend)
++
++            XCTAssertThrowsError(try store.importPrivateIdentity(
++                identity, conflict: .replaceExisting
++            ))
++            XCTAssertEqual(try store.contacts(), [contact])
++            XCTAssertTrue(try store.identities().isEmpty)
++            XCTAssertNil(backend.data(kind: .agreement, fingerprint: identity.fingerprint))
++            XCTAssertNil(backend.data(kind: .signing, fingerprint: identity.fingerprint))
++            XCTAssertNil(backend.data(kind: .identity, fingerprint: identity.fingerprint))
++        }
++
++        let backend = FakeZwzKeychainBackend()
++        backend.seed(
++            kind: .contact,
++            fingerprint: identity.fingerprint,
++            data: try JSONEncoder().encode(contact)
++        )
++        backend.deleteFailures[.contact] = errSecInteractionNotAllowed
++        let store = MacKeychainIdentityStore(backend: backend)
++        XCTAssertThrowsError(try store.importPrivateIdentity(
++            identity, conflict: .replaceExisting
++        ))
++        XCTAssertEqual(try store.contacts(), [contact])
++        XCTAssertTrue(try store.identities().isEmpty)
++        XCTAssertNil(backend.data(kind: .agreement, fingerprint: identity.fingerprint))
++        XCTAssertNil(backend.data(kind: .signing, fingerprint: identity.fingerprint))
++    }
++
++    func testMacContactUpgradeCommitsIdentityBeforeRemovingContact() throws {
++        let identity = try ZwzKeyFileTestSupport.privateIdentity()
++        let contact = try identity.publicIdentity
++        let backend = FakeZwzKeychainBackend()
++        backend.seed(
++            kind: .contact,
++            fingerprint: identity.fingerprint,
++            data: try JSONEncoder().encode(contact)
++        )
++        let store = MacKeychainIdentityStore(backend: backend)
++
++        let metadata = try store.importPrivateIdentity(identity, conflict: .replaceExisting)
++
++        XCTAssertEqual(try store.identities().map(\.fingerprint), [metadata.fingerprint])
++        XCTAssertTrue(try store.contacts().isEmpty)
++        XCTAssertEqual(
++            backend.transactionWrites,
++            [.add(.agreement), .add(.signing), .add(.identity), .delete(.contact)]
++        )
++    }
++
++    func testMacStoreSerializesConcurrentPublicOperations() throws {
++        let backend = FakeZwzKeychainBackend()
++        backend.operationDelay = 0.01
++        let store = MacKeychainIdentityStore(backend: backend)
++
++        DispatchQueue.concurrentPerform(iterations: 12) { _ in
++            _ = try? store.contacts()
++        }
++
++        XCTAssertEqual(backend.maximumConcurrentCalls, 1)
++    }
++
++    func testMacDeleteAttemptsEveryItemAfterFirstFailure() throws {
++        let identity = try ZwzKeyFileTestSupport.privateIdentity()
++        let backend = FakeZwzKeychainBackend()
++        for kind in [
++            ZwzKeychainItemKind.identity, .contact, .agreement, .signing
++        ] {
++            backend.seed(kind: kind, fingerprint: identity.fingerprint, data: Data([1]))
++        }
++        backend.deleteFailures[.identity] = errSecInteractionNotAllowed
++        let store = MacKeychainIdentityStore(backend: backend)
++
++        XCTAssertThrowsError(try store.delete(fingerprint: identity.fingerprint)) {
++            XCTAssertEqual($0 as? ZwzV3Error, .keychainFailure(errSecInteractionNotAllowed))
++        }
++        XCTAssertEqual(backend.deleteCalls, [.identity, .contact, .agreement, .signing])
++        XCTAssertNotNil(backend.data(kind: .identity, fingerprint: identity.fingerprint))
++        XCTAssertNil(backend.data(kind: .contact, fingerprint: identity.fingerprint))
++        XCTAssertNil(backend.data(kind: .agreement, fingerprint: identity.fingerprint))
++        XCTAssertNil(backend.data(kind: .signing, fingerprint: identity.fingerprint))
++    }
++}
+diff --git a/Tests/ZwzCoreTests/ZWZV3/ZwzKeyFileCodecTests.swift b/Tests/ZwzCoreTests/ZWZV3/ZwzKeyFileCodecTests.swift
+new file mode 100644
+index 0000000..962f2b2
+--- /dev/null
++++ b/Tests/ZwzCoreTests/ZWZV3/ZwzKeyFileCodecTests.swift
+@@ -0,0 +1,134 @@
++import CryptoKit
++import XCTest
++@testable import ZwzCore
++
++final class ZwzKeyFileCodecTests: XCTestCase {
++    func testPublicGoldenBytesAndRoundTrip() throws {
++        let identity = try ZwzKeyFileTestSupport.publicIdentity()
++        let encoded = try ZwzKeyFileCodec.encodePublic(identity)
++
++        XCTAssertEqual(encoded.prefix(4), Data("ZWZP".utf8))
++        XCTAssertEqual(encoded.count, 32 + 5 + 64 + 32 + 32)
++        XCTAssertEqual(Array(encoded.prefix(32)), [
++            0x5a, 0x57, 0x5a, 0x50, 0x01, 0x00, 0x20, 0x00,
++            0x01, 0x01, 0x01, 0x00, 0x05, 0x00, 0x00, 0x00,
++            0x40, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
++            0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
++        ])
++        XCTAssertEqual(try ZwzKeyFileCodec.decodePublic(encoded), identity)
++    }
++
++    func testPublicEncoderRecomputesFingerprint() throws {
++        let valid = try ZwzKeyFileTestSupport.publicIdentity()
++        let mismatched = ZwzPublicIdentity(
++            name: valid.name,
++            fingerprint: String(repeating: "0", count: 64),
++            agreementPublicKey: valid.agreementPublicKey,
++            signingPublicKey: valid.signingPublicKey
++        )
++        let decoded = try ZwzKeyFileCodec.decodePublic(ZwzKeyFileCodec.encodePublic(mismatched))
++        XCTAssertEqual(decoded.fingerprint, valid.fingerprint)
++    }
++
++    func testPublicParserRejectsEveryHeaderFieldTruncationAndTrailingBytes() throws {
++        let encoded = try ZwzKeyFileCodec.encodePublic(ZwzKeyFileTestSupport.publicIdentity())
++        let mutations: [Data] = [
++            ZwzKeyFileTestSupport.replacing(encoded, at: 0, with: 0),
++            ZwzKeyFileTestSupport.replacing(encoded, at: 4, with: 2),
++            ZwzKeyFileTestSupport.replacing(encoded, at: 6, with: 31),
++            ZwzKeyFileTestSupport.replacing(encoded, at: 8, with: 2),
++            ZwzKeyFileTestSupport.replacing(encoded, at: 9, with: 2),
++            ZwzKeyFileTestSupport.replacing(encoded, at: 10, with: 2),
++            ZwzKeyFileTestSupport.replacing(encoded, at: 11, with: 1),
++            ZwzKeyFileTestSupport.writing(UInt32(0), to: encoded, at: 12),
++            ZwzKeyFileTestSupport.writing(UInt32(63), to: encoded, at: 16),
++            ZwzKeyFileTestSupport.writing(UInt32.max, to: encoded, at: 20),
++            ZwzKeyFileTestSupport.writing(UInt32(31), to: encoded, at: 24),
++            ZwzKeyFileTestSupport.replacing(encoded, at: 28, with: 1),
++            Data(encoded.dropLast()),
++            encoded + Data([0])
++        ]
++        for mutation in mutations {
++            XCTAssertThrowsError(try ZwzKeyFileCodec.decodePublic(mutation)) {
++                XCTAssertEqual($0 as? ZwzV3Error, .invalidKeyFile)
++            }
++        }
++    }
++
++    func testPublicParserRejectsInvalidUTF8FingerprintAndKeyBinding() throws {
++        let encoded = try ZwzKeyFileCodec.encodePublic(ZwzKeyFileTestSupport.publicIdentity())
++        for offset in [32, 37, 37 + 64, 37 + 64 + 32] {
++            var mutation = encoded
++            mutation[offset] ^= 0xff
++            XCTAssertThrowsError(try ZwzKeyFileCodec.decodePublic(mutation)) {
++                XCTAssertEqual($0 as? ZwzV3Error, .invalidKeyFile)
++            }
++        }
++    }
++
++    func testBackupRoundTripsWithoutPlaintextSecretsOrName() throws {
++        let backup = try ZwzKeyFileTestSupport.backup()
++        XCTAssertEqual(backup.prefix(4), Data("ZWZB".utf8))
++        XCTAssertNil(backup.range(of: ZwzKeyFileTestSupport.agreementPrivateKey))
++        XCTAssertNil(backup.range(of: ZwzKeyFileTestSupport.signingPrivateKey))
++        XCTAssertNil(backup.range(of: Data("Alice".utf8)))
++        XCTAssertEqual(
++            try ZwzKeyFileCodec.decodeBackup(
++                backup, password: "correct horse battery staple"
++            ),
++            try ZwzKeyFileTestSupport.privateIdentity()
++        )
++    }
++
++    func testBackupRejectsEmptyPasswordWrongPasswordAndAuthenticatedMutations() throws {
++        let backup = try ZwzKeyFileTestSupport.backup()
++        XCTAssertThrowsError(try ZwzKeyFileCodec.encodeBackup(
++            ZwzKeyFileTestSupport.privateIdentity(), password: ""
++        ))
++        XCTAssertThrowsError(try ZwzKeyFileCodec.decodeBackup(backup, password: ""))
++        XCTAssertThrowsError(try ZwzKeyFileCodec.decodeBackup(backup, password: "wrong"))
++
++        let fastBackup = try ZwzKeyFileTestSupport.fastBackup()
++        for offset in [64, 80, 92, fastBackup.count - 1] {
++            var mutation = fastBackup
++            mutation[offset] ^= 1
++            XCTAssertThrowsError(try ZwzKeyFileCodec.decodeBackup(
++                mutation,
++                password: "correct horse battery staple",
++                deriveKey: { _, _ in ZwzKeyFileTestSupport.fastDerivedKey }
++            )) { XCTAssertEqual($0 as? ZwzV3Error, .invalidBackup) }
++        }
++    }
++
++    func testBackupRejectsUnsupportedHeaderAndLengthBeforeDerivation() throws {
++        let backup = try ZwzKeyFileTestSupport.fastBackup()
++        let mutations: [Data] = [
++            ZwzKeyFileTestSupport.replacing(backup, at: 0, with: 0),
++            ZwzKeyFileTestSupport.replacing(backup, at: 4, with: 2),
++            ZwzKeyFileTestSupport.replacing(backup, at: 6, with: 63),
++            ZwzKeyFileTestSupport.replacing(backup, at: 8, with: 2),
++            ZwzKeyFileTestSupport.replacing(backup, at: 9, with: 2),
++            ZwzKeyFileTestSupport.replacing(backup, at: 10, with: 2),
++            ZwzKeyFileTestSupport.replacing(backup, at: 11, with: 2),
++            ZwzKeyFileTestSupport.writing(UInt32(32_768), to: backup, at: 12),
++            ZwzKeyFileTestSupport.writing(UInt32(9), to: backup, at: 16),
++            ZwzKeyFileTestSupport.writing(UInt32(2), to: backup, at: 20),
++            ZwzKeyFileTestSupport.writing(UInt16(15), to: backup, at: 24),
++            ZwzKeyFileTestSupport.writing(UInt16(11), to: backup, at: 26),
++            ZwzKeyFileTestSupport.writing(UInt64.max, to: backup, at: 28),
++            ZwzKeyFileTestSupport.replacing(backup, at: 36, with: 1),
++            Data(backup.dropLast()),
++            backup + Data([0])
++        ]
++
++        for mutation in mutations {
++            var derivationCount = 0
++            XCTAssertThrowsError(try ZwzKeyFileCodec.decodeBackup(
++                mutation,
++                password: "correct horse battery staple",
++                deriveKey: { _, _ in derivationCount += 1; return Data(repeating: 0, count: 32) }
++            )) { XCTAssertEqual($0 as? ZwzV3Error, .invalidBackup) }
++            XCTAssertEqual(derivationCount, 0)
++        }
++    }
++}
+diff --git a/Tests/ZwzCoreTests/ZWZV3/ZwzKeyFileTestSupport.swift b/Tests/ZwzCoreTests/ZWZV3/ZwzKeyFileTestSupport.swift
+new file mode 100644
+index 0000000..0236d27
+--- /dev/null
++++ b/Tests/ZwzCoreTests/ZWZV3/ZwzKeyFileTestSupport.swift
+@@ -0,0 +1,162 @@
++import CryptoKit
++import Foundation
++import Security
++@testable import ZwzCore
++
++enum ZwzKeyFileTestSupport {
++    static let agreementPrivateKey = Data((0..<32).map { UInt8($0 + 1) })
++    static let signingPrivateKey = Data((0..<32).map { UInt8($0 + 65) })
++    static let salt = Data((0..<16).map(UInt8.init))
++    static let nonce = Data((16..<28).map(UInt8.init))
++    static let fastDerivedKey = Data(repeating: 0xa5, count: 32)
++
++    static func privateIdentity(name: String = "Alice") throws -> ZwzPrivateIdentity {
++        let agreement = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: agreementPrivateKey)
++        let signing = try Curve25519.Signing.PrivateKey(rawRepresentation: signingPrivateKey)
++        return ZwzPrivateIdentity(
++            name: name,
++            fingerprint: ZwzV3Crypto.fingerprint(
++                agreement: agreement.publicKey.rawRepresentation,
++                signing: signing.publicKey.rawRepresentation
++            ),
++            agreementPrivateKey: agreementPrivateKey,
++            signingPrivateKey: signingPrivateKey
++        )
++    }
++
++    static func publicIdentity(name: String = "Alice") throws -> ZwzPublicIdentity {
++        try privateIdentity(name: name).publicIdentity
++    }
++
++    static func backup(password: String = "correct horse battery staple") throws -> Data {
++        try ZwzKeyFileCodec.encodeBackup(
++            privateIdentity(), password: password, salt: salt, nonce: nonce
++        )
++    }
++
++    static func fastBackup(password: String = "correct horse battery staple") throws -> Data {
++        try ZwzKeyFileCodec.encodeBackup(
++            privateIdentity(),
++            password: password,
++            salt: salt,
++            nonce: nonce,
++            deriveKey: { _, _ in fastDerivedKey }
++        )
++    }
++
++    static func replacing(_ data: Data, at offset: Int, with byte: UInt8) -> Data {
++        var result = data
++        result[offset] = byte
++        return result
++    }
++
++    static func writing<T: FixedWidthInteger>(_ value: T, to data: Data, at offset: Int) -> Data {
++        var result = data
++        var littleEndian = value.littleEndian
++        withUnsafeBytes(of: &littleEndian) { bytes in
++            result.replaceSubrange(offset..<(offset + bytes.count), with: bytes)
++        }
++        return result
++    }
++}
++
++final class FakeZwzKeychainBackend: ZwzKeychainBackend, @unchecked Sendable {
++    enum WriteOperation: Equatable {
++        case add(ZwzKeychainItemKind)
++        case update(ZwzKeychainItemKind)
++        case delete(ZwzKeychainItemKind)
++    }
++
++    struct ItemKey: Hashable {
++        let kind: ZwzKeychainItemKind
++        let fingerprint: String
++    }
++
++    private let lock = NSLock()
++    private var items: [ItemKey: Data] = [:]
++    private var activeCalls = 0
++    private(set) var maximumConcurrentCalls = 0
++    private(set) var deleteCalls: [ZwzKeychainItemKind] = []
++    private(set) var transactionWrites: [WriteOperation] = []
++    var addFailures: [ZwzKeychainItemKind: OSStatus] = [:]
++    var updateFailures: [ZwzKeychainItemKind: OSStatus] = [:]
++    var deleteFailures: [ZwzKeychainItemKind: OSStatus] = [:]
++    var operationDelay: TimeInterval = 0
++
++    func seed(kind: ZwzKeychainItemKind, fingerprint: String, data: Data) {
++        lock.withLock { items[ItemKey(kind: kind, fingerprint: fingerprint)] = data }
++    }
++
++    func data(kind: ZwzKeychainItemKind, fingerprint: String) -> Data? {
++        lock.withLock { items[ItemKey(kind: kind, fingerprint: fingerprint)] }
++    }
++
++    func add(kind: ZwzKeychainItemKind, fingerprint: String, data: Data) -> OSStatus {
++        call {
++            transactionWrites.append(.add(kind))
++            if let failure = addFailures[kind] { return failure }
++            let key = ItemKey(kind: kind, fingerprint: fingerprint)
++            guard items[key] == nil else { return errSecDuplicateItem }
++            items[key] = data
++            return errSecSuccess
++        }
++    }
++
++    func update(kind: ZwzKeychainItemKind, fingerprint: String, data: Data) -> OSStatus {
++        call {
++            transactionWrites.append(.update(kind))
++            if let failure = updateFailures[kind] { return failure }
++            let key = ItemKey(kind: kind, fingerprint: fingerprint)
++            guard items[key] != nil else { return errSecItemNotFound }
++            items[key] = data
++            return errSecSuccess
++        }
++    }
++
++    func read(
++        kind: ZwzKeychainItemKind,
++        fingerprint: String,
++        authenticationReason: String?
++    ) -> ZwzKeychainReadResult {
++        call {
++            guard let data = items[ItemKey(kind: kind, fingerprint: fingerprint)] else {
++                return ZwzKeychainReadResult(status: errSecItemNotFound, items: [])
++            }
++            return ZwzKeychainReadResult(status: errSecSuccess, items: [data])
++        }
++    }
++
++    func readAll(kind: ZwzKeychainItemKind) -> ZwzKeychainReadResult {
++        call {
++            let values = items.compactMap { $0.key.kind == kind ? $0.value : nil }
++            return ZwzKeychainReadResult(
++                status: values.isEmpty ? errSecItemNotFound : errSecSuccess,
++                items: values
++            )
++        }
++    }
++
++    func delete(kind: ZwzKeychainItemKind, fingerprint: String) -> OSStatus {
++        call {
++            deleteCalls.append(kind)
++            transactionWrites.append(.delete(kind))
++            if let failure = deleteFailures[kind] { return failure }
++            let removed = items.removeValue(forKey: ItemKey(kind: kind, fingerprint: fingerprint))
++            return removed == nil ? errSecItemNotFound : errSecSuccess
++        }
++    }
++
++    private func call<T>(_ operation: () -> T) -> T {
++        lock.lock()
++        activeCalls += 1
++        maximumConcurrentCalls = max(maximumConcurrentCalls, activeCalls)
++        lock.unlock()
++        if operationDelay > 0 { Thread.sleep(forTimeInterval: operationDelay) }
++        lock.lock()
++        defer {
++            activeCalls -= 1
++            lock.unlock()
++        }
++        return operation()
++    }
++}

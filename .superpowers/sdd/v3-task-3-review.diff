@@ -1,0 +1,1057 @@
+diff --git a/Sources/ZwzCore/ZWZV3/ZwzV3ArchiveCodec.swift b/Sources/ZwzCore/ZWZV3/ZwzV3ArchiveCodec.swift
+new file mode 100644
+index 0000000..c4bf24d
+--- /dev/null
++++ b/Sources/ZwzCore/ZWZV3/ZwzV3ArchiveCodec.swift
+@@ -0,0 +1,76 @@
++import Foundation
++
++public enum ZwzV3ArchiveCodec {
++    public static func encode(
++        recipients: [ZwzV3RecipientEnvelope],
++        dataRegion: Data,
++        encryptedIndex: Data,
++        signer: ZwzV3SignerRecord?,
++        archiveID: UUID,
++        dataBlockCount: UInt64
++    ) throws -> Data {
++        guard !recipients.isEmpty,
++              let recipientCount = UInt32(exactly: recipients.count),
++              !encryptedIndex.isEmpty,
++              !dataRegion.isEmpty || dataBlockCount == 0 else {
++            throw ZwzV3Error.malformedArchive("invalid archive regions")
++        }
++
++        var recipientRegion = Data()
++        for recipient in recipients {
++            recipientRegion.append(try ZwzV3BinaryCodec.encodeRecipient(recipient))
++        }
++
++        let signerRegion = try signer.map(ZwzV3BinaryCodec.encodeSigner) ?? Data()
++        let headerLength = UInt64(ZwzV3Header.encodedLength)
++        let recipientOffset = headerLength
++        let dataOffset = try checkedAdd(recipientOffset, UInt64(recipientRegion.count))
++        let indexOffset = try checkedAdd(dataOffset, UInt64(dataRegion.count))
++        let signerOffset = try checkedAdd(indexOffset, UInt64(encryptedIndex.count))
++        let archiveLength = try checkedAdd(signerOffset, UInt64(signerRegion.count))
++
++        let signatureOffset: UInt64
++        if signer != nil {
++            guard signerRegion.count >= 64 else {
++                throw ZwzV3Error.malformedArchive("invalid signer region")
++            }
++            signatureOffset = archiveLength - 64
++        } else {
++            signatureOffset = 0
++        }
++
++        let header = ZwzV3Header(
++            archiveID: archiveID,
++            recipientCount: recipientCount,
++            recipientRegionOffset: recipientOffset,
++            recipientRegionLength: UInt64(recipientRegion.count),
++            dataRegionOffset: dataOffset,
++            dataRegionLength: UInt64(dataRegion.count),
++            encryptedIndexOffset: indexOffset,
++            encryptedIndexLength: UInt64(encryptedIndex.count),
++            signerRegionOffset: signer == nil ? 0 : signerOffset,
++            signerRegionLength: UInt64(signerRegion.count),
++            signatureOffset: signatureOffset,
++            signatureLength: signer == nil ? 0 : 64,
++            dataBlockCount: dataBlockCount,
++            signatureAlgorithm: signer == nil ? .none : .ed25519
++        )
++
++        var archive = try ZwzV3BinaryCodec.encodeHeader(header)
++        guard let capacity = Int(exactly: archiveLength) else {
++            throw ZwzV3Error.malformedArchive("archive too large")
++        }
++        archive.reserveCapacity(capacity)
++        archive.append(recipientRegion)
++        archive.append(dataRegion)
++        archive.append(encryptedIndex)
++        archive.append(signerRegion)
++        return archive
++    }
++
++    private static func checkedAdd(_ lhs: UInt64, _ rhs: UInt64) throws -> UInt64 {
++        let result = lhs.addingReportingOverflow(rhs)
++        guard !result.overflow else { throw ZwzV3Error.malformedArchive("archive too large") }
++        return result.partialValue
++    }
++}
+diff --git a/Sources/ZwzCore/ZWZV3/ZwzV3BinaryCodec.swift b/Sources/ZwzCore/ZWZV3/ZwzV3BinaryCodec.swift
+new file mode 100644
+index 0000000..4defd39
+--- /dev/null
++++ b/Sources/ZwzCore/ZWZV3/ZwzV3BinaryCodec.swift
+@@ -0,0 +1,565 @@
++import Foundation
++
++public enum ZwzV3ContentCipher: UInt8, Equatable, Sendable {
++    case aes256GCM = 1
++}
++
++public enum ZwzV3KeyAgreement: UInt8, Equatable, Sendable {
++    case x25519 = 1
++}
++
++public enum ZwzV3KDF: UInt8, Equatable, Sendable {
++    case hkdfSHA256 = 1
++}
++
++public enum ZwzV3KeyWrapCipher: UInt8, Equatable, Sendable {
++    case aes256GCM = 1
++}
++
++public enum ZwzV3SignatureAlgorithm: UInt8, Equatable, Sendable {
++    case none = 0
++    case ed25519 = 1
++}
++
++public enum ZwzV3IndexCipher: UInt8, Equatable, Sendable {
++    case aes256GCM = 1
++}
++
++public struct ZwzV3Header: Equatable, Sendable {
++    public static let encodedLength = 160
++
++    public var archiveID: UUID
++    public var recipientCount: UInt32
++    public var recipientRegionOffset: UInt64
++    public var recipientRegionLength: UInt64
++    public var dataRegionOffset: UInt64
++    public var dataRegionLength: UInt64
++    public var encryptedIndexOffset: UInt64
++    public var encryptedIndexLength: UInt64
++    public var signerRegionOffset: UInt64
++    public var signerRegionLength: UInt64
++    public var signatureOffset: UInt64
++    public var signatureLength: UInt64
++    public var dataBlockCount: UInt64
++    public var encryption: ZwzArchiveEncryptionKind
++    public var contentCipher: ZwzV3ContentCipher
++    public var keyAgreement: ZwzV3KeyAgreement
++    public var kdf: ZwzV3KDF
++    public var keyWrapCipher: ZwzV3KeyWrapCipher
++    public var signatureAlgorithm: ZwzV3SignatureAlgorithm
++    public var indexCipher: ZwzV3IndexCipher
++
++    public init(
++        archiveID: UUID,
++        recipientCount: UInt32,
++        recipientRegionOffset: UInt64,
++        recipientRegionLength: UInt64,
++        dataRegionOffset: UInt64,
++        dataRegionLength: UInt64,
++        encryptedIndexOffset: UInt64,
++        encryptedIndexLength: UInt64,
++        signerRegionOffset: UInt64 = 0,
++        signerRegionLength: UInt64 = 0,
++        signatureOffset: UInt64 = 0,
++        signatureLength: UInt64 = 0,
++        dataBlockCount: UInt64,
++        encryption: ZwzArchiveEncryptionKind = .publicKey,
++        contentCipher: ZwzV3ContentCipher = .aes256GCM,
++        keyAgreement: ZwzV3KeyAgreement = .x25519,
++        kdf: ZwzV3KDF = .hkdfSHA256,
++        keyWrapCipher: ZwzV3KeyWrapCipher = .aes256GCM,
++        signatureAlgorithm: ZwzV3SignatureAlgorithm = .none,
++        indexCipher: ZwzV3IndexCipher = .aes256GCM
++    ) {
++        self.archiveID = archiveID
++        self.recipientCount = recipientCount
++        self.recipientRegionOffset = recipientRegionOffset
++        self.recipientRegionLength = recipientRegionLength
++        self.dataRegionOffset = dataRegionOffset
++        self.dataRegionLength = dataRegionLength
++        self.encryptedIndexOffset = encryptedIndexOffset
++        self.encryptedIndexLength = encryptedIndexLength
++        self.signerRegionOffset = signerRegionOffset
++        self.signerRegionLength = signerRegionLength
++        self.signatureOffset = signatureOffset
++        self.signatureLength = signatureLength
++        self.dataBlockCount = dataBlockCount
++        self.encryption = encryption
++        self.contentCipher = contentCipher
++        self.keyAgreement = keyAgreement
++        self.kdf = kdf
++        self.keyWrapCipher = keyWrapCipher
++        self.signatureAlgorithm = signatureAlgorithm
++        self.indexCipher = indexCipher
++    }
++}
++
++public struct ZwzV3ParsedArchive: Equatable, Sendable {
++    public let header: ZwzV3Header
++    public let recipients: [ZwzV3RecipientEnvelope]
++    public let signer: ZwzV3SignerRecord?
++    public let dataRegion: Data
++    public let encryptedIndex: Data
++    public let canonicalSignedBytes: Data
++
++    public init(
++        header: ZwzV3Header,
++        recipients: [ZwzV3RecipientEnvelope],
++        signer: ZwzV3SignerRecord?,
++        dataRegion: Data,
++        encryptedIndex: Data,
++        canonicalSignedBytes: Data
++    ) {
++        self.header = header
++        self.recipients = recipients
++        self.signer = signer
++        self.dataRegion = dataRegion
++        self.encryptedIndex = encryptedIndex
++        self.canonicalSignedBytes = canonicalSignedBytes
++    }
++}
++
++public enum ZwzV3BinaryCodec {
++    private static let magic = Data([0x5A, 0x57, 0x5A, 0x33])
++    private static let version: UInt16 = 3
++    private static let signedFlag: UInt32 = 1
++
++    public static func encodeHeader(_ header: ZwzV3Header) throws -> Data {
++        try validateHeader(header)
++
++        var data = Data(repeating: 0, count: ZwzV3Header.encodedLength)
++        data.replaceSubrange(0..<4, with: magic)
++        write(version, to: &data, at: 4)
++        write(UInt16(ZwzV3Header.encodedLength), to: &data, at: 6)
++        write(header.signatureAlgorithm == .ed25519 ? signedFlag : 0, to: &data, at: 8)
++        data[12] = header.encryption.rawValue
++        data[13] = header.contentCipher.rawValue
++        data[14] = header.keyAgreement.rawValue
++        data[15] = header.kdf.rawValue
++        data[16] = header.keyWrapCipher.rawValue
++        data[17] = header.signatureAlgorithm.rawValue
++        data[18] = header.indexCipher.rawValue
++        writeUUID(header.archiveID, to: &data, at: 20)
++        write(header.recipientCount, to: &data, at: 36)
++        write(header.recipientRegionOffset, to: &data, at: 40)
++        write(header.recipientRegionLength, to: &data, at: 48)
++        write(header.dataRegionOffset, to: &data, at: 56)
++        write(header.dataRegionLength, to: &data, at: 64)
++        write(header.encryptedIndexOffset, to: &data, at: 72)
++        write(header.encryptedIndexLength, to: &data, at: 80)
++        write(header.signerRegionOffset, to: &data, at: 88)
++        write(header.signerRegionLength, to: &data, at: 96)
++        write(header.signatureOffset, to: &data, at: 104)
++        write(header.signatureLength, to: &data, at: 112)
++        write(header.dataBlockCount, to: &data, at: 120)
++        return data
++    }
++
++    public static func decodeHeader(_ input: Data) throws -> ZwzV3Header {
++        let data = Data(input)
++        guard data.count == ZwzV3Header.encodedLength else {
++            throw malformed("invalid header length")
++        }
++        guard data.prefix(4) == magic else { throw malformed("invalid magic") }
++        guard try readUInt16(data, at: 4) == version else { throw malformed("invalid version") }
++        guard try readUInt16(data, at: 6) == UInt16(ZwzV3Header.encodedLength) else {
++            throw malformed("invalid header size")
++        }
++
++        let flags = try readUInt32(data, at: 8)
++        guard flags & ~signedFlag == 0 else { throw malformed("unsupported flags") }
++        guard data[19] == 0, data[128..<160].allSatisfy({ $0 == 0 }) else {
++            throw malformed("nonzero reserved bytes")
++        }
++        guard let encryption = ZwzArchiveEncryptionKind(rawValue: data[12]), encryption == .publicKey,
++              let contentCipher = ZwzV3ContentCipher(rawValue: data[13]),
++              let keyAgreement = ZwzV3KeyAgreement(rawValue: data[14]),
++              let kdf = ZwzV3KDF(rawValue: data[15]),
++              let keyWrapCipher = ZwzV3KeyWrapCipher(rawValue: data[16]),
++              let signatureAlgorithm = ZwzV3SignatureAlgorithm(rawValue: data[17]),
++              let indexCipher = ZwzV3IndexCipher(rawValue: data[18]) else {
++            throw malformed("unsupported algorithm")
++        }
++        guard (flags == signedFlag) == (signatureAlgorithm == .ed25519) else {
++            throw malformed("inconsistent signature state")
++        }
++
++        let header = ZwzV3Header(
++            archiveID: try readUUID(data, at: 20),
++            recipientCount: try readUInt32(data, at: 36),
++            recipientRegionOffset: try readUInt64(data, at: 40),
++            recipientRegionLength: try readUInt64(data, at: 48),
++            dataRegionOffset: try readUInt64(data, at: 56),
++            dataRegionLength: try readUInt64(data, at: 64),
++            encryptedIndexOffset: try readUInt64(data, at: 72),
++            encryptedIndexLength: try readUInt64(data, at: 80),
++            signerRegionOffset: try readUInt64(data, at: 88),
++            signerRegionLength: try readUInt64(data, at: 96),
++            signatureOffset: try readUInt64(data, at: 104),
++            signatureLength: try readUInt64(data, at: 112),
++            dataBlockCount: try readUInt64(data, at: 120),
++            encryption: encryption,
++            contentCipher: contentCipher,
++            keyAgreement: keyAgreement,
++            kdf: kdf,
++            keyWrapCipher: keyWrapCipher,
++            signatureAlgorithm: signatureAlgorithm,
++            indexCipher: indexCipher
++        )
++        try validateHeader(header)
++        return header
++    }
++
++    public static func parse(_ input: Data) throws -> ZwzV3ParsedArchive {
++        let data = Data(input)
++        guard data.count >= ZwzV3Header.encodedLength else { throw malformed("truncated header") }
++        let header = try decodeHeader(data.subdata(in: 0..<ZwzV3Header.encodedLength))
++        let fileLength = UInt64(data.count)
++
++        let recipientEnd = try checkedEnd(header.recipientRegionOffset, header.recipientRegionLength)
++        let dataEnd = try checkedEnd(header.dataRegionOffset, header.dataRegionLength)
++        let indexEnd = try checkedEnd(header.encryptedIndexOffset, header.encryptedIndexLength)
++        guard header.recipientRegionOffset == UInt64(ZwzV3Header.encodedLength),
++              recipientEnd == header.dataRegionOffset,
++              dataEnd == header.encryptedIndexOffset else {
++            throw malformed("non-canonical region layout")
++        }
++        guard header.dataRegionLength != 0 || header.dataBlockCount == 0 else {
++            throw malformed("empty data region with data blocks")
++        }
++
++        let isSigned = header.signatureAlgorithm == .ed25519
++        if isSigned {
++            let signerEnd = try checkedEnd(header.signerRegionOffset, header.signerRegionLength)
++            guard indexEnd == header.signerRegionOffset, signerEnd == fileLength else {
++                throw malformed("non-canonical signed region layout")
++            }
++        } else {
++            guard indexEnd == fileLength else { throw malformed("trailing archive bytes") }
++        }
++
++        let recipients = try decodeRecipients(
++            data,
++            range: try intRange(header.recipientRegionOffset, recipientEnd, fileLength: fileLength),
++            count: header.recipientCount
++        )
++        let dataRegion = data.subdata(
++            in: try intRange(header.dataRegionOffset, dataEnd, fileLength: fileLength)
++        )
++        let encryptedIndex = data.subdata(
++            in: try intRange(header.encryptedIndexOffset, indexEnd, fileLength: fileLength)
++        )
++
++        let signer: ZwzV3SignerRecord?
++        let canonicalSignedBytes: Data
++        if isSigned {
++            let signerEnd = try checkedEnd(header.signerRegionOffset, header.signerRegionLength)
++            signer = try decodeSigner(
++                data,
++                range: try intRange(header.signerRegionOffset, signerEnd, fileLength: fileLength),
++                signatureOffset: header.signatureOffset
++            )
++            let signatureRange = try intRange(
++                header.signatureOffset,
++                try checkedEnd(header.signatureOffset, header.signatureLength),
++                fileLength: fileLength
++            )
++            var canonical = Data()
++            canonical.reserveCapacity(data.count - signatureRange.count)
++            canonical.append(data.prefix(signatureRange.lowerBound))
++            canonical.append(data.suffix(from: signatureRange.upperBound))
++            canonicalSignedBytes = canonical
++        } else {
++            signer = nil
++            canonicalSignedBytes = data
++        }
++
++        return ZwzV3ParsedArchive(
++            header: header,
++            recipients: recipients,
++            signer: signer,
++            dataRegion: dataRegion,
++            encryptedIndex: encryptedIndex,
++            canonicalSignedBytes: canonicalSignedBytes
++        )
++    }
++
++    static func validateRecipient(_ recipient: ZwzV3RecipientEnvelope) throws {
++        guard !recipient.recipientName.utf8.isEmpty,
++              !recipient.recipientFingerprint.utf8.isEmpty,
++              recipient.ephemeralPublicKey.count == 32,
++              recipient.nonce.count == 12,
++              recipient.encryptedContentKey.count == 32,
++              recipient.authenticationTag.count == 16 else {
++            throw malformed("invalid recipient record")
++        }
++    }
++
++    static func validateSigner(_ signer: ZwzV3SignerRecord) throws {
++        guard !signer.name.utf8.isEmpty,
++              !signer.fingerprint.utf8.isEmpty,
++              signer.signingPublicKey.count == 32,
++              signer.signature.count == 64 else {
++            throw malformed("invalid signer record")
++        }
++    }
++
++    static func encodeRecipient(_ recipient: ZwzV3RecipientEnvelope) throws -> Data {
++        try validateRecipient(recipient)
++        var body = Data()
++        try appendString(recipient.recipientName, to: &body)
++        try appendString(recipient.recipientFingerprint, to: &body)
++        body.append(recipient.ephemeralPublicKey)
++        body.append(recipient.nonce)
++        body.append(recipient.encryptedContentKey)
++        body.append(recipient.authenticationTag)
++        return try lengthPrefixed(body)
++    }
++
++    static func encodeSigner(_ signer: ZwzV3SignerRecord) throws -> Data {
++        try validateSigner(signer)
++        var body = Data()
++        try appendString(signer.name, to: &body)
++        try appendString(signer.fingerprint, to: &body)
++        body.append(signer.signingPublicKey)
++        body.append(signer.signature)
++        return try lengthPrefixed(body)
++    }
++
++    private static func validateHeader(_ header: ZwzV3Header) throws {
++        guard header.encryption == .publicKey,
++              header.contentCipher == .aes256GCM,
++              header.keyAgreement == .x25519,
++              header.kdf == .hkdfSHA256,
++              header.keyWrapCipher == .aes256GCM,
++              header.indexCipher == .aes256GCM,
++              header.recipientCount > 0,
++              header.recipientRegionLength > 0,
++              header.encryptedIndexLength > 0 else {
++            throw malformed("invalid header fields")
++        }
++        let recipientEnd = try checkedEnd(header.recipientRegionOffset, header.recipientRegionLength)
++        let dataEnd = try checkedEnd(header.dataRegionOffset, header.dataRegionLength)
++        let indexEnd = try checkedEnd(header.encryptedIndexOffset, header.encryptedIndexLength)
++        guard header.recipientRegionOffset == UInt64(ZwzV3Header.encodedLength),
++              recipientEnd == header.dataRegionOffset,
++              dataEnd == header.encryptedIndexOffset else {
++            throw malformed("non-canonical header layout")
++        }
++
++        switch header.signatureAlgorithm {
++        case .none:
++            guard header.signerRegionOffset == 0,
++                  header.signerRegionLength == 0,
++                  header.signatureOffset == 0,
++                  header.signatureLength == 0 else {
++                throw malformed("inconsistent unsigned header")
++            }
++        case .ed25519:
++            let signerEnd = try checkedEnd(header.signerRegionOffset, header.signerRegionLength)
++            let signatureEnd = try checkedEnd(header.signatureOffset, header.signatureLength)
++            guard header.signerRegionLength > 0,
++                  header.signatureLength == 64,
++                  indexEnd == header.signerRegionOffset,
++                  header.signatureOffset >= header.signerRegionOffset,
++                  signatureEnd == signerEnd else {
++                throw malformed("inconsistent signed header")
++            }
++        }
++    }
++
++    private static func decodeRecipients(
++        _ data: Data,
++        range: Range<Int>,
++        count: UInt32
++    ) throws -> [ZwzV3RecipientEnvelope] {
++        let minimumRecipientRecordLength = 106
++        guard UInt64(count) <= UInt64(range.count / minimumRecipientRecordLength) else {
++            throw malformed("recipient count exceeds region capacity")
++        }
++        var cursor = range.lowerBound
++        var recipients: [ZwzV3RecipientEnvelope] = []
++        recipients.reserveCapacity(Int(count))
++        for _ in 0..<count {
++            let recordEnd = try readRecordEnd(data, cursor: &cursor, limit: range.upperBound)
++            let name = try readString(data, cursor: &cursor, limit: recordEnd)
++            let fingerprint = try readString(data, cursor: &cursor, limit: recordEnd)
++            let ephemeralPublicKey = try readData(data, count: 32, cursor: &cursor, limit: recordEnd)
++            let nonce = try readData(data, count: 12, cursor: &cursor, limit: recordEnd)
++            let encryptedContentKey = try readData(data, count: 32, cursor: &cursor, limit: recordEnd)
++            let authenticationTag = try readData(data, count: 16, cursor: &cursor, limit: recordEnd)
++            guard cursor == recordEnd else { throw malformed("recipient record length mismatch") }
++            recipients.append(ZwzV3RecipientEnvelope(
++                recipientName: name,
++                recipientFingerprint: fingerprint,
++                ephemeralPublicKey: ephemeralPublicKey,
++                nonce: nonce,
++                encryptedContentKey: encryptedContentKey,
++                authenticationTag: authenticationTag
++            ))
++        }
++        guard cursor == range.upperBound else { throw malformed("recipient region length mismatch") }
++        return recipients
++    }
++
++    private static func decodeSigner(
++        _ data: Data,
++        range: Range<Int>,
++        signatureOffset: UInt64
++    ) throws -> ZwzV3SignerRecord {
++        var cursor = range.lowerBound
++        let recordEnd = try readRecordEnd(data, cursor: &cursor, limit: range.upperBound)
++        let name = try readString(data, cursor: &cursor, limit: recordEnd)
++        let fingerprint = try readString(data, cursor: &cursor, limit: recordEnd)
++        let publicKey = try readData(data, count: 32, cursor: &cursor, limit: recordEnd)
++        guard UInt64(cursor) == signatureOffset else { throw malformed("invalid signature offset") }
++        let signature = try readData(data, count: 64, cursor: &cursor, limit: recordEnd)
++        guard cursor == recordEnd, recordEnd == range.upperBound else {
++            throw malformed("signer record length mismatch")
++        }
++        return ZwzV3SignerRecord(
++            name: name,
++            fingerprint: fingerprint,
++            signingPublicKey: publicKey,
++            signature: signature
++        )
++    }
++
++    private static func readRecordEnd(_ data: Data, cursor: inout Int, limit: Int) throws -> Int {
++        let length = try readUInt32Advancing(data, cursor: &cursor, limit: limit)
++        let (end, overflow) = cursor.addingReportingOverflow(Int(length))
++        guard !overflow, end <= limit else { throw malformed("record exceeds region") }
++        return end
++    }
++
++    private static func readString(
++        _ data: Data,
++        cursor: inout Int,
++        limit: Int
++    ) throws -> String {
++        let length = try readUInt32Advancing(data, cursor: &cursor, limit: limit)
++        guard length > 0 else { throw malformed("empty string field") }
++        let bytes = try readData(data, count: Int(length), cursor: &cursor, limit: limit)
++        guard let value = String(data: bytes, encoding: .utf8) else {
++            throw malformed("invalid UTF-8")
++        }
++        return value
++    }
++
++    private static func readUInt32Advancing(
++        _ data: Data,
++        cursor: inout Int,
++        limit: Int
++    ) throws -> UInt32 {
++        let valueData = try readData(data, count: 4, cursor: &cursor, limit: limit)
++        return try readUInt32(valueData, at: 0)
++    }
++
++    private static func readData(
++        _ data: Data,
++        count: Int,
++        cursor: inout Int,
++        limit: Int
++    ) throws -> Data {
++        let (end, overflow) = cursor.addingReportingOverflow(count)
++        guard count >= 0, !overflow, cursor >= 0, end <= limit, end <= data.count else {
++            throw malformed("truncated field")
++        }
++        defer { cursor = end }
++        return data.subdata(in: cursor..<end)
++    }
++
++    private static func appendString(_ string: String, to data: inout Data) throws {
++        let bytes = Data(string.utf8)
++        guard !bytes.isEmpty, let length = UInt32(exactly: bytes.count) else {
++            throw malformed("invalid string length")
++        }
++        append(length, to: &data)
++        data.append(bytes)
++    }
++
++    private static func lengthPrefixed(_ body: Data) throws -> Data {
++        guard let length = UInt32(exactly: body.count) else { throw malformed("record too large") }
++        var data = Data()
++        append(length, to: &data)
++        data.append(body)
++        return data
++    }
++
++    private static func checkedEnd(_ offset: UInt64, _ length: UInt64) throws -> UInt64 {
++        let result = offset.addingReportingOverflow(length)
++        guard !result.overflow else { throw malformed("overflowing region") }
++        return result.partialValue
++    }
++
++    private static func intRange(
++        _ start: UInt64,
++        _ end: UInt64,
++        fileLength: UInt64
++    ) throws -> Range<Int> {
++        guard start <= end, end <= fileLength,
++              let intStart = Int(exactly: start), let intEnd = Int(exactly: end) else {
++            throw malformed("region outside archive")
++        }
++        return intStart..<intEnd
++    }
++
++    private static func writeUUID(_ uuid: UUID, to data: inout Data, at offset: Int) {
++        let value = uuid.uuid
++        data.replaceSubrange(offset..<(offset + 16), with: [
++            value.0, value.1, value.2, value.3, value.4, value.5, value.6, value.7,
++            value.8, value.9, value.10, value.11, value.12, value.13, value.14, value.15,
++        ])
++    }
++
++    private static func readUUID(_ data: Data, at offset: Int) throws -> UUID {
++        guard offset >= 0, offset + 16 <= data.count else { throw malformed("short UUID") }
++        let bytes = Array(data[offset..<(offset + 16)])
++        return UUID(uuid: (
++            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
++            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
++        ))
++    }
++
++    private static func write<T: FixedWidthInteger>(_ value: T, to data: inout Data, at offset: Int) {
++        var value = value.littleEndian
++        Swift.withUnsafeBytes(of: &value) { bytes in
++            data.replaceSubrange(offset..<(offset + bytes.count), with: bytes)
++        }
++    }
++
++    private static func append<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
++        var value = value.littleEndian
++        Swift.withUnsafeBytes(of: &value) { data.append(contentsOf: $0) }
++    }
++
++    private static func readUInt16(_ data: Data, at offset: Int) throws -> UInt16 {
++        try readInteger(data, at: offset, as: UInt16.self)
++    }
++
++    private static func readUInt32(_ data: Data, at offset: Int) throws -> UInt32 {
++        try readInteger(data, at: offset, as: UInt32.self)
++    }
++
++    private static func readUInt64(_ data: Data, at offset: Int) throws -> UInt64 {
++        try readInteger(data, at: offset, as: UInt64.self)
++    }
++
++    private static func readInteger<T: FixedWidthInteger>(
++        _ data: Data,
++        at offset: Int,
++        as: T.Type
++    ) throws -> T {
++        let size = MemoryLayout<T>.size
++        guard offset >= 0, offset <= data.count, size <= data.count - offset else {
++            throw malformed("short integer")
++        }
++        return data[offset..<(offset + size)].enumerated().reduce(into: T.zero) { value, element in
++            value |= T(element.element) << (element.offset * 8)
++        }
++    }
++
++    private static func malformed(_ reason: String) -> ZwzV3Error {
++        .malformedArchive(reason)
++    }
++}
+diff --git a/Tests/ZwzCoreTests/ZWZV3/ZwzV3BinaryCodecTestSupport.swift b/Tests/ZwzCoreTests/ZWZV3/ZwzV3BinaryCodecTestSupport.swift
+new file mode 100644
+index 0000000..e594c31
+--- /dev/null
++++ b/Tests/ZwzCoreTests/ZWZV3/ZwzV3BinaryCodecTestSupport.swift
+@@ -0,0 +1,90 @@
++import Foundation
++@testable import ZwzCore
++
++extension ZwzV3RecipientEnvelope {
++    static func codecFixture(name: String = "Alice", fingerprint: String = "alice-fingerprint") -> Self {
++        Self(
++            recipientName: name,
++            recipientFingerprint: fingerprint,
++            ephemeralPublicKey: Data(repeating: 0x11, count: 32),
++            nonce: Data(repeating: 0x22, count: 12),
++            encryptedContentKey: Data(repeating: 0x33, count: 32),
++            authenticationTag: Data(repeating: 0x44, count: 16)
++        )
++    }
++}
++
++extension ZwzV3SignerRecord {
++    static func codecFixture(signature: Data = Data(repeating: 0x55, count: 64)) -> Self {
++        Self(
++            name: "Sender",
++            fingerprint: "sender-fingerprint",
++            signingPublicKey: Data(repeating: 0x66, count: 32),
++            signature: signature
++        )
++    }
++}
++
++extension Data {
++    static let v3HeaderGolden = Data([
++        0x5A, 0x57, 0x5A, 0x33, 0x03, 0x00, 0xA0, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x01, 0x01, 0x01,
++        0x01, 0x01, 0x01, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67,
++        0x89, 0xAB, 0xCD, 0xEF, 0x02, 0x00, 0x00, 0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x2C, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xCC, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x58, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x82, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x9A, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    ])
++
++    static func fixture() throws -> Data {
++        try ZwzV3ArchiveCodec.encode(
++            recipients: [.codecFixture()],
++            dataRegion: Data([0x70, 0x71, 0x72]),
++            encryptedIndex: Data([0x80, 0x81]),
++            signer: nil,
++            archiveID: UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!,
++            dataBlockCount: 1
++        )
++    }
++
++    static func signedFixture(signature: Data) throws -> Data {
++        try ZwzV3ArchiveCodec.encode(
++            recipients: [.codecFixture()],
++            dataRegion: Data([0x70, 0x71, 0x72]),
++            encryptedIndex: Data([0x80, 0x81]),
++            signer: .codecFixture(signature: signature),
++            archiveID: UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!,
++            dataBlockCount: 1
++        )
++    }
++
++    static func fixtureWithOverlappingIndex() throws -> Data {
++        var archive = try fixture()
++        let dataOffset = readUInt64(at: 56, in: archive)
++        writeUInt64(dataOffset, at: 72, in: &archive)
++        return archive
++    }
++
++    static func writeUInt32(_ value: UInt32, at offset: Int, in data: inout Data) {
++        var value = value.littleEndian
++        Swift.withUnsafeBytes(of: &value) { bytes in
++            data.replaceSubrange(offset..<(offset + 4), with: bytes)
++        }
++    }
++
++    static func writeUInt64(_ value: UInt64, at offset: Int, in data: inout Data) {
++        var value = value.littleEndian
++        Swift.withUnsafeBytes(of: &value) { bytes in
++            data.replaceSubrange(offset..<(offset + 8), with: bytes)
++        }
++    }
++
++    static func readUInt64(at offset: Int, in data: Data) -> UInt64 {
++        data[offset..<(offset + 8)].enumerated().reduce(into: UInt64.zero) { value, element in
++            value |= UInt64(element.element) << (element.offset * 8)
++        }
++    }
++}
+diff --git a/Tests/ZwzCoreTests/ZWZV3/ZwzV3BinaryCodecTests.swift b/Tests/ZwzCoreTests/ZWZV3/ZwzV3BinaryCodecTests.swift
+new file mode 100644
+index 0000000..b5752ea
+--- /dev/null
++++ b/Tests/ZwzCoreTests/ZWZV3/ZwzV3BinaryCodecTests.swift
+@@ -0,0 +1,273 @@
++import Foundation
++import XCTest
++@testable import ZwzCore
++
++final class ZwzV3BinaryCodecTests: XCTestCase {
++    func testGoldenHeaderLocksCanonicalByteLayout() throws {
++        let golden = Data.v3HeaderGolden
++        let expected = ZwzV3Header(
++            archiveID: UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!,
++            recipientCount: 2,
++            recipientRegionOffset: 160,
++            recipientRegionLength: 300,
++            dataRegionOffset: 460,
++            dataRegionLength: 100,
++            encryptedIndexOffset: 560,
++            encryptedIndexLength: 40,
++            signerRegionOffset: 600,
++            signerRegionLength: 130,
++            signatureOffset: 666,
++            signatureLength: 64,
++            dataBlockCount: 3,
++            signatureAlgorithm: .ed25519
++        )
++
++        XCTAssertEqual(golden.count, 160)
++        XCTAssertEqual(Array(golden[0..<4]), [0x5A, 0x57, 0x5A, 0x33])
++        XCTAssertEqual(Array(golden[4..<12]), [0x03, 0x00, 0xA0, 0x00, 0x01, 0x00, 0x00, 0x00])
++        XCTAssertEqual(Array(golden[12..<20]), [0x02, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00])
++        XCTAssertEqual(
++            Array(golden[20..<36]),
++            [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
++             0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]
++        )
++        XCTAssertEqual(
++            Array(golden[36..<128]),
++            [
++                0x02, 0x00, 0x00, 0x00,
++                0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++                0x2C, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++                0xCC, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++                0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++                0x30, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++                0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++                0x58, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++                0x82, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++                0x9A, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++                0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++                0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++            ]
++        )
++        XCTAssertTrue(golden[128..<160].allSatisfy { $0 == 0 })
++        XCTAssertEqual(try ZwzV3BinaryCodec.decodeHeader(golden), expected)
++        XCTAssertEqual(try ZwzV3BinaryCodec.encodeHeader(expected), golden)
++    }
++
++    func testHeaderRoundTripPreservesAlgorithmsAndOffsets() throws {
++        let header = ZwzV3Header(
++            archiveID: UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")!,
++            recipientCount: 2,
++            recipientRegionOffset: 160,
++            recipientRegionLength: 300,
++            dataRegionOffset: 460,
++            dataRegionLength: 100,
++            encryptedIndexOffset: 560,
++            encryptedIndexLength: 40,
++            signerRegionOffset: 600,
++            signerRegionLength: 130,
++            signatureOffset: 666,
++            signatureLength: 64,
++            dataBlockCount: 3,
++            signatureAlgorithm: .ed25519
++        )
++
++        XCTAssertEqual(
++            try ZwzV3BinaryCodec.decodeHeader(ZwzV3BinaryCodec.encodeHeader(header)),
++            header
++        )
++    }
++
++    func testUnsignedArchiveRoundTripPreservesOpaqueRegionsAndRecipients() throws {
++        let archive = try Data.fixture()
++        let parsed = try ZwzV3BinaryCodec.parse(archive)
++
++        XCTAssertEqual(parsed.recipients, [.codecFixture()])
++        XCTAssertEqual(parsed.dataRegion, Data([0x70, 0x71, 0x72]))
++        XCTAssertEqual(parsed.encryptedIndex, Data([0x80, 0x81]))
++        XCTAssertNil(parsed.signer)
++        XCTAssertEqual(parsed.canonicalSignedBytes, archive)
++    }
++
++    func testSignedArchiveRoundTripAndCanonicalBytesExcludeOnlySignatureValue() throws {
++        let firstArchive = try Data.signedFixture(signature: Data(repeating: 1, count: 64))
++        let secondArchive = try Data.signedFixture(signature: Data(repeating: 2, count: 64))
++        let first = try ZwzV3BinaryCodec.parse(firstArchive)
++        let second = try ZwzV3BinaryCodec.parse(secondArchive)
++
++        XCTAssertEqual(first.signer, .codecFixture(signature: Data(repeating: 1, count: 64)))
++        XCTAssertEqual(first.canonicalSignedBytes, second.canonicalSignedBytes)
++        XCTAssertEqual(first.canonicalSignedBytes.count, firstArchive.count - 64)
++        XCTAssertEqual(
++            first.canonicalSignedBytes,
++            firstArchive.prefix(Int(first.header.signatureOffset))
++        )
++    }
++
++    func testParserRejectsEveryTruncationBoundary() throws {
++        let archives = [
++            try Data.fixture(),
++            try Data.signedFixture(signature: Data(repeating: 1, count: 64)),
++        ]
++
++        for archive in archives {
++            for length in 0..<archive.count {
++                assertMalformed(archive.prefix(length), "accepted truncation at byte \(length)")
++            }
++        }
++    }
++
++    func testParserRejectsOverlappingGappedAndTrailingRegions() throws {
++        assertMalformed(try Data.fixtureWithOverlappingIndex())
++
++        var gapped = try Data.fixture()
++        Data.writeUInt64(Data.readUInt64(at: 72, in: gapped) + 1, at: 72, in: &gapped)
++        assertMalformed(gapped)
++
++        var trailing = try Data.fixture()
++        trailing.append(0)
++        assertMalformed(trailing)
++    }
++
++    func testParserRejectsCorruptRecordLengthsAndInvalidUTF8() throws {
++        let fixture = try Data.fixture()
++        let recipientOffset = Int(Data.readUInt64(at: 40, in: fixture))
++
++        var impossibleRecipientCount = fixture
++        Data.writeUInt32(.max, at: 36, in: &impossibleRecipientCount)
++        assertMalformed(impossibleRecipientCount)
++
++        for length: UInt32 in [0, 1, UInt32.max] {
++            var archive = fixture
++            Data.writeUInt32(length, at: recipientOffset, in: &archive)
++            assertMalformed(archive)
++        }
++
++        var invalidUTF8 = fixture
++        invalidUTF8[recipientOffset + 8] = 0xFF
++        assertMalformed(invalidUTF8)
++
++        var corruptNameLength = fixture
++        Data.writeUInt32(.max, at: recipientOffset + 4, in: &corruptNameLength)
++        assertMalformed(corruptNameLength)
++
++        var corruptFingerprintLength = fixture
++        let recipientFingerprintLengthOffset = recipientOffset + 8 + "Alice".utf8.count
++        Data.writeUInt32(.max, at: recipientFingerprintLengthOffset, in: &corruptFingerprintLength)
++        assertMalformed(corruptFingerprintLength)
++
++        let signed = try Data.signedFixture(signature: Data(repeating: 1, count: 64))
++        let signerOffset = Int(Data.readUInt64(at: 88, in: signed))
++        for lengthOffset in [signerOffset + 4, signerOffset + 8 + "Sender".utf8.count] {
++            var corruptSignerStringLength = signed
++            Data.writeUInt32(.max, at: lengthOffset, in: &corruptSignerStringLength)
++            assertMalformed(corruptSignerStringLength)
++        }
++
++        for delta: Int64 in [-1, 1] {
++            var corruptSignatureOffset = signed
++            let signatureOffset = Data.readUInt64(at: 104, in: signed)
++            Data.writeUInt64(UInt64(Int64(signatureOffset) + delta), at: 104, in: &corruptSignatureOffset)
++            assertMalformed(corruptSignatureOffset)
++        }
++    }
++
++    func testParserRejectsEmptyDataRegionWithNonzeroBlockCount() throws {
++        var archive = try Data.fixture()
++        let dataOffset = Int(Data.readUInt64(at: 56, in: archive))
++        let indexOffset = Int(Data.readUInt64(at: 72, in: archive))
++        archive.removeSubrange(dataOffset..<indexOffset)
++        Data.writeUInt64(0, at: 64, in: &archive)
++        Data.writeUInt64(UInt64(dataOffset), at: 72, in: &archive)
++
++        assertMalformed(archive)
++    }
++
++    func testParserRejectsUnknownFlagsAlgorithmsReservedBytesAndInconsistentSignature() throws {
++        let fixture = try Data.fixture()
++        for mutation: (inout Data) -> Void in [
++            { $0[8] = 0x02 },
++            { $0[12] = 0xFF },
++            { $0[13] = 0xFF },
++            { $0[14] = 0xFF },
++            { $0[15] = 0xFF },
++            { $0[16] = 0xFF },
++            { $0[17] = 0xFF },
++            { $0[18] = 0xFF },
++            { $0[19] = 0x01 },
++            { $0[128] = 0x01 },
++            { $0[8] = 0x01 },
++        ] {
++            var archive = fixture
++            mutation(&archive)
++            assertMalformed(archive)
++        }
++
++        var overflowing = fixture
++        Data.writeUInt64(.max, at: 40, in: &overflowing)
++        assertMalformed(overflowing)
++    }
++
++    func testEncoderRejectsEmptyRequiredRegionsAndWrongCryptoFieldSizes() throws {
++        let recipient = ZwzV3RecipientEnvelope.codecFixture()
++        let arguments: [(ZwzV3RecipientEnvelope, Data)] = [
++            (ZwzV3RecipientEnvelope(
++                recipientName: recipient.recipientName,
++                recipientFingerprint: recipient.recipientFingerprint,
++                ephemeralPublicKey: Data(repeating: 0, count: 31),
++                nonce: recipient.nonce,
++                encryptedContentKey: recipient.encryptedContentKey,
++                authenticationTag: recipient.authenticationTag
++            ), Data([1])),
++            (ZwzV3RecipientEnvelope(
++                recipientName: recipient.recipientName,
++                recipientFingerprint: recipient.recipientFingerprint,
++                ephemeralPublicKey: recipient.ephemeralPublicKey,
++                nonce: Data(repeating: 0, count: 11),
++                encryptedContentKey: recipient.encryptedContentKey,
++                authenticationTag: recipient.authenticationTag
++            ), Data([1])),
++        ]
++
++        for (invalidRecipient, index) in arguments {
++            XCTAssertThrowsError(try encode(recipients: [invalidRecipient], encryptedIndex: index))
++        }
++        XCTAssertThrowsError(try encode(recipients: [], encryptedIndex: Data([1])))
++        XCTAssertThrowsError(try encode(recipients: [recipient], encryptedIndex: Data()))
++        XCTAssertThrowsError(try encode(recipients: [recipient], dataRegion: Data(), dataBlockCount: 1))
++        XCTAssertNoThrow(try encode(recipients: [recipient], dataRegion: Data(), dataBlockCount: 0))
++        XCTAssertThrowsError(try encode(
++            recipients: [recipient],
++            signer: .codecFixture(signature: Data(repeating: 0, count: 63))
++        ))
++    }
++
++    private func encode(
++        recipients: [ZwzV3RecipientEnvelope],
++        dataRegion: Data = Data([1]),
++        encryptedIndex: Data = Data([2]),
++        signer: ZwzV3SignerRecord? = nil,
++        dataBlockCount: UInt64 = 1
++    ) throws -> Data {
++        try ZwzV3ArchiveCodec.encode(
++            recipients: recipients,
++            dataRegion: dataRegion,
++            encryptedIndex: encryptedIndex,
++            signer: signer,
++            archiveID: UUID(),
++            dataBlockCount: dataBlockCount
++        )
++    }
++
++    private func assertMalformed<T: DataProtocol>(
++        _ bytes: T,
++        _ message: String = "",
++        file: StaticString = #filePath,
++        line: UInt = #line
++    ) {
++        XCTAssertThrowsError(try ZwzV3BinaryCodec.parse(Data(bytes)), message, file: file, line: line) {
++            guard case .malformedArchive = $0 as? ZwzV3Error else {
++                return XCTFail("expected malformedArchive, got \($0)", file: file, line: line)
++            }
++        }
++    }
++}
+diff --git a/docs/superpowers/specs/2026-07-12-public-key-encryption-design.md b/docs/superpowers/specs/2026-07-12-public-key-encryption-design.md
+index 863bb7d..fa5beb9 100644
+--- a/docs/superpowers/specs/2026-07-12-public-key-encryption-design.md
++++ b/docs/superpowers/specs/2026-07-12-public-key-encryption-design.md
+@@ -91,6 +91,24 @@
+ 
+ 旧文件无需转换。新写入逻辑不能改变旧版解码行为。
+ 
++### V3 二进制封装规范
++
++V3 固定头部为 160 字节，所有整数使用小端序，所有 offset 都是从逻辑完整文件第 0
++字节开始计算的绝对 `UInt64`。头部依次记录 `ZWZ3` magic、版本与头部长度、签名标志、
++公钥加密/AES-256-GCM/X25519/HKDF-SHA-256/Ed25519 算法 ID、archive UUID、接收方数量，
++以及接收方、数据、加密索引、签名者和签名值的 offset/length。算法 ID、标志或 reserved
++字段出现未知值时必须拒绝读取。
++
++文件区域按“固定头部、接收方记录、数据、加密索引、可选签名者记录”严格连续排列，
++不允许间隙、重叠或尾随字节。接收方记录使用长度前缀 UTF-8 名称和指纹，随后是固定长度
++的 32 字节 X25519 临时公钥、12 字节 nonce、32 字节内容密钥密文和 16 字节认证标签。
++签名者记录使用长度前缀名称和指纹、32 字节 Ed25519 公钥，最后为 64 字节签名值。
++
++规范签名字节定义为完整文件删除且仅删除头部 `signatureOffset` 指向的 64 字节签名值。
++因此签名 offset/length、签名者名称、指纹和公钥仍属于签名覆盖范围。未签名文件的规范
++字节就是完整文件。完整逐字节 offset 表和编码器约束由 Task 3 实施简报
++`.superpowers/sdd/v3-task-3-brief.md` 固化并作为实现测试依据。
++
+ ## 密钥管理
+ 
+ ### 本机身份
