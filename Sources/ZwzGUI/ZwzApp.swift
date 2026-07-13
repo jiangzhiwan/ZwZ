@@ -62,7 +62,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         let contentView = WorkspaceContentView(workspace: mainWorkspace)
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 640, height: 480),
+            contentRect: NSRect(x: 0, y: 0, width: 960, height: 480),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -75,7 +75,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // This window owns its size; SwiftUI content updates must not resize it.
         hostingController.sizingOptions = []
         window.contentViewController = hostingController
-        window.minSize = NSSize(width: 560, height: 420)
+        window.minSize = NSSize(width: 820, height: 420)
         window.alphaValue = 0
         window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
@@ -438,6 +438,7 @@ struct ContentView: View {
                 }
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .id(languageManager.currentLanguage)
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers)
@@ -1400,8 +1401,17 @@ struct ZWZErrorView: View {
 struct ZWZArchiveContentView: View {
     @ObservedObject var viewModel: ArchiveViewModel
     @ObservedObject private var virtualDisk = VirtualDiskManager.shared
+    @StateObject private var entryPreviewModel = ArchiveEntryPreviewModel()
     @State private var showMountOptions = false
     @State private var capacityMB = 256
+    @State private var isPreviewSidebarPresented = false
+    @State private var closedPreviewEntryID: UUID?
+    @State private var windowFrameBeforePreview: NSRect?
+    @State private var previewWindowNumber: Int?
+    @State private var previewWindowRestorationGate = ArchivePreviewWindowRestorationGate()
+    @AppStorage(ArchiveEntryPreviewSettings.sidebarEnabledKey) private var previewSidebarEnabled = true
+    @AppStorage(ArchiveEntryPreviewSettings.triggerKey) private var previewTrigger = "single"
+    @AppStorage(ArchiveEntryPreviewSettings.sidebarWidthKey) private var previewSidebarWidth = ArchiveEntryPreviewSettings.defaultSidebarWidth
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1576,117 +1586,47 @@ struct ZWZArchiveContentView: View {
 
             Divider()
 
-            // 文件列表
-            if viewModel.isSearching && viewModel.previewEntries.isEmpty {
-                VStack(spacing: 10) {
-                    Image(systemName: "magnifyingglass")
-                        .font(.system(size: 28, weight: .light))
-                        .foregroundColor(.secondary)
-                    Text(L.string("no_search_results"))
-                        .font(.system(size: 13, design: .rounded))
-                        .foregroundColor(.secondary)
+            HStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    archiveEntryList
+                    archiveFooter
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                List(viewModel.previewEntries, selection: $viewModel.selectedEntryId) { entry in
-                    HStack(spacing: 12) {
-                        if entry.isDirectory {
-                            Button {
-                                viewModel.openEntry(entry: entry)
-                            } label: {
-                                Image(systemName: ArchiveEntryPresentation.iconName(forFileNamed: entry.name, isDirectory: true))
-                                    .foregroundColor(.zwzPink)
-                                    .font(.system(size: 16))
-                                    .frame(width: 28, height: 28)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                        } else {
-                            Image(systemName: ArchiveEntryPresentation.iconName(forFileNamed: entry.name, isDirectory: false))
-                                .foregroundColor(.zwzBlue)
-                                .font(.system(size: 16))
-                        }
 
-                        if entry.isDirectory {
-                            Button {
-                                viewModel.openEntry(entry: entry)
-                            } label: {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(entry.name)
-                                        .font(.system(size: 14, design: .rounded))
-                                    Text(entry.path)
-                                        .font(.system(size: 11))
-                                        .foregroundColor(.secondary)
-                                }
-                                .padding(.vertical, 2)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                        } else {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(entry.name)
-                                    .font(.system(size: 14, design: .rounded))
-                                Text(entry.path)
-                                    .font(.system(size: 11))
-                                    .foregroundColor(.secondary)
-                            }
-                        }
-
-                        Spacer()
-
-                        if viewModel.selectedEntryId == entry.id {
-                            Image(systemName: "checkmark.circle.fill")
-                                .foregroundColor(.zwzBlue)
-                                .font(.system(size: 12))
-                        }
-
-                        if entry.isDirectory {
-                            Image(systemName: "chevron.right")
-                                .font(.system(size: 11))
-                                .foregroundColor(.zwzBlue)
-                        }
-
-                        Text(viewModel.formatBytes(viewModel.displaySize(for: entry)))
-                            .font(.system(size: 11, design: .rounded))
-                            .foregroundColor(.secondary)
-                            .monospacedDigit()
-
-                        if let date = entry.modifiedDate {
-                            Text(viewModel.formatDate(date))
-                                .font(.system(size: 11, design: .rounded))
-                                .foregroundColor(.secondary)
-                                .monospacedDigit()
-                        }
-                    }
-                    .padding(.vertical, 3)
-                    .contentShape(Rectangle())
-                    .onTapGesture(count: 2) {
-                        viewModel.openEntry(entry: entry)
-                    }
-                    .onDrag {
-                        let tempURL = viewModel.extractEntryForDrag(entry: entry)
-                        return NSItemProvider(contentsOf: tempURL) ?? NSItemProvider()
-                    }
+                if isPreviewSidebarPresented {
+                    ZWZArchiveEntryPreviewPane(
+                        model: entryPreviewModel,
+                        formattedSize: entryPreviewModel.currentEntry.map {
+                            viewModel.formatBytes($0.size)
+                        } ?? "",
+                        onClose: closeEntryPreview
+                    )
+                    .frame(width: CGFloat(effectivePreviewSidebarWidth))
+                    .frame(maxHeight: .infinity)
                 }
             }
-
-            // 底部信息
-            HStack(spacing: 16) {
-                Text(L.string("total_items", viewModel.previewEntries.count))
-                    .font(.system(size: 12, design: .rounded))
-                    .foregroundColor(.secondary)
-
-                Spacer()
-
-                Text(L.string("total_size", viewModel.formatBytes(viewModel.previewEntries.reduce(0) { $0 + viewModel.displaySize(for: $1) })))
-                    .font(.system(size: 12, design: .rounded))
-                    .foregroundColor(.secondary)
-            }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 10)
-            .background(.ultraThinMaterial)
+            .id(isPreviewSidebarPresented)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onChange(of: viewModel.selectedEntryId) { _, selectedEntryID in
+            handlePreviewSelectionChange(selectedEntryID)
+        }
+        .onChange(of: previewSidebarEnabled) { _, enabled in
+            if enabled {
+                handlePreviewSelectionChange(viewModel.selectedEntryId)
+            } else {
+                closeEntryPreview()
+            }
+        }
+        .onChange(of: previewTrigger) { _, _ in
+            handlePreviewSelectionChange(viewModel.selectedEntryId)
+        }
+        .onDisappear {
+            hideEntryPreview()
+        }
+        .onAppear {
+            normalizePreviewSidebarWidth()
+        }
         .sheet(isPresented: $showMountOptions) {
             VirtualDiskMountOptionsView(
                 archivePath: viewModel.sourcePath ?? "",
@@ -1696,6 +1636,265 @@ struct ZWZArchiveContentView: View {
                     uncompressedBytes: viewModel.previewEntries.reduce(UInt64(0)) { $0 + UInt64(max(0, viewModel.displaySize(for: $1))) }
                 )
             )
+        }
+    }
+
+    @ViewBuilder
+    private var archiveEntryList: some View {
+        if viewModel.isSearching && viewModel.previewEntries.isEmpty {
+            VStack(spacing: 10) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 28, weight: .light))
+                    .foregroundColor(.secondary)
+                Text(L.string("no_search_results"))
+                    .font(.system(size: 13, design: .rounded))
+                    .foregroundColor(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            List(viewModel.previewEntries, selection: $viewModel.selectedEntryId) { entry in
+                HStack(spacing: 12) {
+                    if entry.isDirectory {
+                        Button {
+                            viewModel.openEntry(entry: entry)
+                        } label: {
+                            Image(systemName: ArchiveEntryPresentation.iconName(forFileNamed: entry.name, isDirectory: true))
+                                .foregroundColor(.zwzPink)
+                                .font(.system(size: 16))
+                                .frame(width: 28, height: 28)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        Image(systemName: ArchiveEntryPresentation.iconName(forFileNamed: entry.name, isDirectory: false))
+                            .foregroundColor(.zwzBlue)
+                            .font(.system(size: 16))
+                    }
+
+                    if entry.isDirectory {
+                        Button {
+                            viewModel.openEntry(entry: entry)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(entry.name)
+                                    .font(.system(size: 14, design: .rounded))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Text(entry.path)
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 2)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(entry.name)
+                                .font(.system(size: 14, design: .rounded))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Text(entry.path)
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+
+                    Spacer()
+
+                    if viewModel.selectedEntryId == entry.id {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.zwzBlue)
+                            .font(.system(size: 12))
+                    }
+
+                    if entry.isDirectory {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 11))
+                            .foregroundColor(.zwzBlue)
+                    }
+
+                    Text(viewModel.formatBytes(viewModel.displaySize(for: entry)))
+                        .font(.system(size: 11, design: .rounded))
+                        .foregroundColor(.secondary)
+                        .monospacedDigit()
+
+                    if let date = entry.modifiedDate {
+                        Text(viewModel.formatDate(date))
+                            .font(.system(size: 11, design: .rounded))
+                            .foregroundColor(.secondary)
+                            .monospacedDigit()
+                    }
+                }
+                .padding(.vertical, 3)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    closedPreviewEntryID = nil
+                    viewModel.selectedEntryId = entry.id
+                }
+                .onTapGesture(count: 2) {
+                    closedPreviewEntryID = nil
+                    viewModel.selectedEntryId = entry.id
+                    if entry.isDirectory || previewTrigger == "single" {
+                        viewModel.openEntry(entry: entry)
+                    } else {
+                        updateEntryPreview(selectedEntryID: entry.id)
+                    }
+                }
+                .onDrag {
+                    let tempURL = viewModel.extractEntryForDrag(entry: entry)
+                    return NSItemProvider(contentsOf: tempURL) ?? NSItemProvider()
+                }
+            }
+        }
+    }
+
+    private var archiveFooter: some View {
+        HStack(spacing: 16) {
+            Text(L.string("total_items", viewModel.previewEntries.count))
+                .font(.system(size: 12, design: .rounded))
+                .foregroundColor(.secondary)
+
+            Spacer()
+
+            Text(L.string("total_size", viewModel.formatBytes(viewModel.previewEntries.reduce(0) { $0 + viewModel.displaySize(for: $1) })))
+                .font(.system(size: 12, design: .rounded))
+                .foregroundColor(.secondary)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial)
+    }
+
+    private func updateEntryPreview(selectedEntryID: UUID?) {
+        guard let selectedEntryID,
+              previewSidebarEnabled,
+              selectedEntryID != closedPreviewEntryID,
+              let entry = viewModel.previewEntries.first(where: { $0.id == selectedEntryID }),
+              !entry.isDirectory,
+              let archivePath = viewModel.sourcePath else {
+            hideEntryPreview()
+            return
+        }
+
+        captureWindowFrameBeforePreviewIfNeeded()
+        isPreviewSidebarPresented = true
+        entryPreviewModel.preview(
+            archivePath: archivePath,
+            entry: entry,
+            password: viewModel.password
+        )
+    }
+
+    private func handlePreviewSelectionChange(_ selectedEntryID: UUID?) {
+        if let selectedEntryID, selectedEntryID != closedPreviewEntryID {
+            closedPreviewEntryID = nil
+        }
+
+        guard previewSidebarEnabled, previewTrigger == "single" else {
+            if entryPreviewModel.currentEntry?.id != selectedEntryID {
+                hideEntryPreview()
+            }
+            return
+        }
+        updateEntryPreview(selectedEntryID: selectedEntryID)
+    }
+
+    private func closeEntryPreview() {
+        closedPreviewEntryID = entryPreviewModel.currentEntry?.id
+        hideEntryPreview()
+        viewModel.selectedEntryId = nil
+    }
+
+    private func hideEntryPreview() {
+        let frameToRestore = windowFrameBeforePreview
+        let windowNumber = previewWindowNumber
+
+        isPreviewSidebarPresented = false
+        entryPreviewModel.clear()
+
+        guard let frameToRestore, let windowNumber else { return }
+        let restorationToken = previewWindowRestorationGate.beginRestoration()
+        DispatchQueue.main.async {
+            // Let the HSplitView finish removing the preview column first.
+            DispatchQueue.main.async {
+                guard previewWindowRestorationGate.accepts(restorationToken) else {
+                    return
+                }
+                guard let window = NSApp.windows.first(where: { $0.windowNumber == windowNumber }) else {
+                    windowFrameBeforePreview = nil
+                    previewWindowNumber = nil
+                    return
+                }
+                let contentSize = window.contentRect(forFrameRect: frameToRestore).size
+                window.setFrame(frameToRestore, display: true, animate: true)
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    guard previewWindowRestorationGate.accepts(restorationToken) else { return }
+                    window.setContentSize(contentSize)
+                    window.setFrameOrigin(frameToRestore.origin)
+                    window.contentView?.setFrameSize(contentSize)
+                    window.contentView?.invalidateIntrinsicContentSize()
+                    window.contentView?.needsLayout = true
+                    window.contentView?.layoutSubtreeIfNeeded()
+                    window.contentView?.displayIfNeeded()
+                    windowFrameBeforePreview = nil
+                    previewWindowNumber = nil
+                }
+            }
+        }
+    }
+
+    private func captureWindowFrameBeforePreviewIfNeeded() {
+        previewWindowRestorationGate.invalidateForPreviewOpen()
+        if isPreviewSidebarPresented { return }
+        guard let window = NSApp.mainWindow ?? NSApp.keyWindow,
+              window.title == "ZwZ" else {
+            return
+        }
+        let baselineFrame: NSRect
+        if let existingFrame = windowFrameBeforePreview,
+           previewWindowNumber == window.windowNumber {
+            baselineFrame = existingFrame
+        } else {
+            baselineFrame = window.frame
+            windowFrameBeforePreview = baselineFrame
+            previewWindowNumber = window.windowNumber
+        }
+
+        let sidebarWidth = CGFloat(effectivePreviewSidebarWidth)
+        var expandedFrame = baselineFrame
+        expandedFrame.size.width += sidebarWidth
+
+        if let visibleFrame = window.screen?.visibleFrame {
+            expandedFrame.size.width = min(expandedFrame.width, visibleFrame.width)
+            expandedFrame.origin.x = min(
+                max(expandedFrame.origin.x, visibleFrame.minX),
+                visibleFrame.maxX - expandedFrame.width
+            )
+        }
+        window.setFrame(expandedFrame, display: true, animate: true)
+    }
+
+
+    private var effectivePreviewSidebarWidth: Double {
+        guard previewSidebarWidth <= ArchiveEntryPreviewSettings.maximumSidebarWidth else {
+            return ArchiveEntryPreviewSettings.defaultSidebarWidth
+        }
+        return max(previewSidebarWidth, ArchiveEntryPreviewSettings.minimumSidebarWidth)
+    }
+
+    private func normalizePreviewSidebarWidth() {
+        if previewSidebarWidth > ArchiveEntryPreviewSettings.maximumSidebarWidth {
+            previewSidebarWidth = ArchiveEntryPreviewSettings.defaultSidebarWidth
+        } else if previewSidebarWidth < ArchiveEntryPreviewSettings.minimumSidebarWidth {
+            previewSidebarWidth = ArchiveEntryPreviewSettings.minimumSidebarWidth
         }
     }
 }
@@ -2468,11 +2667,57 @@ struct CompressionSettingsView: View {
 
 struct PreviewSettingsView: View {
     @AppStorage("zwz_preview_show_hidden") private var showHiddenFiles = false
+    @AppStorage(ArchiveEntryPreviewSettings.sidebarEnabledKey) private var sidebarEnabled = true
+    @AppStorage(ArchiveEntryPreviewSettings.triggerKey) private var previewTrigger = "single"
+    @AppStorage(ArchiveEntryPreviewSettings.sidebarWidthKey) private var sidebarWidth = ArchiveEntryPreviewSettings.defaultSidebarWidth
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 24) {
+        VStack(alignment: .leading, spacing: 18) {
             Text(SettingsStrings.text("预览设置", "Preview Settings"))
                 .font(.system(size: 18, weight: .semibold, design: .rounded))
+
+            SettingsRow(title: SettingsStrings.text("侧栏预览", "Preview Sidebar")) {
+                Toggle(
+                    SettingsStrings.text("启用侧栏预览", "Enable preview sidebar"),
+                    isOn: $sidebarEnabled
+                )
+                .toggleStyle(.switch)
+                .font(.system(size: 13, design: .rounded))
+            }
+
+            SettingsRow(title: SettingsStrings.text("触发方式", "Preview Trigger")) {
+                Picker("", selection: $previewTrigger) {
+                    Text(SettingsStrings.text("单击", "Single Click")).tag("single")
+                    Text(SettingsStrings.text("双击", "Double Click")).tag("double")
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 220)
+            }
+            .disabled(!sidebarEnabled)
+            .opacity(sidebarEnabled ? 1 : 0.55)
+
+            SettingsRow(
+                title: SettingsStrings.text(
+                    "侧栏宽度：\(Int(sidebarWidth)) px",
+                    "Sidebar Width: \(Int(sidebarWidth)) px"
+                )
+            ) {
+                Slider(
+                    value: $sidebarWidth,
+                    in: ArchiveEntryPreviewSettings.minimumSidebarWidth...ArchiveEntryPreviewSettings.maximumSidebarWidth,
+                    step: 20
+                )
+                    .frame(width: 280)
+            }
+            .disabled(!sidebarEnabled)
+            .opacity(sidebarEnabled ? 1 : 0.55)
+
+            Text(SettingsStrings.text(
+                "侧栏宽度会记住最近一次调整；双击模式下，单击只选中文件。",
+                "The sidebar width is remembered. In double-click mode, a single click only selects the file."
+            ))
+            .font(.system(size: 11, design: .rounded))
+            .foregroundColor(.secondary)
 
             SettingsRow(title: SettingsStrings.text("隐藏文件", "Hidden Files")) {
                 Toggle(SettingsStrings.text("显示隐藏文件", "Show hidden files"), isOn: $showHiddenFiles)

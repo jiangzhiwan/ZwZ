@@ -103,13 +103,17 @@ public final class ZwzExtractor {
     public func extractEntryToTemp(
         archivePath: String,
         entryPath: String,
-        password: String? = nil
+        password: String? = nil,
+        maximumBytes: Int64? = nil,
+        cancellationToken: CancellationToken? = nil
     ) throws -> URL {
         try extractEntryToTemp(
             archivePath: archivePath,
             entryPath: entryPath,
             password: password,
-            keyProvider: nil
+            keyProvider: nil,
+            maximumBytes: maximumBytes,
+            cancellationToken: cancellationToken
         )
     }
 
@@ -117,28 +121,55 @@ public final class ZwzExtractor {
         archivePath: String,
         entryPath: String,
         password: String? = nil,
-        keyProvider: ZwzPrivateKeyProvider?
+        keyProvider: ZwzPrivateKeyProvider?,
+        maximumBytes: Int64? = nil,
+        cancellationToken: CancellationToken? = nil
     ) throws -> URL {
+        try cancellationToken?.checkCancellation()
+        if let maximumBytes, maximumBytes < 0 {
+            throw ZwzError.extractionFailed("Invalid single-entry extraction byte limit")
+        }
         let archiveURLs = try Self.archiveURLs(for: archivePath)
         if case .v3 = try Self.codec(for: archiveURLs) {
-            return try ZwzV3Extractor().extractEntryToTemp(
-                archivePath: archivePath,
-                entryPath: entryPath,
-                keyProvider: keyProvider ?? MissingZwzPrivateKeyProvider()
-            )
+            var outputURL: URL?
+            do {
+                let url = try ZwzV3Extractor().extractEntryToTemp(
+                    archivePath: archivePath,
+                    entryPath: entryPath,
+                    keyProvider: keyProvider ?? MissingZwzPrivateKeyProvider(),
+                    cancellationToken: cancellationToken
+                )
+                outputURL = url
+                try cancellationToken?.checkCancellation()
+                try Self.verifySingleEntrySize(url, maximumBytes: maximumBytes)
+                return url
+            } catch {
+                if let outputURL { Self.removeEntryTemporaryRoot(containing: outputURL) }
+                throw error
+            }
         }
         let destination = FileManager.default.temporaryDirectory
             .appendingPathComponent("zwz-entry-\(UUID().uuidString)", isDirectory: true)
 
-        _ = try waitForZwzAsync {
-            try await ZwzV2Extractor().extractEntry(
-                path: entryPath,
-                archiveURLs: archiveURLs,
-                to: destination,
-                password: password
-            )
+        do {
+            _ = try waitForZwzAsync {
+                try await ZwzV2Extractor().extractEntry(
+                    path: entryPath,
+                    archiveURLs: archiveURLs,
+                    to: destination,
+                    password: password,
+                    maximumBytes: maximumBytes,
+                    cancellationToken: cancellationToken
+                )
+            }
+            try cancellationToken?.checkCancellation()
+            let outputURL = try ZwzV2PathValidator.validateExtractionPath(entryPath, destination: destination)
+            try Self.verifySingleEntrySize(outputURL, maximumBytes: maximumBytes)
+            return outputURL
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            throw error
         }
-        return destination.appendingPathComponent(entryPath)
     }
 
     public func isZwzFormat(_ path: String) -> Bool {
@@ -197,6 +228,38 @@ public final class ZwzExtractor {
         ZwzArchiveSecurityInfo(
             encryption: header.flags.contains(.encrypted) ? .password : .none,
             signature: .unsigned
+        )
+    }
+
+    private static func verifySingleEntrySize(_ url: URL, maximumBytes: Int64?) throws {
+        let values = try url.resourceValues(forKeys: [
+            .fileSizeKey,
+            .isDirectoryKey,
+            .isRegularFileKey,
+            .isSymbolicLinkKey,
+        ])
+        if values.isDirectory == true { return }
+        guard values.isRegularFile == true, values.isSymbolicLink != true else {
+            throw ZwzV2Error.unsafePath(url.path)
+        }
+        if let maximumBytes, Int64(values.fileSize ?? 0) > maximumBytes {
+            throw ZwzError.extractionFailed("Archive entry exceeds the extraction byte limit")
+        }
+    }
+
+    private static func removeEntryTemporaryRoot(containing url: URL) {
+        let temporaryDirectory = FileManager.default.temporaryDirectory.standardizedFileURL
+        let candidate = url.standardizedFileURL
+        let temporaryComponents = temporaryDirectory.pathComponents
+        let candidateComponents = candidate.pathComponents
+        guard candidateComponents.starts(with: temporaryComponents),
+              candidateComponents.count > temporaryComponents.count else { return }
+        let rootName = candidateComponents[temporaryComponents.count]
+        guard ["zwz-entry-", "zwz-v3-entry-"].contains(where: {
+            rootName.hasPrefix($0) && rootName.count > $0.count
+        }) else { return }
+        try? FileManager.default.removeItem(
+            at: temporaryDirectory.appendingPathComponent(rootName, isDirectory: true)
         )
     }
 

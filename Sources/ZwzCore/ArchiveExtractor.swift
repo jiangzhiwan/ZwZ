@@ -133,8 +133,14 @@ public class ArchiveExtractor {
         archivePath: String,
         entryPath: String,
         password: String? = nil,
-        keyProvider: ZwzPrivateKeyProvider? = nil
+        keyProvider: ZwzPrivateKeyProvider? = nil,
+        maximumBytes: Int64? = nil,
+        cancellationToken: CancellationToken? = nil
     ) throws -> URL {
+        try cancellationToken?.checkCancellation()
+        if let maximumBytes, maximumBytes < 0 {
+            throw ZwzError.extractionFailed("Invalid single-entry extraction byte limit")
+        }
         let format = try detectFormat(archivePath: archivePath)
 
         // 创建临时目录
@@ -142,42 +148,66 @@ public class ArchiveExtractor {
             .appendingPathComponent("zwz-drag-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
 
-        switch format {
-        case .zip:
-            return try extractZipEntryToTemp(
-                archivePath: archivePath,
-                entryPath: entryPath,
-                tempDir: tempDir,
-                password: password
-            )
-        case .zwz:
-            return try ZwzExtractor().extractEntryToTemp(
-                archivePath: archivePath,
-                entryPath: entryPath,
-                password: password,
-                keyProvider: keyProvider
-            )
-        case .tarGz, .tgz:
-            return try extractTarGzEntryToTemp(
-                archivePath: archivePath,
-                entryPath: entryPath,
-                tempDir: tempDir
-            )
-        case .gz:
-            // GZ 只有一个文件，直接全解压到临时目录
-            try extract(archivePath: archivePath, destinationPath: tempDir.path, password: password)
-            if let file = try FileManager.default.contentsOfDirectory(atPath: tempDir.path).first {
-                return tempDir.appendingPathComponent(file)
+        do {
+            switch format {
+            case .zip:
+                return try extractZipEntryToTemp(
+                    archivePath: archivePath,
+                    entryPath: entryPath,
+                    tempDir: tempDir,
+                    password: password,
+                    maximumBytes: maximumBytes,
+                    cancellationToken: cancellationToken
+                )
+            case .zwz:
+                // ZWZ owns a separate temporary directory.
+                try? FileManager.default.removeItem(at: tempDir)
+                return try ZwzExtractor().extractEntryToTemp(
+                    archivePath: archivePath,
+                    entryPath: entryPath,
+                    password: password,
+                    keyProvider: keyProvider,
+                    maximumBytes: maximumBytes,
+                    cancellationToken: cancellationToken
+                )
+            case .tarGz, .tgz:
+                return try extractTarGzEntryToTemp(
+                    archivePath: archivePath,
+                    entryPath: entryPath,
+                    tempDir: tempDir,
+                    maximumBytes: maximumBytes,
+                    cancellationToken: cancellationToken
+                )
+            case .gz:
+                return try extractGzEntryToTemp(
+                    archivePath: archivePath,
+                    entryPath: entryPath,
+                    tempDir: tempDir,
+                    maximumBytes: maximumBytes,
+                    cancellationToken: cancellationToken
+                )
+            case .rar:
+                return try extractRarEntryToTemp(
+                    archivePath: archivePath,
+                    entryPath: entryPath,
+                    tempDir: tempDir,
+                    password: password,
+                    maximumBytes: maximumBytes,
+                    cancellationToken: cancellationToken
+                )
+            case .sevenZip:
+                return try extract7zEntryToTemp(
+                    archivePath: archivePath,
+                    entryPath: entryPath,
+                    tempDir: tempDir,
+                    password: password,
+                    maximumBytes: maximumBytes,
+                    cancellationToken: cancellationToken
+                )
             }
-            throw ZwzError.extractionFailed("No file found in GZ archive")
-        case .rar, .sevenZip:
-            // RAR/7Z 整体解压到临时目录，然后找到对应文件
-            try extract(archivePath: archivePath, destinationPath: tempDir.path, password: password)
-            let fullPath = tempDir.appendingPathComponent(entryPath)
-            if FileManager.default.fileExists(atPath: fullPath.path) {
-                return fullPath
-            }
-            throw ZwzError.extractionFailed("Entry not found after extraction: \(entryPath)")
+        } catch {
+            try? FileManager.default.removeItem(at: tempDir)
+            throw error
         }
     }
 
@@ -185,8 +215,12 @@ public class ArchiveExtractor {
         archivePath: String,
         entryPath: String,
         tempDir: URL,
-        password: String?
+        password: String?,
+        maximumBytes: Int64?,
+        cancellationToken: CancellationToken?
     ) throws -> URL {
+        let fileURL = try validatedSingleEntryURL(entryPath, in: tempDir)
+        try cancellationToken?.checkCancellation()
         let archiveURL = URL(fileURLWithPath: archivePath)
         let gbkEncoding = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(
             CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)
@@ -199,96 +233,482 @@ public class ArchiveExtractor {
             archive = try ZIPFoundation.Archive(url: archiveURL, accessMode: .read)
         }
 
-        // 查找匹配的 entry
-        for entry in archive {
-            // 智能解码路径
-            var pathStr = entry.path
-            let utf8Path = entry.path(using: .utf8)
-            let gbkPath = entry.path(using: gbkEncoding)
-            if !utf8Path.isEmpty && !containsReplacementChar(utf8Path) && !isLikelyGarbled(utf8Path) {
-                pathStr = utf8Path
-            } else if !gbkPath.isEmpty && !isLikelyGarbled(gbkPath) {
-                pathStr = gbkPath
+        let matches = archive.filter { decodedZipPath($0, gbkEncoding: gbkEncoding) == entryPath }
+        if matches.count > 1 {
+            throw ZwzError.extractionFailed("Duplicate archive entry: \(entryPath)")
+        }
+        if let entry = matches.first {
+            guard entry.type != .symlink else {
+                throw ZwzError.extractionFailed("Symbolic links cannot be extracted for preview")
             }
-
-            if pathStr == entryPath || pathStr.hasSuffix("/" + entryPath) {
-                if pathStr.hasSuffix("/") {
-                    // 目录
-                    let dirURL = tempDir.appendingPathComponent(pathStr)
-                    try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
-                    return dirURL
-                }
-
-                let fileURL = tempDir.appendingPathComponent(pathStr)
-                try FileManager.default.createDirectory(
-                    at: fileURL.deletingLastPathComponent(),
-                    withIntermediateDirectories: true
-                )
-
-                // 检查是否加密
-                let archiveData = try Data(contentsOf: archiveURL)
-                var isEncrypted = false
-                do {
-                    _ = try ZipContainer.info(container: archiveData)
-                } catch let error as ZipError {
-                    if case .encryptionNotSupported = error { isEncrypted = true }
-                } catch { isEncrypted = true }
-
-                if isEncrypted {
-                    // 加密 ZIP 用系统 unzip 提取单个文件
-                    guard let unzipPath = findSystemTool(["unzip"]) else {
-                        throw ZwzError.unsupportedOperation("Encrypted ZIP requires unzip tool")
-                    }
-                    var args = ["-o"]
-                    if let pwd = password, !pwd.isEmpty {
-                        args.append("-P")
-                        args.append(pwd)
-                    } else {
-                        throw ZwzError.passwordRequired("Password required")
-                    }
-                    args.append(archivePath)
-                    args.append("-d")
-                    args.append(tempDir.path)
-                    try runProcess(executablePath: unzipPath, arguments: args, errorKeyword: "password")
-                } else {
-                    _ = try archive.extract(entry, to: fileURL)
-                }
-
+            if entry.type == .directory {
+                try FileManager.default.createDirectory(at: fileURL, withIntermediateDirectories: true)
                 return fileURL
             }
+            try enforceByteLimit(entry.uncompressedSize, maximumBytes: maximumBytes)
+            try streamZipEntry(
+                entry,
+                from: archive,
+                to: fileURL,
+                maximumBytes: maximumBytes,
+                cancellationToken: cancellationToken
+            )
+            return try verifySingleEntryOutput(fileURL, in: tempDir, maximumBytes: maximumBytes)
         }
-        throw ZwzError.extractionFailed("Entry not found: \(entryPath)")
+
+        // ZIPFoundation intentionally omits encrypted entries. List with the
+        // system tool, require one exact name, then stream only that entry.
+        guard let unzipPath = findSystemTool(["unzip"]) else {
+            throw ZwzError.extractionFailed("Entry not found: \(entryPath)")
+        }
+        guard !entryPath.hasPrefix("-"),
+              !entryPath.contains(where: \.isNewline) else {
+            throw ZwzError.unsupportedOperation("This encrypted ZIP entry name cannot be previewed safely")
+        }
+        let names = try runProcessCapturing(
+            executablePath: unzipPath,
+            arguments: ["-Z1", archivePath],
+            errorKeyword: "password",
+            cancellationToken: cancellationToken
+        ).split(whereSeparator: \.isNewline).map(String.init)
+        guard names.filter({ $0 == entryPath }).count == 1 else {
+            throw ZwzError.extractionFailed("Entry is missing or duplicated: \(entryPath)")
+        }
+        guard let password, !password.isEmpty else {
+            throw ZwzError.passwordRequired("Password required")
+        }
+        let escapedEntry = escapedUnzipPattern(entryPath)
+        let listing = try runProcessCapturing(
+            executablePath: unzipPath,
+            arguments: ["-Z", "-l", archivePath, escapedEntry],
+            errorKeyword: "password",
+            cancellationToken: cancellationToken
+        )
+        guard !listing.split(whereSeparator: \.isNewline).contains(where: { $0.first == "l" }) else {
+            throw ZwzError.extractionFailed("Symbolic links cannot be extracted for preview")
+        }
+        try runProcessStreamingOutput(
+            executablePath: unzipPath,
+            arguments: ["-p", "-P", password, archivePath, escapedEntry],
+            outputURL: fileURL,
+            maximumBytes: maximumBytes,
+            cancellationToken: cancellationToken,
+            errorKeyword: "password"
+        )
+        return try verifySingleEntryOutput(fileURL, in: tempDir, maximumBytes: maximumBytes)
     }
 
     private func extractTarGzEntryToTemp(
         archivePath: String,
         entryPath: String,
-        tempDir: URL
+        tempDir: URL,
+        maximumBytes: Int64?,
+        cancellationToken: CancellationToken?
     ) throws -> URL {
-        let archiveURL = URL(fileURLWithPath: archivePath)
-        let archiveData = try Data(contentsOf: archiveURL)
-        let decompressedData = try GzipArchive.unarchive(archive: archiveData)
-        let entries = try TarContainer.open(container: decompressedData)
+        let outputURL = try validatedSingleEntryURL(entryPath, in: tempDir)
+        guard !entryPath.hasPrefix("-"),
+              !entryPath.contains(where: \.isNewline) else {
+            throw ZwzError.unsupportedOperation("This TAR entry name cannot be previewed safely")
+        }
+        guard let tarPath = findSystemTool(["tar"]) else {
+            throw ZwzError.unsupportedOperation("Safe single-entry TAR preview requires the system tar tool")
+        }
+        let names = try runProcessCapturing(
+            executablePath: tarPath,
+            arguments: ["-tzf", archivePath],
+            errorKeyword: "password",
+            cancellationToken: cancellationToken
+        ).split(whereSeparator: \.isNewline).map(String.init)
+        guard names.filter({ $0 == entryPath }).count == 1 else {
+            throw ZwzError.extractionFailed("Entry is missing or duplicated: \(entryPath)")
+        }
+        let verboseListing = try runProcessCapturing(
+            executablePath: tarPath,
+            arguments: ["-tvzf", archivePath, entryPath],
+            errorKeyword: "password",
+            cancellationToken: cancellationToken
+        )
+        guard let type = verboseListing.first, type == "-" else {
+            throw ZwzError.extractionFailed("Archive links and special files cannot be extracted for preview")
+        }
+        try runProcessStreamingOutput(
+            executablePath: tarPath,
+            arguments: ["-xOzf", archivePath, entryPath],
+            outputURL: outputURL,
+            maximumBytes: maximumBytes,
+            cancellationToken: cancellationToken,
+            errorKeyword: "password"
+        )
+        return try verifySingleEntryOutput(outputURL, in: tempDir, maximumBytes: maximumBytes)
+    }
 
-        for entry in entries {
-            if entry.info.name == entryPath || entry.info.name.hasSuffix("/" + entryPath) {
-                if entry.info.type == .directory {
-                    let dirURL = tempDir.appendingPathComponent(entry.info.name)
-                    try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
-                    return dirURL
+    private func extractGzEntryToTemp(
+        archivePath: String,
+        entryPath: String,
+        tempDir: URL,
+        maximumBytes: Int64?,
+        cancellationToken: CancellationToken?
+    ) throws -> URL {
+        guard let gzipPath = findSystemTool(["gzip"]) else {
+            throw ZwzError.unsupportedOperation("Safe GZIP preview requires the system gzip tool")
+        }
+        let outputURL = try validatedSingleEntryURL(entryPath, in: tempDir)
+        try runProcessStreamingOutput(
+            executablePath: gzipPath,
+            arguments: ["-dc", archivePath],
+            outputURL: outputURL,
+            maximumBytes: maximumBytes,
+            cancellationToken: cancellationToken,
+            errorKeyword: "password"
+        )
+        return try verifySingleEntryOutput(outputURL, in: tempDir, maximumBytes: maximumBytes)
+    }
+
+    private func extractRarEntryToTemp(
+        archivePath: String,
+        entryPath: String,
+        tempDir: URL,
+        password: String?,
+        maximumBytes: Int64?,
+        cancellationToken: CancellationToken?
+    ) throws -> URL {
+        guard !entryPath.hasPrefix("-"),
+              !entryPath.contains(where: { "*?[".contains($0) || $0.isNewline }) else {
+            throw ZwzError.unsupportedOperation("This RAR entry name cannot be previewed safely")
+        }
+        guard let toolPath = findSystemTool(["unrar"]) else {
+            throw ZwzError.unsupportedOperation("Safe single-entry RAR preview requires unrar")
+        }
+        let passwordArgument = password.flatMap { $0.isEmpty ? nil : "-p\($0)" } ?? "-p-"
+        let listing = try runProcessCapturing(
+            executablePath: toolPath,
+            arguments: ["lb", passwordArgument, archivePath],
+            errorKeyword: "password",
+            cancellationToken: cancellationToken
+        )
+        let names = listing.split(whereSeparator: \.isNewline).map(String.init)
+        guard names.filter({ $0 == entryPath }).count == 1 else {
+            throw ZwzError.extractionFailed("Entry is missing or duplicated: \(entryPath)")
+        }
+        let technicalListing = try runProcessCapturing(
+            executablePath: toolPath,
+            arguments: ["lt", "-idq", passwordArgument, archivePath, entryPath],
+            errorKeyword: "password",
+            cancellationToken: cancellationToken
+        ).lowercased()
+        guard !technicalListing.contains("symbolic link"),
+              !technicalListing.contains("hard link") else {
+            throw ZwzError.extractionFailed("Archive links cannot be extracted for preview")
+        }
+
+        let outputURL = try validatedSingleEntryURL(entryPath, in: tempDir)
+        try runProcessStreamingOutput(
+            executablePath: toolPath,
+            arguments: ["p", "-inul", passwordArgument, archivePath, entryPath],
+            outputURL: outputURL,
+            maximumBytes: maximumBytes,
+            cancellationToken: cancellationToken,
+            errorKeyword: "password"
+        )
+        return try verifySingleEntryOutput(outputURL, in: tempDir, maximumBytes: maximumBytes)
+    }
+
+    private func extract7zEntryToTemp(
+        archivePath: String,
+        entryPath: String,
+        tempDir: URL,
+        password: String?,
+        maximumBytes: Int64?,
+        cancellationToken: CancellationToken?
+    ) throws -> URL {
+        guard !entryPath.hasPrefix("-"),
+              !entryPath.contains(where: \.isNewline) else {
+            throw ZwzError.unsupportedOperation("This 7Z entry name cannot be previewed safely")
+        }
+        guard let toolPath = findSystemTool(["7z", "7za", "7zr"]) else {
+            throw ZwzError.unsupportedOperation("Safe single-entry 7Z preview requires 7z")
+        }
+        var passwordArguments: [String] = []
+        if let password, !password.isEmpty { passwordArguments = ["-p\(password)"] }
+        let listing = try runProcessCapturing(
+            executablePath: toolPath,
+            arguments: ["l", "-slt", "-ba"] + passwordArguments + [archivePath],
+            errorKeyword: "password",
+            cancellationToken: cancellationToken
+        )
+        let names = listing.split(whereSeparator: \.isNewline).compactMap { line -> String? in
+            let prefix = "Path = "
+            return line.hasPrefix(prefix) ? String(line.dropFirst(prefix.count)) : nil
+        }
+        guard names.filter({ $0 == entryPath }).count == 1 else {
+            throw ZwzError.extractionFailed("Entry is missing or duplicated: \(entryPath)")
+        }
+        let selectedBlock = listing.components(separatedBy: "\n\n").first(where: {
+            $0.components(separatedBy: .newlines).contains("Path = \(entryPath)")
+        }) ?? ""
+        guard !selectedBlock.contains("Symbolic Link ="),
+              !selectedBlock.contains("Hard Link =") else {
+            throw ZwzError.extractionFailed("Archive links cannot be extracted for preview")
+        }
+
+        let outputURL = try validatedSingleEntryURL(entryPath, in: tempDir)
+        try runProcessStreamingOutput(
+            executablePath: toolPath,
+            arguments: ["x", "-so", "-y", "-spd", "-bd"] + passwordArguments + [archivePath, entryPath],
+            outputURL: outputURL,
+            maximumBytes: maximumBytes,
+            cancellationToken: cancellationToken,
+            errorKeyword: "password"
+        )
+        return try verifySingleEntryOutput(outputURL, in: tempDir, maximumBytes: maximumBytes)
+    }
+
+    private func decodedZipPath(
+        _ entry: ZIPFoundation.Entry,
+        gbkEncoding: String.Encoding
+    ) -> String {
+        let utf8Path = entry.path(using: .utf8)
+        if !utf8Path.isEmpty,
+           !containsReplacementChar(utf8Path),
+           !isLikelyGarbled(utf8Path) {
+            return utf8Path
+        }
+        let gbkPath = entry.path(using: gbkEncoding)
+        if !gbkPath.isEmpty, !isLikelyGarbled(gbkPath) { return gbkPath }
+        return entry.path
+    }
+
+    private func streamZipEntry(
+        _ entry: ZIPFoundation.Entry,
+        from archive: ZIPFoundation.Archive,
+        to outputURL: URL,
+        maximumBytes: Int64?,
+        cancellationToken: CancellationToken?
+    ) throws {
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        guard FileManager.default.createFile(atPath: outputURL.path, contents: nil) else {
+            throw ZwzError.extractionFailed("Could not create single-entry output")
+        }
+        do {
+            let handle = try FileHandle(forWritingTo: outputURL)
+            defer { try? handle.close() }
+            var written: UInt64 = 0
+            _ = try archive.extract(entry) { chunk in
+                try cancellationToken?.checkCancellation()
+                let result = written.addingReportingOverflow(UInt64(chunk.count))
+                guard !result.overflow else {
+                    throw ZwzError.extractionFailed("Single-entry extraction size overflow")
                 }
-                let fileURL = tempDir.appendingPathComponent(entry.info.name)
-                try FileManager.default.createDirectory(
-                    at: fileURL.deletingLastPathComponent(),
-                    withIntermediateDirectories: true
-                )
-                if let data = entry.data {
-                    try data.write(to: fileURL)
-                }
-                return fileURL
+                try enforceByteLimit(result.partialValue, maximumBytes: maximumBytes)
+                try handle.write(contentsOf: chunk)
+                written = result.partialValue
+            }
+            try cancellationToken?.checkCancellation()
+        } catch {
+            try? FileManager.default.removeItem(at: outputURL)
+            throw error
+        }
+    }
+
+    private func validatedSingleEntryURL(_ entryPath: String, in tempDir: URL) throws -> URL {
+        let root = tempDir.standardizedFileURL
+        let output = try ZwzV2PathValidator.validateExtractionPath(entryPath, destination: root)
+        guard output.pathComponents.starts(with: root.pathComponents),
+              output.pathComponents.count > root.pathComponents.count else {
+            throw ZwzV2Error.unsafePath(entryPath)
+        }
+
+        var current = root
+        for component in output.pathComponents.dropFirst(root.pathComponents.count) {
+            current.appendPathComponent(component)
+            if (try? FileManager.default.destinationOfSymbolicLink(atPath: current.path)) != nil {
+                throw ZwzV2Error.unsafePath(entryPath)
             }
         }
-        throw ZwzError.extractionFailed("Entry not found: \(entryPath)")
+        return output
+    }
+
+    @discardableResult
+    private func verifySingleEntryOutput(
+        _ outputURL: URL,
+        in tempDir: URL,
+        maximumBytes: Int64?
+    ) throws -> URL {
+        let root = tempDir.standardizedFileURL
+        let output = outputURL.standardizedFileURL
+        guard output.pathComponents.starts(with: root.pathComponents),
+              output.pathComponents.count > root.pathComponents.count else {
+            throw ZwzV2Error.unsafePath(outputURL.path)
+        }
+        let values = try output.resourceValues(forKeys: [
+            .fileSizeKey,
+            .isDirectoryKey,
+            .isRegularFileKey,
+            .isSymbolicLinkKey,
+        ])
+        if values.isDirectory == true { return output }
+        guard values.isRegularFile == true, values.isSymbolicLink != true else {
+            throw ZwzV2Error.unsafePath(outputURL.path)
+        }
+        try enforceByteLimit(UInt64(values.fileSize ?? 0), maximumBytes: maximumBytes)
+        return output
+    }
+
+    private func enforceByteLimit(_ size: UInt64, maximumBytes: Int64?) throws {
+        guard let maximumBytes else { return }
+        guard size <= UInt64(maximumBytes) else {
+            throw ZwzError.extractionFailed("Archive entry exceeds the extraction byte limit")
+        }
+    }
+
+    private func escapedUnzipPattern(_ path: String) -> String {
+        var result = ""
+        for character in path {
+            if "*?[]\\".contains(character) { result.append("\\") }
+            result.append(character)
+        }
+        return result
+    }
+
+    private func runProcessCapturing(
+        executablePath: String,
+        arguments: [String],
+        errorKeyword: String,
+        cancellationToken: CancellationToken?
+    ) throws -> String {
+        try cancellationToken?.checkCancellation()
+        let captureLimit = 16 * 1024 * 1024
+        let captureURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(".zwz-command-output-\(UUID().uuidString)")
+        guard FileManager.default.createFile(atPath: captureURL.path, contents: nil) else {
+            throw ZwzError.extractionFailed("Could not create command output file")
+        }
+        defer { try? FileManager.default.removeItem(at: captureURL) }
+        let captureHandle = try FileHandle(forWritingTo: captureURL)
+        defer { try? captureHandle.close() }
+
+        let process = Foundation.Process()
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = arguments
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = captureHandle
+        process.standardError = captureHandle
+        try process.run()
+        var interruptedError: Error?
+        while process.isRunning {
+            if cancellationToken?.isCancelled == true {
+                interruptedError = ZwzError.operationCancelled
+                process.terminate()
+                break
+            }
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: captureURL.path),
+               let number = attributes[.size] as? NSNumber,
+               number.intValue > captureLimit {
+                interruptedError = ZwzError.extractionFailed("Archive listing exceeds the safe output limit")
+                process.terminate()
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        process.waitUntilExit()
+        if let interruptedError { throw interruptedError }
+        try cancellationToken?.checkCancellation()
+        try captureHandle.synchronize()
+        let readHandle = try FileHandle(forReadingFrom: captureURL)
+        defer { try? readHandle.close() }
+        let data = try readHandle.read(upToCount: captureLimit + 1) ?? Data()
+        guard data.count <= captureLimit else {
+            throw ZwzError.extractionFailed("Archive listing exceeds the safe output limit")
+        }
+        let output = String(data: data, encoding: .utf8) ?? ""
+        guard process.terminationStatus == 0 else {
+            if output.lowercased().contains(errorKeyword) || output.lowercased().contains("encrypted") {
+                throw ZwzError.wrongPassword("Wrong password or password required")
+            }
+            throw ZwzError.extractionFailed("Process failed: \(output)")
+        }
+        return output
+    }
+
+    private func runProcessStreamingOutput(
+        executablePath: String,
+        arguments: [String],
+        outputURL: URL,
+        maximumBytes: Int64?,
+        cancellationToken: CancellationToken?,
+        errorKeyword: String
+    ) throws {
+        try cancellationToken?.checkCancellation()
+        try FileManager.default.createDirectory(
+            at: outputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        guard FileManager.default.createFile(atPath: outputURL.path, contents: nil) else {
+            throw ZwzError.extractionFailed("Could not create single-entry output")
+        }
+
+        let errorURL = outputURL.deletingLastPathComponent()
+            .appendingPathComponent(".zwz-process-error-\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: errorURL.path, contents: nil)
+        defer { try? FileManager.default.removeItem(at: errorURL) }
+
+        do {
+            let outputHandle = try FileHandle(forWritingTo: outputURL)
+            let errorHandle = try FileHandle(forWritingTo: errorURL)
+            defer {
+                try? outputHandle.close()
+                try? errorHandle.close()
+            }
+            let process = Foundation.Process()
+            process.executableURL = URL(fileURLWithPath: executablePath)
+            process.arguments = arguments
+            process.standardInput = FileHandle.nullDevice
+            process.standardOutput = outputHandle
+            process.standardError = errorHandle
+            try process.run()
+
+            var interruptedError: Error?
+            while process.isRunning {
+                if cancellationToken?.isCancelled == true {
+                    interruptedError = ZwzError.operationCancelled
+                    process.terminate()
+                    break
+                }
+                if let maximumBytes,
+                   let attributes = try? FileManager.default.attributesOfItem(atPath: outputURL.path),
+                   let number = attributes[.size] as? NSNumber,
+                   number.int64Value > maximumBytes {
+                    interruptedError = ZwzError.extractionFailed("Archive entry exceeds the extraction byte limit")
+                    process.terminate()
+                    break
+                }
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            process.waitUntilExit()
+            if let interruptedError { throw interruptedError }
+            try cancellationToken?.checkCancellation()
+            if process.terminationStatus != 0 {
+                try? errorHandle.synchronize()
+                let readHandle = try FileHandle(forReadingFrom: errorURL)
+                defer { try? readHandle.close() }
+                let errorData = try readHandle.read(upToCount: 64 * 1024) ?? Data()
+                let output = String(data: errorData, encoding: .utf8) ?? ""
+                if output.lowercased().contains(errorKeyword) || output.lowercased().contains("encrypted") {
+                    throw ZwzError.wrongPassword("Wrong password or password required")
+                }
+                throw ZwzError.extractionFailed("Process failed: \(output)")
+            }
+            try enforceByteLimit(
+                UInt64((try outputURL.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? 0),
+                maximumBytes: maximumBytes
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: outputURL)
+            throw error
+        }
     }
 
     // MARK: - ZIP Extraction

@@ -101,9 +101,13 @@ final class ArchiveViewModelSearchTests: XCTestCase {
         languageManager.setLanguage("zh")
         XCTAssertEqual(L.string("search_archive_contents"), "搜索压缩包内容")
         XCTAssertEqual(L.string("no_search_results"), "未找到匹配项目")
+        XCTAssertEqual(L.string("preview_loading"), "正在准备预览…")
+        XCTAssertEqual(L.string("preview_unsupported"), "暂不支持预览此文件类型")
 
         languageManager.setLanguage("en")
         XCTAssertEqual(L.string("search_archive_contents"), "Search archive contents")
         XCTAssertEqual(L.string("no_search_results"), "No matching items")
+        XCTAssertEqual(L.string("preview_loading"), "Preparing preview…")
+        XCTAssertEqual(L.string("preview_unsupported"), "This file type cannot be previewed")
     }
 }
