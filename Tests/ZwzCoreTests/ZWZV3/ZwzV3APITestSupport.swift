@@ -13,12 +13,13 @@ enum ZwzV3APITestSupport {
     static func makeFixture(
         name: String = "archive.zwz",
         signer: Bool = false,
-        splitVolume: SplitVolume? = nil
+        splitVolume: SplitVolume? = nil,
+        contents: Data = Data("public api".utf8)
     ) throws -> Fixture {
         let directory = try ZwzV3TestSupport.makeTempDirectory()
         let source = directory.appendingPathComponent("source", isDirectory: true)
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
-        try Data("public api".utf8).write(to: source.appendingPathComponent("file.txt"))
+        try contents.write(to: source.appendingPathComponent("file.txt"))
         let identity = ZwzV3IdentityFixture.make(name: "Alice")
         let archive = directory.appendingPathComponent(name)
         let signingIdentity = signer ? identity.signingIdentity : nil

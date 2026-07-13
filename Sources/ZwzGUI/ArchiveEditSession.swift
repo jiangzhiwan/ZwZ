@@ -21,6 +21,8 @@ final class ArchiveEditSession {
     let archiveURL: URL
     let format: ExtractionFormat
     let workspaceURL: URL
+    let originalSecurityInfo: ZwzArchiveSecurityInfo?
+    let originalPassword: String?
     private(set) var hasChanges = false
     private let fileManager = FileManager.default
 
@@ -29,13 +31,49 @@ final class ArchiveEditSession {
         "java", "c", "cc", "cpp", "cxx", "h", "hpp"
     ]
 
-    private init(archiveURL: URL, format: ExtractionFormat, workspaceURL: URL) {
+    private init(
+        archiveURL: URL,
+        format: ExtractionFormat,
+        workspaceURL: URL,
+        originalSecurityInfo: ZwzArchiveSecurityInfo?,
+        originalPassword: String?
+    ) {
         self.archiveURL = archiveURL
         self.format = format
         self.workspaceURL = workspaceURL
+        self.originalSecurityInfo = originalSecurityInfo
+        self.originalPassword = originalPassword
     }
 
     static func create(archiveURL: URL, password: String?) throws -> ArchiveEditSession {
+        try createSession(
+            archiveURL: archiveURL,
+            password: password,
+            identityStore: nil,
+            securityInfo: nil
+        )
+    }
+
+    static func create(
+        archiveURL: URL,
+        password: String?,
+        identityStore: any ZwzIdentityStore,
+        securityInfo: ZwzArchiveSecurityInfo?
+    ) throws -> ArchiveEditSession {
+        try createSession(
+            archiveURL: archiveURL,
+            password: password,
+            identityStore: identityStore,
+            securityInfo: securityInfo
+        )
+    }
+
+    private static func createSession(
+        archiveURL: URL,
+        password: String?,
+        identityStore: (any ZwzIdentityStore)?,
+        securityInfo: ZwzArchiveSecurityInfo?
+    ) throws -> ArchiveEditSession {
         let extractor = ArchiveExtractor()
         let format = try extractor.detectFormat(archivePath: archiveURL.path)
         guard format == .zip || format == .zwz else { throw ArchiveEditorError.unsupportedFormat }
@@ -44,12 +82,27 @@ final class ArchiveEditSession {
             .appendingPathComponent("zwz-edit-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: workspaceURL, withIntermediateDirectories: true)
         do {
+            var resolvedSecurityInfo = securityInfo
             if format == .zip {
                 try extractZip(archiveURL: archiveURL, to: workspaceURL, password: password)
+            } else if let identityStore {
+                let result = try ZwzAPI().extract(
+                    archivePath: archiveURL.path,
+                    destinationPath: workspaceURL.path,
+                    password: password,
+                    keyProvider: identityStore
+                )
+                resolvedSecurityInfo = result.securityInfo ?? securityInfo
             } else {
                 try extractor.extract(archivePath: archiveURL.path, destinationPath: workspaceURL.path, password: password)
             }
-            return ArchiveEditSession(archiveURL: archiveURL, format: format, workspaceURL: workspaceURL)
+            return ArchiveEditSession(
+                archiveURL: archiveURL,
+                format: format,
+                workspaceURL: workspaceURL,
+                originalSecurityInfo: resolvedSecurityInfo,
+                originalPassword: password.flatMap { $0.isEmpty ? nil : $0 }
+            )
         } catch {
             try? FileManager.default.removeItem(at: workspaceURL)
             throw error
@@ -141,15 +194,51 @@ final class ArchiveEditSession {
     }
 
     func save(password: String?, progress: ProgressHandler? = nil) throws {
+        let encryption = password.flatMap { $0.isEmpty ? nil : $0 }
+            .map(ZwzEncryptionMode.password) ?? .none
+        try save(encryption: encryption, keyProvider: nil, progress: progress)
+    }
+
+    func save(
+        encryption: ZwzEncryptionMode,
+        identityStore: any ZwzIdentityStore,
+        progress: ProgressHandler? = nil
+    ) throws {
+        try save(
+            encryption: encryption,
+            keyProvider: identityStore,
+            progress: progress
+        )
+    }
+
+    private func save(
+        encryption: ZwzEncryptionMode,
+        keyProvider: ZwzPrivateKeyProvider?,
+        progress: ProgressHandler?
+    ) throws {
         let temporaryOutput = archiveURL.deletingLastPathComponent()
             .appendingPathComponent(".zwz-edit-save-\(UUID().uuidString).\(archiveURL.pathExtension)")
-        let options = CompressionOptions(level: .normal, password: password, aes256: true, format: format == .zip ? .zip : .zwz)
+        if format == .zip, case .publicKey = encryption {
+            throw ArchiveEditorError.unsupportedFormat
+        }
+        let options = CompressionOptions(
+            level: .normal,
+            encryption: encryption,
+            aes256: true,
+            format: format == .zip ? .zip : .zwz
+        )
         do {
             switch format {
             case .zip:
                 try ZipCompressor().compress(sourcePath: workspaceURL.path, destinationPath: temporaryOutput.path, options: options, progress: progress)
             case .zwz:
-                try ZwzCompressor().compress(sourcePath: workspaceURL.path, destinationPath: temporaryOutput.path, options: options, progress: progress)
+                try ZwzCompressor().compress(
+                    sourcePath: workspaceURL.path,
+                    destinationPath: temporaryOutput.path,
+                    options: options,
+                    keyProvider: keyProvider,
+                    progress: progress
+                )
             default:
                 throw ArchiveEditorError.unsupportedFormat
             }
@@ -214,5 +303,98 @@ final class ArchiveEditSession {
             let details = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
             throw ZwzError.extractionFailed(details.isEmpty ? "Unable to extract ZIP archive" : details)
         }
+    }
+}
+
+final class DefaultArchiveEditWorkflowClient: ArchiveEditWorkflowClient, @unchecked Sendable {
+    private let lock = NSLock()
+    private var session: ArchiveEditSession?
+    private var openGeneration: UUID?
+
+    var archivePath: String? {
+        lock.withLock { session?.archiveURL.path }
+    }
+
+    var hasChanges: Bool {
+        lock.withLock { session?.hasChanges ?? false }
+    }
+
+    func open(
+        archivePath: String,
+        password: String?,
+        securityInfo: ZwzArchiveSecurityInfo?,
+        identityStore: any ZwzIdentityStore
+    ) throws -> [ArchiveEntry] {
+        let generation = UUID()
+        lock.withLock { openGeneration = generation }
+        let opened = try ArchiveEditSession.create(
+            archiveURL: URL(fileURLWithPath: archivePath),
+            password: password,
+            identityStore: identityStore,
+            securityInfo: securityInfo
+        )
+        let entries = try opened.entries()
+        let accepted = lock.withLock { () -> Bool in
+            guard openGeneration == generation else { return false }
+            session = opened
+            return true
+        }
+        guard accepted else { throw CancellationError() }
+        return entries
+    }
+
+    func entries() throws -> [ArchiveEntry] {
+        try currentSession().entries()
+    }
+
+    func add(urls: [URL], into directoryPath: String) throws {
+        try currentSession().add(urls: urls, into: directoryPath)
+    }
+
+    func delete(path: String) throws {
+        try currentSession().delete(path: path)
+    }
+
+    func rename(path: String, to newName: String) throws {
+        try currentSession().rename(path: path, to: newName)
+    }
+
+    func replace(path: String, with sourceURL: URL) throws {
+        try currentSession().replace(path: path, with: sourceURL)
+    }
+
+    func text(for path: String) throws -> String {
+        try currentSession().text(for: path)
+    }
+
+    func writeText(_ text: String, to path: String) throws {
+        try currentSession().writeText(text, to: path)
+    }
+
+    func save(identityStore: any ZwzIdentityStore) throws {
+        let session = try currentSession()
+        let encryption = try ArchiveEncryptionResolver.resolve(
+            securityInfo: session.originalSecurityInfo,
+            password: session.originalPassword,
+            identityStore: identityStore
+        )
+        try session.save(
+            encryption: encryption,
+            identityStore: identityStore
+        )
+    }
+
+    func discard() {
+        lock.withLock {
+            openGeneration = nil
+            session = nil
+        }
+    }
+
+    private func currentSession() throws -> ArchiveEditSession {
+        guard let session = lock.withLock({ session }) else {
+            throw ArchiveEditWorkflowError.noActiveSession
+        }
+        return session
     }
 }

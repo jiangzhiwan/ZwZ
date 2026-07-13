@@ -6,12 +6,80 @@ struct VirtualDiskSession: Codable, Equatable {
     var archivePath: String
     var imagePath: String
     var mountPath: String
-    var password: String?
     var capacityMB: Int
     var baselineFingerprint: String
     var splitVolumeBytes: Int64?
     var isMounted: Bool
     var ownerTabID: UUID? = nil
+    var protection: ArchiveProtectionDescriptor? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case archivePath
+        case imagePath
+        case mountPath
+        case password
+        case capacityMB
+        case baselineFingerprint
+        case splitVolumeBytes
+        case isMounted
+        case ownerTabID
+        case protection
+    }
+
+    init(
+        archivePath: String,
+        imagePath: String,
+        mountPath: String,
+        capacityMB: Int,
+        baselineFingerprint: String,
+        splitVolumeBytes: Int64?,
+        isMounted: Bool,
+        ownerTabID: UUID? = nil,
+        protection: ArchiveProtectionDescriptor? = nil
+    ) {
+        self.archivePath = archivePath
+        self.imagePath = imagePath
+        self.mountPath = mountPath
+        self.capacityMB = capacityMB
+        self.baselineFingerprint = baselineFingerprint
+        self.splitVolumeBytes = splitVolumeBytes
+        self.isMounted = isMounted
+        self.ownerTabID = ownerTabID
+        self.protection = protection
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        archivePath = try container.decode(String.self, forKey: .archivePath)
+        imagePath = try container.decode(String.self, forKey: .imagePath)
+        mountPath = try container.decode(String.self, forKey: .mountPath)
+        capacityMB = try container.decode(Int.self, forKey: .capacityMB)
+        baselineFingerprint = try container.decode(String.self, forKey: .baselineFingerprint)
+        splitVolumeBytes = try container.decodeIfPresent(Int64.self, forKey: .splitVolumeBytes)
+        isMounted = try container.decode(Bool.self, forKey: .isMounted)
+        ownerTabID = try container.decodeIfPresent(UUID.self, forKey: .ownerTabID)
+        protection = try container.decodeIfPresent(ArchiveProtectionDescriptor.self, forKey: .protection)
+
+        let legacyPassword = try container.decodeIfPresent(String.self, forKey: .password)
+        if protection == nil, legacyPassword?.isEmpty == false {
+            protection = ArchiveProtectionDescriptor(securityInfo: ZwzArchiveSecurityInfo(
+                encryption: .password
+            ))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(archivePath, forKey: .archivePath)
+        try container.encode(imagePath, forKey: .imagePath)
+        try container.encode(mountPath, forKey: .mountPath)
+        try container.encode(capacityMB, forKey: .capacityMB)
+        try container.encode(baselineFingerprint, forKey: .baselineFingerprint)
+        try container.encodeIfPresent(splitVolumeBytes, forKey: .splitVolumeBytes)
+        try container.encode(isMounted, forKey: .isMounted)
+        try container.encodeIfPresent(ownerTabID, forKey: .ownerTabID)
+        try container.encodeIfPresent(protection, forKey: .protection)
+    }
 }
 
 enum VirtualDiskError: LocalizedError {
@@ -42,6 +110,7 @@ final class VirtualDiskManager: ObservableObject {
 
     private let fileManager = FileManager.default
     private var unmountObserver: NSObjectProtocol?
+    private var activePassword: String?
 
     private var rootURL: URL {
         let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -62,9 +131,30 @@ final class VirtualDiskManager: ObservableObject {
     }
 
     func mount(archivePath: String, password: String?, capacityMB: Int, ownerTabID: UUID? = nil) async throws {
+        try await mount(
+            archivePath: archivePath,
+            password: password,
+            capacityMB: capacityMB,
+            ownerTabID: ownerTabID,
+            securityInfo: nil,
+            identityStore: ZwzGUIIdentityStore.shared
+        )
+    }
+
+    func mount(
+        archivePath: String,
+        password: String?,
+        capacityMB: Int,
+        ownerTabID: UUID? = nil,
+        securityInfo: ZwzArchiveSecurityInfo?,
+        identityStore: any ZwzIdentityStore
+    ) async throws {
         guard session == nil else { throw VirtualDiskError.sessionAlreadyActive }
         guard URL(fileURLWithPath: archivePath).pathExtension.lowercased() == "zwz" else {
             throw VirtualDiskError.unsupportedArchive
+        }
+        guard securityInfo?.signature != .invalid else {
+            throw ZwzV3Error.invalidSignature
         }
         isBusy = true
         defer { isBusy = false }
@@ -80,15 +170,35 @@ final class VirtualDiskManager: ObservableObject {
         try runHdiutil(["attach", imageURL.path, "-mountpoint", mountURL.path])
         guard fileManager.fileExists(atPath: mountURL.path) else { throw VirtualDiskError.mountPointMissing }
 
+        let extraction: ZwzExtractionResult
         do {
-            _ = try ZwzAPI().extract(archivePath: archivePath, destinationPath: mountURL.path, password: password)
+            extraction = try ZwzAPI().extract(
+                archivePath: archivePath,
+                destinationPath: mountURL.path,
+                password: password,
+                keyProvider: identityStore
+            )
         } catch {
             try? runHdiutil(["detach", mountURL.path])
+            try? fileManager.removeItem(at: imageURL)
+            try? fileManager.removeItem(at: mountURL)
             throw error
         }
 
         let fingerprint = try fingerprint(of: mountURL)
-        session = VirtualDiskSession(archivePath: archivePath, imagePath: imageURL.path, mountPath: mountURL.path, password: password, capacityMB: capacityMB, baselineFingerprint: fingerprint, splitVolumeBytes: inferSplitVolumeBytes(archivePath: archivePath), isMounted: true, ownerTabID: ownerTabID)
+        let resolvedSecurityInfo = extraction.securityInfo ?? securityInfo
+        session = VirtualDiskSession(
+            archivePath: archivePath,
+            imagePath: imageURL.path,
+            mountPath: mountURL.path,
+            capacityMB: capacityMB,
+            baselineFingerprint: fingerprint,
+            splitVolumeBytes: inferSplitVolumeBytes(archivePath: archivePath),
+            isMounted: true,
+            ownerTabID: ownerTabID,
+            protection: resolvedSecurityInfo.map(ArchiveProtectionDescriptor.init)
+        )
+        activePassword = password
         try persistSession()
     }
 
@@ -109,6 +219,49 @@ final class VirtualDiskManager: ObservableObject {
     }
 
     func save(to destinationPath: String) throws {
+        try save(to: destinationPath, identityStore: ZwzGUIIdentityStore.shared)
+    }
+
+    func save(
+        to destinationPath: String,
+        identityStore: any ZwzIdentityStore
+    ) throws {
+        guard let current = session else { throw VirtualDiskError.noActiveSession }
+        let securityInfo: ZwzArchiveSecurityInfo?
+        if let persisted = current.protection?.securityInfo {
+            securityInfo = persisted
+        } else {
+            securityInfo = try? ZwzAPI().inspect(
+                archivePath: current.archivePath,
+                keyProvider: identityStore
+            ).securityInfo
+        }
+        if securityInfo?.encryption == .password, activePassword == nil {
+            let candidate = try requestPasswordForSave()
+            _ = try ZwzAPI().list(
+                archivePath: current.archivePath,
+                password: candidate,
+                keyProvider: identityStore
+            )
+            activePassword = candidate
+        }
+        let encryption = try ArchiveEncryptionResolver.resolve(
+            securityInfo: securityInfo,
+            password: activePassword,
+            identityStore: identityStore
+        )
+        try save(
+            to: destinationPath,
+            encryption: encryption,
+            identityStore: identityStore
+        )
+    }
+
+    func save(
+        to destinationPath: String,
+        encryption: ZwzEncryptionMode,
+        identityStore: any ZwzIdentityStore
+    ) throws {
         guard let current = session else { throw VirtualDiskError.noActiveSession }
         try ensureMounted()
         let destination = URL(fileURLWithPath: destinationPath)
@@ -122,8 +275,18 @@ final class VirtualDiskManager: ObservableObject {
         try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
         try copyArchiveContent(from: URL(fileURLWithPath: current.mountPath), to: staging)
         defer { try? fileManager.removeItem(at: staging) }
-        let options = CompressionOptions(level: .normal, password: current.password, splitVolume: split, format: .zwz)
-        _ = try ZwzAPI().compress(sourcePath: staging.path, destinationPath: temporary.path, options: options)
+        let options = CompressionOptions(
+            level: .normal,
+            encryption: encryption,
+            splitVolume: split,
+            format: .zwz
+        )
+        _ = try ZwzAPI().compress(
+            sourcePath: staging.path,
+            destinationPath: temporary.path,
+            options: options,
+            keyProvider: identityStore
+        )
         try detach()
         try installArchiveVolumes(from: temporary, to: destination)
         try finishSession()
@@ -145,6 +308,7 @@ final class VirtualDiskManager: ObservableObject {
         try? fileManager.removeItem(atPath: current.imagePath)
         try? fileManager.removeItem(at: sessionURL)
         session = nil
+        activePassword = nil
     }
 
     func requestUnmount() {
@@ -202,11 +366,33 @@ final class VirtualDiskManager: ObservableObject {
         alert.runModal()
     }
 
+    private func requestPasswordForSave() throws -> String {
+        let alert = NSAlert()
+        alert.messageText = SettingsStrings.text("输入原压缩密码", "Enter Original Archive Password")
+        alert.informativeText = SettingsStrings.text(
+            "需要原密码才能保留虚拟磁盘的加密并保存修改。密码不会写入会话文件。",
+            "The original password is required to preserve encryption when saving. It will not be stored in the session file."
+        )
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = SettingsStrings.text("压缩密码", "Archive password")
+        alert.accessoryView = field
+        alert.addButton(withTitle: SettingsStrings.text("继续保存", "Continue Saving"))
+        alert.addButton(withTitle: SettingsStrings.text("取消", "Cancel"))
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            throw CancellationError()
+        }
+        guard !field.stringValue.isEmpty else {
+            throw ArchiveEncryptionResolutionError.passwordRequired
+        }
+        return field.stringValue
+    }
+
     private func finishSession() throws {
         guard let current = session else { return }
         try? fileManager.removeItem(atPath: current.imagePath)
         try? fileManager.removeItem(at: sessionURL)
         session = nil
+        activePassword = nil
     }
 
     private func restoreSession() {
@@ -214,6 +400,7 @@ final class VirtualDiskManager: ObservableObject {
         let mountedPaths = fileManager.mountedVolumeURLs(includingResourceValuesForKeys: nil, options: [])?.map { $0.path } ?? []
         restored.isMounted = mountedPaths.contains(restored.mountPath)
         session = restored
+        activePassword = nil
     }
 
     private func persistSession() throws {
@@ -316,5 +503,37 @@ final class VirtualDiskManager: ObservableObject {
         let parts = files.filter { $0.deletingPathExtension().lastPathComponent == base && $0.pathExtension.lowercased().hasPrefix("z") }
         guard !parts.isEmpty else { return nil }
         return parts.compactMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize }.map(Int64.init).max()
+    }
+}
+
+@MainActor
+final class DefaultArchiveMountWorkflowClient: ArchiveMountWorkflowClient {
+    private let manager: VirtualDiskManager
+
+    init(manager: VirtualDiskManager = .shared) {
+        self.manager = manager
+    }
+
+    func mount(
+        archivePath: String,
+        password: String?,
+        capacityMB: Int,
+        securityInfo: ZwzArchiveSecurityInfo?,
+        identityStore: any ZwzIdentityStore
+    ) async throws {
+        try await manager.mount(
+            archivePath: archivePath,
+            password: password,
+            capacityMB: capacityMB,
+            securityInfo: securityInfo,
+            identityStore: identityStore
+        )
+    }
+
+    func save(identityStore: any ZwzIdentityStore) async throws {
+        guard let destinationPath = manager.session?.archivePath else {
+            throw VirtualDiskError.noActiveSession
+        }
+        try manager.save(to: destinationPath, identityStore: identityStore)
     }
 }

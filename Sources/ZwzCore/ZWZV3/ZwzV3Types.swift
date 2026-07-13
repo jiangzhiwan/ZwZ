@@ -78,15 +78,28 @@ public struct ZwzArchiveSecurityInfo: Equatable, Sendable {
     public let encryption: ZwzArchiveEncryptionKind
     public let recipientFingerprints: [String]
     public let signature: ZwzSignatureVerification
+    public let signerSigningPublicKey: Data?
 
     public init(
         encryption: ZwzArchiveEncryptionKind,
         recipientFingerprints: [String] = [],
-        signature: ZwzSignatureVerification = .unsigned
+        signature: ZwzSignatureVerification = .unsigned,
+        signerSigningPublicKey: Data? = nil
     ) {
         self.encryption = encryption
         self.recipientFingerprints = recipientFingerprints
         self.signature = signature
+        self.signerSigningPublicKey = signerSigningPublicKey
+    }
+}
+
+public struct ZwzV3ArchiveInspection: Equatable, Sendable {
+    public let recipients: [ZwzRecipientInfo]
+    public let securityInfo: ZwzArchiveSecurityInfo
+
+    public init(recipients: [ZwzRecipientInfo], securityInfo: ZwzArchiveSecurityInfo) {
+        self.recipients = recipients
+        self.securityInfo = securityInfo
     }
 }
 

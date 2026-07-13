@@ -47,6 +47,26 @@ enum ThreadMode: String, CaseIterable {
     }
 }
 
+enum EncryptionModeSelection: String, CaseIterable, Sendable {
+    case none
+    case password
+    case publicKey
+}
+
+private enum ArchiveViewModelSecurityError: LocalizedError {
+    case invalidCompressionConfiguration
+    case invalidArchiveSignature
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidCompressionConfiguration:
+            return "The selected archive encryption settings are incomplete."
+        case .invalidArchiveSignature:
+            return "The archive signature is invalid. Content cannot be opened."
+        }
+    }
+}
+
 // MARK: - View Model
 
 @MainActor
@@ -63,11 +83,22 @@ class ArchiveViewModel: ObservableObject {
 
     // 压缩选项
     @Published var showCompressOptions = false
-    @Published var compressFormat: CompressionFormat = .zip
+    @Published var compressFormat: CompressionFormat = .zip {
+        didSet {
+            if compressFormat == .zip, encryptionModeSelection == .publicKey {
+                selectEncryptionMode(.none)
+            }
+        }
+    }
     @Published var compressLevel: CompressionLevel = .normal
     @Published var password = ""
     @Published var splitSize = ""
     @Published var splitUnit = "MB"
+    @Published var encryptionModeSelection: EncryptionModeSelection = .none
+    @Published var selectedRecipientFingerprints: Set<String> = []
+    @Published var selectedSignerFingerprint: String?
+    @Published private(set) var availableRecipients: [ZwzPublicIdentity] = []
+    @Published private(set) var availableSigningIdentities: [ZwzIdentityMetadata] = []
 
     // 多线程设置（全局，从 UserDefaults 读取）
     @Published var threadMode: ThreadMode = .auto
@@ -87,6 +118,9 @@ class ArchiveViewModel: ObservableObject {
     @Published var isSavingEdits = false
     @Published var editErrorMessage: String?
     @Published private(set) var hasUnsavedArchiveEdits = false
+    @Published private(set) var archiveSecurityInfo: ZwzArchiveSecurityInfo?
+    @Published var showMissingPrivateKeyPrompt = false
+    @Published private(set) var missingPrivateKeyRecipients: [ZwzRecipientInfo] = []
 
     // 压缩包内容（内联显示）
     @Published var previewEntries: [ArchiveEntry] = []
@@ -120,7 +154,17 @@ class ArchiveViewModel: ObservableObject {
     // 文件选择
     @Published var showFilePicker = false
     @Published var showSavePanel = false
-    @Published var sourcePath: String?
+    @Published var sourcePath: String? {
+        didSet {
+            if sourcePath != oldValue {
+                invalidateOperation()
+                editClient.discard()
+                clearPendingPrivateKeyRecovery()
+                archiveSecurityInfo = nil
+                inspectedRecipients = []
+            }
+        }
+    }
 
     // 旋转动画
     @Published var rotationAngle: Double = 0
@@ -130,11 +174,13 @@ class ArchiveViewModel: ObservableObject {
 
     // 待操作类型
     private var pendingAction: PendingAction = .none
-    private var compressor = ZipCompressor()
-    private var extractor = ArchiveExtractor()
-    private var previewer = ArchivePreviewer()
     private var passwordWasAutoFilled = false
-    private var editSession: ArchiveEditSession?
+    private var inspectedRecipients: [ZwzRecipientInfo] = []
+
+    let identityStore: any ZwzIdentityStore
+    private let archiveClient: any ArchiveWorkflowClient
+    private let editClient: any ArchiveEditWorkflowClient
+    private let mountClient: any ArchiveMountWorkflowClient
 
     var isEditableArchive: Bool {
         detectedFormat == .zip || detectedFormat == .zwz
@@ -144,6 +190,61 @@ class ArchiveViewModel: ObservableObject {
         case none
         case compress
         case extract
+    }
+
+    private enum PendingPrivateKeyOperation {
+        case compress
+        case preview(path: String, isPasswordRetry: Bool)
+        case extract
+        case smartExtract
+        case entry(ArchiveEntry, openAfterExtraction: Bool)
+        case edit
+        case mount(capacityMB: Int)
+        case customResume(@MainActor @Sendable () -> Void)
+    }
+
+    private var pendingPrivateKeyOperation: PendingPrivateKeyOperation?
+
+    init(
+        identityStore: any ZwzIdentityStore = ZwzGUIIdentityStore.shared,
+        archiveClient: any ArchiveWorkflowClient = ZwzAPIArchiveWorkflowClient(),
+        editClient: any ArchiveEditWorkflowClient = DefaultArchiveEditWorkflowClient(),
+        mountClient: any ArchiveMountWorkflowClient = DefaultArchiveMountWorkflowClient()
+    ) {
+        self.identityStore = identityStore
+        self.archiveClient = archiveClient
+        self.editClient = editClient
+        self.mountClient = mountClient
+    }
+
+    var canStartCompression: Bool {
+        guard sourcePath != nil else { return false }
+        switch encryptionModeSelection {
+        case .none:
+            return true
+        case .password:
+            return !password.isEmpty
+        case .publicKey:
+            guard compressFormat == .zwz, !selectedRecipientFingerprints.isEmpty else {
+                return false
+            }
+            let knownRecipients = Set(availableRecipients.map(\.fingerprint))
+            guard selectedRecipientFingerprints.isSubset(of: knownRecipients) else { return false }
+            if let selectedSignerFingerprint {
+                return availableSigningIdentities.contains {
+                    $0.fingerprint == selectedSignerFingerprint
+                }
+            }
+            return true
+        }
+    }
+
+    var signatureBadge: ZwzSignatureVerification? {
+        archiveSecurityInfo?.signature
+    }
+
+    var canOpenArchiveContent: Bool {
+        archiveSecurityInfo?.signature != .invalid
     }
 
     @discardableResult
@@ -156,6 +257,7 @@ class ArchiveViewModel: ObservableObject {
     }
 
     func cancelOperation() {
+        clearPendingPrivateKeyRecovery()
         guard isProcessing else { return }
         isCancelling = true
         cancellationToken?.cancel()
@@ -169,6 +271,42 @@ class ArchiveViewModel: ObservableObject {
         operationGeneration = nil
     }
 
+    func selectEncryptionMode(_ mode: EncryptionModeSelection) {
+        encryptionModeSelection = mode
+        if mode != .publicKey {
+            selectedRecipientFingerprints.removeAll()
+            selectedSignerFingerprint = nil
+        }
+        if mode != .password {
+            password = ""
+        }
+    }
+
+    func refreshIdentityChoices() async throws {
+        let store = identityStore
+        let values = try await Task.detached(priority: .userInitiated) {
+            (try store.identities(), try store.contacts())
+        }.value
+
+        let identities = values.0.sorted(by: Self.identitySort)
+        var recipientsByFingerprint: [String: ZwzPublicIdentity] = [:]
+        for contact in values.1 {
+            recipientsByFingerprint[contact.fingerprint] = contact
+        }
+        for identity in identities {
+            recipientsByFingerprint[identity.fingerprint] = identity.publicIdentity
+        }
+        availableSigningIdentities = identities
+        availableRecipients = recipientsByFingerprint.values.sorted(by: Self.publicIdentitySort)
+
+        let recipientFingerprints = Set(availableRecipients.map(\.fingerprint))
+        selectedRecipientFingerprints.formIntersection(recipientFingerprints)
+        if let selectedSignerFingerprint,
+           !identities.contains(where: { $0.fingerprint == selectedSignerFingerprint }) {
+            self.selectedSignerFingerprint = nil
+        }
+    }
+
     // MARK: - Actions
 
     func startCompress() {
@@ -177,6 +315,7 @@ class ArchiveViewModel: ObservableObject {
         rememberPreviewPassword = false
         splitSize = ""
         compressLevel = .normal
+        Task { try? await refreshIdentityChoices() }
         // 从 UserDefaults 读取多线程设置
         let modeRaw = UserDefaults.standard.string(forKey: "zwz_thread_mode") ?? "auto"
         threadMode = ThreadMode(rawValue: modeRaw) ?? .auto
@@ -206,7 +345,7 @@ class ArchiveViewModel: ObservableObject {
                 password = ""
                 rememberPreviewPassword = false
                 previewPasswordError = nil
-                detectedFormat = try extractor.detectFormat(archivePath: path)
+                detectedFormat = try archiveClient.detectFormat(archivePath: path)
                 archiveName = url.lastPathComponent
                 performPreview(path: path)
             } catch {
@@ -247,7 +386,7 @@ class ArchiveViewModel: ObservableObject {
                 password = ""
                 rememberPreviewPassword = false
                 previewPasswordError = nil
-                detectedFormat = try extractor.detectFormat(archivePath: path)
+                detectedFormat = try archiveClient.detectFormat(archivePath: path)
                 archiveName = url.lastPathComponent
                 performPreview(path: path)
             } catch {
@@ -262,6 +401,7 @@ class ArchiveViewModel: ObservableObject {
     /// 清空预览内容，回到拖拽初始界面
     func clearPreview() {
         invalidateOperation()
+        clearPendingPrivateKeyRecovery()
         showPreviewPasswordPrompt = false
         previewPasswordError = nil
         password = ""
@@ -274,6 +414,8 @@ class ArchiveViewModel: ObservableObject {
         selectedEntryId = nil
         sourcePath = nil
         detectedFormat = nil
+        archiveSecurityInfo = nil
+        inspectedRecipients = []
         errorMessage = nil
         currentStatus = .idle
         discardArchiveEdits()
@@ -281,20 +423,32 @@ class ArchiveViewModel: ObservableObject {
 
     // MARK: - Archive Editing
 
-    func beginArchiveEditing() {
+    func beginArchiveEditing(allowsPrivateKeyRecovery: Bool = true) {
+        guard enforceValidSignature() else { return }
         guard let sourcePath, isEditableArchive else { return }
         isProcessing = true
         processingTitle = "正在准备编辑…"
         currentStatus = .reading
         let password = password.isEmpty ? nil : password
+        let securityInfo = archiveSecurityInfo
+        let editClient = editClient
+        let identityStore = identityStore
+        let generation = beginOperation()
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let session = try ArchiveEditSession.create(archiveURL: URL(fileURLWithPath: sourcePath), password: password)
-                let entries = try session.entries()
+                let entries = try editClient.open(
+                    archivePath: sourcePath,
+                    password: password,
+                    securityInfo: securityInfo,
+                    identityStore: identityStore
+                )
                 DispatchQueue.main.async {
-                    self.editSession = session
+                    guard self.acceptsCallback(generation: generation), self.sourcePath == sourcePath else {
+                        editClient.discard()
+                        return
+                    }
                     self.editEntries = entries
-                    self.hasUnsavedArchiveEdits = false
+                    self.hasUnsavedArchiveEdits = editClient.hasChanges
                     self.isProcessing = false
                     self.currentStatus = .idle
                     self.editErrorMessage = nil
@@ -302,87 +456,93 @@ class ArchiveViewModel: ObservableObject {
                 }
             } catch {
                 DispatchQueue.main.async {
+                    guard self.acceptsCallback(generation: generation), self.sourcePath == sourcePath else {
+                        return
+                    }
                     self.isProcessing = false
-                    self.currentStatus = .error
-                    self.errorMessage = self.localizedMessage(for: error, context: .preview)
+                    if self.handleProtectedOperationFailure(
+                        error,
+                        operation: .edit,
+                        allowsRecovery: allowsPrivateKeyRecovery,
+                        context: .preview
+                    ) {
+                        return
+                    }
                 }
             }
         }
     }
 
     func refreshEditEntries() {
-        do { editEntries = try editSession?.entries() ?? [] }
+        do { editEntries = try editClient.entries() }
         catch { editErrorMessage = error.localizedDescription }
     }
 
     func addToArchive(urls: [URL], directory: String) {
-        guard let editSession else { return }
         do {
-            try editSession.add(urls: urls, into: directory)
+            try editClient.add(urls: urls, into: directory)
             refreshEditEntries()
         } catch { editErrorMessage = error.localizedDescription }
-        hasUnsavedArchiveEdits = editSession.hasChanges
+        hasUnsavedArchiveEdits = editClient.hasChanges
     }
 
     func deleteFromArchive(path: String) {
-        guard let editSession else { return }
         do {
-            try editSession.delete(path: path)
+            try editClient.delete(path: path)
             refreshEditEntries()
         } catch { editErrorMessage = error.localizedDescription }
-        hasUnsavedArchiveEdits = editSession.hasChanges
+        hasUnsavedArchiveEdits = editClient.hasChanges
     }
 
     func renameInArchive(path: String, to name: String) {
-        guard let editSession else { return }
         do {
-            try editSession.rename(path: path, to: name)
+            try editClient.rename(path: path, to: name)
             refreshEditEntries()
         } catch { editErrorMessage = error.localizedDescription }
-        hasUnsavedArchiveEdits = editSession.hasChanges
+        hasUnsavedArchiveEdits = editClient.hasChanges
     }
 
     func replaceInArchive(path: String, with url: URL) {
-        guard let editSession else { return }
         do {
-            try editSession.replace(path: path, with: url)
+            try editClient.replace(path: path, with: url)
             refreshEditEntries()
         } catch { editErrorMessage = error.localizedDescription }
-        hasUnsavedArchiveEdits = editSession.hasChanges
+        hasUnsavedArchiveEdits = editClient.hasChanges
     }
 
-    func textForArchiveEntry(path: String) throws -> String { try editSession?.text(for: path) ?? "" }
+    func textForArchiveEntry(path: String) throws -> String {
+        try editClient.text(for: path)
+    }
 
     @discardableResult
     func saveTextInArchive(_ text: String, path: String) -> Bool {
-        guard let editSession else { return false }
         do {
-            try editSession.writeText(text, to: path)
+            try editClient.writeText(text, to: path)
             refreshEditEntries()
-            hasUnsavedArchiveEdits = editSession.hasChanges
+            hasUnsavedArchiveEdits = editClient.hasChanges
             return true
         } catch {
             editErrorMessage = error.localizedDescription
-            hasUnsavedArchiveEdits = editSession.hasChanges
+            hasUnsavedArchiveEdits = editClient.hasChanges
             return false
         }
     }
 
     func saveArchiveEdits(onSuccess: (@MainActor @Sendable () -> Void)? = nil) {
-        guard let session = editSession else {
+        guard let archivePath = editClient.archivePath ?? sourcePath else {
             onSuccess?()
             return
         }
-        let archivePath = session.archiveURL.path
         isSavingEdits = true
         editErrorMessage = nil
-        let password = password.isEmpty ? nil : password
+        let editClient = editClient
+        let identityStore = identityStore
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                try session.save(password: password)
+                try editClient.save(identityStore: identityStore)
                 DispatchQueue.main.async {
                     self.isSavingEdits = false
-                    self.editSession = nil
+                    editClient.discard()
                     self.hasUnsavedArchiveEdits = false
                     self.showArchiveEditor = false
                     self.performPreview(path: archivePath)
@@ -398,7 +558,7 @@ class ArchiveViewModel: ObservableObject {
     }
 
     func discardArchiveEdits() {
-        editSession = nil
+        editClient.discard()
         editEntries = []
         editErrorMessage = nil
         hasUnsavedArchiveEdits = false
@@ -407,36 +567,22 @@ class ArchiveViewModel: ObservableObject {
 
     // MARK: - Compress
 
-    func performCompress() {
+    func performCompress(allowsPrivateKeyRecovery: Bool = true) {
         guard let srcPath = sourcePath else {
             errorMessage = "No source file selected"
             return
         }
 
+        let options: CompressionOptions
+        do {
+            options = try compressionOptions()
+        } catch {
+            errorMessage = error.localizedDescription
+            return
+        }
+
         let ext = compressFormat.fileExtension
         let destPath = srcPath.hasSuffix(".\(ext)") ? srcPath : srcPath + ".\(ext)"
-
-        var splitVolume: SplitVolume?
-        if let size = Int(splitSize), size > 0 {
-            splitVolume = splitUnit == "MB" ? .megaBytes(size) : .kiloBytes(size)
-        }
-
-        // 线程数
-        let threadCount: Int
-        if threadMode == .auto {
-            threadCount = 0  // 0 = 自动检测
-        } else {
-            threadCount = manualThreadCount
-        }
-
-        let options = CompressionOptions(
-            level: compressLevel,
-            password: password.isEmpty ? nil : password,
-            aes256: true,
-            splitVolume: splitVolume,
-            format: compressFormat,
-            threadCount: threadCount
-        )
 
         isProcessing = true
         progress = 0
@@ -446,32 +592,19 @@ class ArchiveViewModel: ObservableObject {
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let compressor = ZipCompressor()
-                let zwzCompressor = ZwzCompressor()
-
-                switch options.format {
-                case .zip:
-                    try compressor.compress(
-                        sourcePath: srcPath,
-                        destinationPath: destPath,
-                        options: options,
-                        progress: { prog in
+                _ = try self.archiveClient.compress(
+                    sourcePath: srcPath,
+                    destinationPath: destPath,
+                    options: options,
+                    identityStore: self.identityStore,
+                    progress: { prog in
                         DispatchQueue.main.async {
                             guard self.acceptsCallback(generation: generation) else { return }
                             self.progress = prog
                         }
-                    }, cancellationToken: self.cancellationToken)
-                case .zwz:
-                    try zwzCompressor.compress(
-                        sourcePath: srcPath,
-                        destinationPath: destPath,
-                        options: options,
-                        progress: { prog in
-                        DispatchQueue.main.async {
-                            self.progress = prog
-                        }
-                    }, cancellationToken: self.cancellationToken)
-                }
+                    },
+                    cancellationToken: self.cancellationToken
+                )
 
                 DispatchQueue.main.async {
                     guard self.acceptsCallback(generation: generation) else { return }
@@ -489,8 +622,14 @@ class ArchiveViewModel: ObservableObject {
                 DispatchQueue.main.async {
                     guard self.acceptsCallback(generation: generation) else { return }
                     self.isProcessing = false
-                    self.currentStatus = .error
-                    self.errorMessage = self.localizedMessage(for: error, context: .general)
+                    if self.handleProtectedOperationFailure(
+                        error,
+                        operation: .compress,
+                        allowsRecovery: allowsPrivateKeyRecovery,
+                        context: .general
+                    ) {
+                        return
+                    }
                     self.history.append(ZWZHistoryItem(
                         type: .compress,
                         fileName: (srcPath as NSString).lastPathComponent,
@@ -504,7 +643,8 @@ class ArchiveViewModel: ObservableObject {
 
     // MARK: - Extract
 
-    func performSmartExtract() {
+    func performSmartExtract(allowsPrivateKeyRecovery: Bool = true) {
+        guard enforceValidSignature() else { return }
         guard let srcPath = sourcePath else {
             errorMessage = "No archive selected"
             return
@@ -512,6 +652,9 @@ class ArchiveViewModel: ObservableObject {
 
         let archiveURL = URL(fileURLWithPath: srcPath)
         let plan = SmartExtractionPlanner.makePlan(archiveURL: archiveURL, entries: allEntries)
+        let extractionDirectoryExisted = FileManager.default.fileExists(
+            atPath: plan.extractionDirectory.path
+        )
         let pwd = password.isEmpty ? nil : password
 
         isProcessing = true
@@ -526,10 +669,11 @@ class ArchiveViewModel: ObservableObject {
                     at: plan.extractionDirectory,
                     withIntermediateDirectories: true
                 )
-                try self.extractor.extract(
+                let result = try self.archiveClient.extract(
                     archivePath: srcPath,
                     destinationPath: plan.extractionDirectory.path,
                     password: pwd,
+                    identityStore: self.identityStore,
                     progress: { prog in
                         DispatchQueue.main.async {
                             guard self.acceptsCallback(generation: generation) else { return }
@@ -545,6 +689,9 @@ class ArchiveViewModel: ObservableObject {
                     self.isProcessing = false
                     self.progress = 1
                     self.currentStatus = .done
+                    if let securityInfo = result.securityInfo {
+                        self.archiveSecurityInfo = securityInfo
+                    }
                     self.history.append(ZWZHistoryItem(
                         type: .extract,
                         fileName: archiveURL.lastPathComponent,
@@ -556,14 +703,20 @@ class ArchiveViewModel: ObservableObject {
                     self.currentStatus = .done
                 }
             } catch {
-                if plan.extractedTopLevelName != nil {
+                if plan.extractedTopLevelName != nil || !extractionDirectoryExisted {
                     try? FileManager.default.removeItem(at: plan.extractionDirectory)
                 }
                 DispatchQueue.main.async {
                     guard self.acceptsCallback(generation: generation) else { return }
                     self.isProcessing = false
-                    self.currentStatus = .error
-                    self.errorMessage = self.localizedMessage(for: error, context: .extract)
+                    if self.handleProtectedOperationFailure(
+                        error,
+                        operation: .smartExtract,
+                        allowsRecovery: allowsPrivateKeyRecovery,
+                        context: .extract
+                    ) {
+                        return
+                    }
                     self.history.append(ZWZHistoryItem(
                         type: .extract,
                         fileName: archiveURL.lastPathComponent,
@@ -575,7 +728,8 @@ class ArchiveViewModel: ObservableObject {
         }
     }
 
-    func performExtract() {
+    func performExtract(allowsPrivateKeyRecovery: Bool = true) {
+        guard enforceValidSignature() else { return }
         guard let srcPath = sourcePath else {
             errorMessage = "No archive selected"
             return
@@ -592,10 +746,11 @@ class ArchiveViewModel: ObservableObject {
 
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                try self.extractor.extract(
+                let result = try self.archiveClient.extract(
                     archivePath: srcPath,
                     destinationPath: destPath,
                     password: pwd,
+                    identityStore: self.identityStore,
                     progress: { prog in
                     DispatchQueue.main.async {
                         guard self.acceptsCallback(generation: generation) else { return }
@@ -608,6 +763,9 @@ class ArchiveViewModel: ObservableObject {
                     self.isProcessing = false
                     self.progress = 1
                     self.currentStatus = .done
+                    if let securityInfo = result.securityInfo {
+                        self.archiveSecurityInfo = securityInfo
+                    }
                     self.history.append(ZWZHistoryItem(
                         type: .extract,
                         fileName: (srcPath as NSString).lastPathComponent,
@@ -622,8 +780,14 @@ class ArchiveViewModel: ObservableObject {
                 DispatchQueue.main.async {
                     guard self.acceptsCallback(generation: generation) else { return }
                     self.isProcessing = false
-                    self.currentStatus = .error
-                    self.errorMessage = self.localizedMessage(for: error, context: .extract)
+                    if self.handleProtectedOperationFailure(
+                        error,
+                        operation: .extract,
+                        allowsRecovery: allowsPrivateKeyRecovery,
+                        context: .extract
+                    ) {
+                        return
+                    }
                     self.history.append(ZWZHistoryItem(
                         type: .extract,
                         fileName: (srcPath as NSString).lastPathComponent,
@@ -635,9 +799,51 @@ class ArchiveViewModel: ObservableObject {
         }
     }
 
+    func mountArchive(
+        capacityMB: Int,
+        allowsPrivateKeyRecovery: Bool = true
+    ) async {
+        guard enforceValidSignature() else { return }
+        guard let sourcePath else {
+            errorMessage = "No archive selected"
+            return
+        }
+        do {
+            try await mountClient.mount(
+                archivePath: sourcePath,
+                password: password.isEmpty ? nil : password,
+                capacityMB: capacityMB,
+                securityInfo: archiveSecurityInfo,
+                identityStore: identityStore
+            )
+        } catch {
+            _ = handleProtectedOperationFailure(
+                error,
+                operation: .mount(capacityMB: capacityMB),
+                allowsRecovery: allowsPrivateKeyRecovery,
+                context: .extract
+            )
+        }
+    }
+
+    func saveMountedArchive() async {
+        guard enforceValidSignature() else { return }
+        let identityStore = identityStore
+        do {
+            try await mountClient.save(identityStore: identityStore)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
     // MARK: - Preview (inline, not a sheet)
 
-    func performPreview(path: String, isPasswordRetry: Bool = false) {
+    func performPreview(
+        path: String,
+        isPasswordRetry: Bool = false,
+        allowsPrivateKeyRecovery: Bool = true
+    ) {
+        guard enforceValidSignature() else { return }
         searchQuery = ""
         showHiddenFiles = UserDefaults.standard.bool(forKey: "zwz_preview_show_hidden")
         previewPasswordError = nil
@@ -646,17 +852,51 @@ class ArchiveViewModel: ObservableObject {
         currentStatus = .reading
         let previewPassword = password.isEmpty ? nil : password
         let generation = beginOperation()
+        let shouldInspect = detectedFormat == .zwz || Self.looksLikeZwzPath(path)
 
         DispatchQueue.global(qos: .userInitiated).async {
+            var inspection: ZwzV3ArchiveInspection?
             do {
-                let entries = try self.previewer.preview(archivePath: path, password: previewPassword)
+                if shouldInspect {
+                    inspection = try? self.archiveClient.inspect(
+                        archivePath: path,
+                        identityStore: self.identityStore
+                    )
+                }
+                if inspection?.securityInfo.signature == .invalid {
+                    DispatchQueue.main.async {
+                        guard self.acceptsCallback(generation: generation) else { return }
+                        self.applyInspection(inspection)
+                        self.publishInvalidSignature()
+                    }
+                    return
+                }
+
+                let listing = try self.archiveClient.list(
+                    archivePath: path,
+                    password: previewPassword,
+                    identityStore: self.identityStore
+                )
                 DispatchQueue.main.async {
                     guard self.acceptsCallback(generation: generation) else { return }
-                    self.handlePreviewSuccess(entries)
+                    self.handlePreviewSuccess(
+                        listing.entries,
+                        securityInfo: listing.securityInfo ?? inspection?.securityInfo,
+                        recipients: inspection?.recipients ?? []
+                    )
                 }
             } catch {
                 DispatchQueue.main.async {
                     guard self.acceptsCallback(generation: generation) else { return }
+                    self.applyInspection(inspection)
+                    if self.handleProtectedOperationFailure(
+                        error,
+                        operation: .preview(path: path, isPasswordRetry: isPasswordRetry),
+                        allowsRecovery: allowsPrivateKeyRecovery,
+                        context: .preview
+                    ) {
+                        return
+                    }
                     self.handlePreviewFailure(error, isPasswordRetry: isPasswordRetry)
                 }
             }
@@ -708,8 +948,18 @@ class ArchiveViewModel: ObservableObject {
     }
 
     func handlePreviewSuccess(_ entries: [ArchiveEntry]) {
+        handlePreviewSuccess(entries, securityInfo: nil, recipients: [])
+    }
+
+    private func handlePreviewSuccess(
+        _ entries: [ArchiveEntry],
+        securityInfo: ZwzArchiveSecurityInfo?,
+        recipients: [ZwzRecipientInfo]
+    ) {
         currentDir = ""
         setArchiveEntries(entries)
+        archiveSecurityInfo = securityInfo
+        inspectedRecipients = recipients
         isProcessing = false
         currentStatus = .idle
         errorMessage = nil
@@ -924,24 +1174,42 @@ class ArchiveViewModel: ObservableObject {
     // MARK: - Drag Out (提取单个文件供拖拽)
 
     func extractEntryForDrag(entry: ArchiveEntry) -> URL {
+        extractEntry(entry, openAfterExtraction: false, allowsPrivateKeyRecovery: true)
+    }
+
+    private func extractEntry(
+        _ entry: ArchiveEntry,
+        openAfterExtraction: Bool,
+        allowsPrivateKeyRecovery: Bool
+    ) -> URL {
+        guard enforceValidSignature() else {
+            return makeEntryErrorFile(ArchiveViewModelSecurityError.invalidArchiveSignature)
+        }
         guard let archivePath = sourcePath else {
             return URL(fileURLWithPath: "/tmp/zwz-error.txt")
         }
 
         do {
-            let url = try extractor.extractEntryToTemp(
+            let url = try archiveClient.extractEntryToTemp(
                 archivePath: archivePath,
                 entryPath: entry.path,
-                password: password.isEmpty ? nil : password
+                password: password.isEmpty ? nil : password,
+                identityStore: identityStore
             )
+            if openAfterExtraction {
+                NSWorkspace.shared.open(url)
+            }
             return url
         } catch {
-            let tempDir = FileManager.default.temporaryDirectory
-                .appendingPathComponent("zwz-error-\(UUID().uuidString)")
-            try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-            let errorFile = tempDir.appendingPathComponent("error.txt")
-            try? error.localizedDescription.write(to: errorFile, atomically: true, encoding: .utf8)
-            return errorFile
+            if handleProtectedOperationFailure(
+                error,
+                operation: .entry(entry, openAfterExtraction: openAfterExtraction),
+                allowsRecovery: allowsPrivateKeyRecovery,
+                context: .preview
+            ) {
+                return makeEntryErrorFile(error)
+            }
+            return makeEntryErrorFile(error)
         }
     }
 
@@ -951,13 +1219,241 @@ class ArchiveViewModel: ObservableObject {
             // 目录：在预览列表中进入子目录
             enterDirectory(entry)
         } else {
-            // 文件：用系统默认应用打开
-            let tempURL = extractEntryForDrag(entry: entry)
-            NSWorkspace.shared.open(tempURL)
+            _ = extractEntry(entry, openAfterExtraction: true, allowsPrivateKeyRecovery: true)
         }
     }
 
     // MARK: - Helpers
+
+    func resumePendingPrivateKeyOperationAfterRestore() {
+        guard let operation = pendingPrivateKeyOperation else { return }
+        clearPendingPrivateKeyRecovery()
+
+        switch operation {
+        case .compress:
+            performCompress(allowsPrivateKeyRecovery: false)
+        case .preview(let path, let isPasswordRetry):
+            performPreview(
+                path: path,
+                isPasswordRetry: isPasswordRetry,
+                allowsPrivateKeyRecovery: false
+            )
+        case .extract:
+            performExtract(allowsPrivateKeyRecovery: false)
+        case .smartExtract:
+            performSmartExtract(allowsPrivateKeyRecovery: false)
+        case .entry(let entry, let openAfterExtraction):
+            _ = extractEntry(
+                entry,
+                openAfterExtraction: openAfterExtraction,
+                allowsPrivateKeyRecovery: false
+            )
+        case .edit:
+            beginArchiveEditing(allowsPrivateKeyRecovery: false)
+        case .mount(let capacityMB):
+            Task {
+                await mountArchive(
+                    capacityMB: capacityMB,
+                    allowsPrivateKeyRecovery: false
+                )
+            }
+        case .customResume(let resume):
+            resume()
+        }
+    }
+
+    func dismissMissingPrivateKeyPrompt() {
+        clearPendingPrivateKeyRecovery()
+    }
+
+    func handleEntryPreviewProtectionFailure(
+        _ error: Error,
+        allowsPrivateKeyRecovery: Bool,
+        retryAfterRestore: @escaping @MainActor @Sendable () -> Void
+    ) {
+        _ = handleProtectedOperationFailure(
+            error,
+            operation: .customResume(retryAfterRestore),
+            allowsRecovery: allowsPrivateKeyRecovery,
+            context: .preview
+        )
+    }
+
+    private func compressionOptions() throws -> CompressionOptions {
+        guard canStartCompression else {
+            throw ArchiveViewModelSecurityError.invalidCompressionConfiguration
+        }
+
+        let encryption: ZwzEncryptionMode
+        switch encryptionModeSelection {
+        case .none:
+            encryption = .none
+        case .password:
+            encryption = .password(password)
+        case .publicKey:
+            let recipientsByFingerprint = Dictionary(
+                uniqueKeysWithValues: availableRecipients.map { ($0.fingerprint, $0) }
+            )
+            let recipients = try selectedRecipientFingerprints.sorted().map {
+                fingerprint -> ZwzRecipient in
+                guard let identity = recipientsByFingerprint[fingerprint] else {
+                    throw ArchiveViewModelSecurityError.invalidCompressionConfiguration
+                }
+                return ZwzRecipient(
+                    name: identity.name,
+                    fingerprint: identity.fingerprint,
+                    agreementPublicKey: identity.agreementPublicKey
+                )
+            }
+            let signer: ZwzSigningIdentity?
+            if let selectedSignerFingerprint {
+                guard let identity = availableSigningIdentities.first(where: {
+                    $0.fingerprint == selectedSignerFingerprint
+                }) else {
+                    throw ArchiveViewModelSecurityError.invalidCompressionConfiguration
+                }
+                signer = ZwzSigningIdentity(
+                    name: identity.name,
+                    fingerprint: identity.fingerprint,
+                    agreementPublicKey: identity.agreementPublicKey,
+                    signingPublicKey: identity.signingPublicKey
+                )
+            } else {
+                signer = nil
+            }
+            encryption = .publicKey(recipients: recipients, signer: signer)
+        }
+
+        let splitVolume: SplitVolume?
+        if let size = Int(splitSize), size > 0 {
+            splitVolume = splitUnit == "MB" ? .megaBytes(size) : .kiloBytes(size)
+        } else {
+            splitVolume = nil
+        }
+        let threadCount = threadMode == .auto ? 0 : manualThreadCount
+        return CompressionOptions(
+            level: compressLevel,
+            encryption: encryption,
+            aes256: true,
+            splitVolume: splitVolume,
+            format: compressFormat,
+            threadCount: threadCount
+        )
+    }
+
+    @discardableResult
+    private func handleProtectedOperationFailure(
+        _ error: Error,
+        operation: PendingPrivateKeyOperation,
+        allowsRecovery: Bool,
+        context: ErrorContext
+    ) -> Bool {
+        if let v3Error = error as? ZwzV3Error {
+            switch v3Error {
+            case .invalidSignature:
+                let fingerprints = archiveSecurityInfo?.recipientFingerprints
+                    ?? inspectedRecipients.map(\.fingerprint)
+                archiveSecurityInfo = ZwzArchiveSecurityInfo(
+                    encryption: .publicKey,
+                    recipientFingerprints: fingerprints,
+                    signature: .invalid
+                )
+                publishInvalidSignature()
+                return true
+            case .noMatchingPrivateKey(let fingerprints):
+                isProcessing = false
+                if allowsRecovery {
+                    pendingPrivateKeyOperation = operation
+                    if inspectedRecipients.isEmpty {
+                        missingPrivateKeyRecipients = fingerprints.map {
+                            ZwzRecipientInfo(name: "", fingerprint: $0)
+                        }
+                    } else {
+                        missingPrivateKeyRecipients = inspectedRecipients
+                    }
+                    showMissingPrivateKeyPrompt = true
+                    currentStatus = .idle
+                    errorMessage = nil
+                } else {
+                    clearPendingPrivateKeyRecovery()
+                    currentStatus = .error
+                    errorMessage = v3Error.localizedDescription
+                }
+                return true
+            default:
+                break
+            }
+        }
+
+        currentStatus = .error
+        errorMessage = localizedMessage(for: error, context: context)
+        return false
+    }
+
+    private func enforceValidSignature() -> Bool {
+        guard archiveSecurityInfo?.signature == .invalid else { return true }
+        publishInvalidSignature()
+        return false
+    }
+
+    private func publishInvalidSignature() {
+        clearPendingPrivateKeyRecovery()
+        isProcessing = false
+        currentStatus = .error
+        errorMessage = ArchiveViewModelSecurityError.invalidArchiveSignature.localizedDescription
+    }
+
+    private func applyInspection(_ inspection: ZwzV3ArchiveInspection?) {
+        guard let inspection else { return }
+        archiveSecurityInfo = inspection.securityInfo
+        inspectedRecipients = inspection.recipients
+    }
+
+    private func clearPendingPrivateKeyRecovery() {
+        pendingPrivateKeyOperation = nil
+        showMissingPrivateKeyPrompt = false
+        missingPrivateKeyRecipients = []
+    }
+
+    private func makeEntryErrorFile(_ error: Error) -> URL {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("zwz-error-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(
+            at: tempDir,
+            withIntermediateDirectories: true
+        )
+        let errorFile = tempDir.appendingPathComponent("error.txt")
+        try? error.localizedDescription.write(
+            to: errorFile,
+            atomically: true,
+            encoding: .utf8
+        )
+        return errorFile
+    }
+
+    private static func looksLikeZwzPath(_ path: String) -> Bool {
+        URL(fileURLWithPath: path).pathExtension.lowercased() == "zwz"
+    }
+
+    private static func identitySort(
+        _ lhs: ZwzIdentityMetadata,
+        _ rhs: ZwzIdentityMetadata
+    ) -> Bool {
+        if lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedSame {
+            return lhs.fingerprint < rhs.fingerprint
+        }
+        return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+    }
+
+    private static func publicIdentitySort(
+        _ lhs: ZwzPublicIdentity,
+        _ rhs: ZwzPublicIdentity
+    ) -> Bool {
+        if lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedSame {
+            return lhs.fingerprint < rhs.fingerprint
+        }
+        return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+    }
 
     private enum ErrorContext {
         case general

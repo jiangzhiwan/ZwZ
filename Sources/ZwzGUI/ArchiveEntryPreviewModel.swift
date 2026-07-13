@@ -16,6 +16,42 @@ enum ArchiveEntryPreviewState: Equatable, Sendable {
     case failed(String)
 }
 
+enum ArchiveEntryPreviewProtectionFailure: Equatable, Sendable {
+    case missingPrivateKey([String])
+    case invalidSignature
+
+    init?(_ error: Error) {
+        guard let error = error as? ZwzV3Error else { return nil }
+        switch error {
+        case .noMatchingPrivateKey(let fingerprints):
+            self = .missingPrivateKey(fingerprints)
+        case .invalidSignature:
+            self = .invalidSignature
+        default:
+            return nil
+        }
+    }
+
+    var error: ZwzV3Error {
+        switch self {
+        case .missingPrivateKey(let fingerprints):
+            return .noMatchingPrivateKey(fingerprints)
+        case .invalidSignature:
+            return .invalidSignature
+        }
+    }
+}
+
+struct ArchiveEntryPreviewProtectionEvent: Sendable {
+    let failure: ArchiveEntryPreviewProtectionFailure
+    let allowsPrivateKeyRecovery: Bool
+    let retryAfterPrivateKeyRestore: @MainActor @Sendable () -> Void
+}
+
+typealias ArchiveEntryPreviewProtectionHandler = @MainActor @Sendable (
+    ArchiveEntryPreviewProtectionEvent
+) -> Void
+
 protocol ArchiveEntryPreviewExtracting: Sendable {
     func extractEntryToTemp(
         archivePath: String,
@@ -27,6 +63,8 @@ protocol ArchiveEntryPreviewExtracting: Sendable {
 }
 
 private struct DefaultArchiveEntryPreviewExtractor: ArchiveEntryPreviewExtracting {
+    let identityStore: any ZwzIdentityStore
+
     func extractEntryToTemp(
         archivePath: String,
         entryPath: String,
@@ -38,6 +76,7 @@ private struct DefaultArchiveEntryPreviewExtractor: ArchiveEntryPreviewExtractin
             archivePath: archivePath,
             entryPath: entryPath,
             password: password,
+            keyProvider: identityStore,
             maximumBytes: maximumBytes,
             cancellationToken: cancellationToken
         )
@@ -53,6 +92,7 @@ final class ArchiveEntryPreviewModel: ObservableObject {
     var currentEntryPath: String? { currentEntry?.path }
 
     private let extractor: any ArchiveEntryPreviewExtracting
+    private let onProtectionFailure: ArchiveEntryPreviewProtectionHandler?
     private var currentRequest: PreviewRequest?
     private var currentTask: Task<Void, Never>?
     private var currentCancellationToken: CancellationToken?
@@ -62,9 +102,15 @@ final class ArchiveEntryPreviewModel: ObservableObject {
         let archivePath: String
         let entry: ArchiveEntry
         let password: String?
+        let allowsPrivateKeyRecovery: Bool
 
         var key: PreviewRequestKey {
-            PreviewRequestKey(archivePath: archivePath, entryPath: entry.path, password: password)
+            PreviewRequestKey(
+                archivePath: archivePath,
+                entryPath: entry.path,
+                password: password,
+                allowsPrivateKeyRecovery: allowsPrivateKeyRecovery
+            )
         }
     }
 
@@ -72,17 +118,36 @@ final class ArchiveEntryPreviewModel: ObservableObject {
         let archivePath: String
         let entryPath: String
         let password: String?
+        let allowsPrivateKeyRecovery: Bool
     }
 
-    init(extractor: any ArchiveEntryPreviewExtracting = DefaultArchiveEntryPreviewExtractor()) {
+    init(
+        identityStore: any ZwzIdentityStore = ZwzGUIIdentityStore.shared,
+        onProtectionFailure: ArchiveEntryPreviewProtectionHandler? = nil
+    ) {
+        extractor = DefaultArchiveEntryPreviewExtractor(identityStore: identityStore)
+        self.onProtectionFailure = onProtectionFailure
+    }
+
+    init(
+        extractor: any ArchiveEntryPreviewExtracting,
+        onProtectionFailure: ArchiveEntryPreviewProtectionHandler? = nil
+    ) {
         self.extractor = extractor
+        self.onProtectionFailure = onProtectionFailure
     }
 
-    func preview(archivePath: String, entry: ArchiveEntry, password: String? = nil) {
+    func preview(
+        archivePath: String,
+        entry: ArchiveEntry,
+        password: String? = nil,
+        allowsPrivateKeyRecovery: Bool = true
+    ) {
         let request = PreviewRequest(
             archivePath: archivePath,
             entry: entry,
-            password: password?.isEmpty == true ? nil : password
+            password: password?.isEmpty == true ? nil : password,
+            allowsPrivateKeyRecovery: allowsPrivateKeyRecovery
         )
         if state == .loading, currentRequest?.key == request.key {
             return
@@ -162,7 +227,18 @@ final class ArchiveEntryPreviewModel: ObservableObject {
         preview(
             archivePath: request.archivePath,
             entry: request.entry,
-            password: request.password
+            password: request.password,
+            allowsPrivateKeyRecovery: request.allowsPrivateKeyRecovery
+        )
+    }
+
+    func retryAfterPrivateKeyRestore() {
+        guard let request = currentRequest else { return }
+        preview(
+            archivePath: request.archivePath,
+            entry: request.entry,
+            password: request.password,
+            allowsPrivateKeyRecovery: false
         )
     }
 
@@ -214,6 +290,16 @@ final class ArchiveEntryPreviewModel: ObservableObject {
                 state = .idle
             } else {
                 state = .failed(error.localizedDescription)
+                if let failure = ArchiveEntryPreviewProtectionFailure(error),
+                   let request = currentRequest {
+                    onProtectionFailure?(ArchiveEntryPreviewProtectionEvent(
+                        failure: failure,
+                        allowsPrivateKeyRecovery: request.allowsPrivateKeyRecovery,
+                        retryAfterPrivateKeyRestore: { [weak self] in
+                            self?.retryAfterPrivateKeyRestore()
+                        }
+                    ))
+                }
             }
         }
     }

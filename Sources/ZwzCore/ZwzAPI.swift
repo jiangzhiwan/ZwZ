@@ -208,6 +208,21 @@ public final class ZwzAPI {
         )
     }
 
+    /// Reads public V3 recipient metadata and verifies its optional signature
+    /// without requesting a private key or decrypting archive contents.
+    public func inspect(
+        archivePath: String,
+        keyProvider: ZwzPrivateKeyProvider? = nil
+    ) throws -> ZwzV3ArchiveInspection {
+        guard FileManager.default.fileExists(atPath: archivePath) else {
+            throw ZwzError.fileNotFound(archivePath)
+        }
+        return try ZwzV3Extractor().inspectArchive(
+            archivePath: archivePath,
+            keyProvider: keyProvider
+        )
+    }
+
     // MARK: - Detect Format
 
     /// 检测压缩包格式

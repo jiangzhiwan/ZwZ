@@ -229,8 +229,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: - Menu Actions
 
     private let compressor = ZipCompressor()
-    private let extractor = ArchiveExtractor()
-    private let previewer = ArchivePreviewer()
 
     @objc func compressFileAction() {
         let panel = NSOpenPanel()
@@ -312,45 +310,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func extractArchive(at path: String) {
-        let destPath = (path as NSString).deletingPathExtension
-        let extractor = self.extractor
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                try extractor.extract(archivePath: path, destinationPath: destPath, password: nil)
-                DispatchQueue.main.async {
-                    NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: destPath)
-                    Self.notify(title: "解压完成", body: (destPath as NSString).lastPathComponent)
-                }
-            } catch {
-                let msg = error.localizedDescription
-                DispatchQueue.main.async { Self.notify(title: "解压失败", body: msg) }
-            }
-        }
+        openArchiveInWorkspace(at: path, intent: .extract)
     }
 
     func previewArchive(at path: String) {
-        let previewer = self.previewer
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                let entries = try previewer.preview(archivePath: path)
-                var content = "共 \(entries.count) 个项目\n"
-                for entry in entries.prefix(20) {
-                    let icon = entry.isDirectory ? "📁" : "📄"
-                    content += "\(icon) \(entry.name) - \(self.formatBytes(entry.size))\n"
-                }
-                if entries.count > 20 { content += "... 还有 \(entries.count - 20) 个项目" }
-                DispatchQueue.main.async {
-                    let alert = NSAlert()
-                    alert.messageText = (path as NSString).lastPathComponent
-                    alert.informativeText = content
-                    alert.alertStyle = .informational
-                    alert.runModal()
-                }
-            } catch {
-                let msg = error.localizedDescription
-                DispatchQueue.main.async { Self.notify(title: "预览失败", body: msg) }
-            }
-        }
+        openArchiveInWorkspace(at: path, intent: .preview)
+    }
+
+    private func openArchiveInWorkspace(at path: String, intent: WorkspaceOpenIntent) {
+        createMainWindow()
+        mainWorkspace.requestOpen(url: URL(fileURLWithPath: path), intent: intent)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     @MainActor static func notify(title: String, body: String) {
@@ -361,13 +331,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSUserNotificationCenter.default.deliver(notification)
     }
 
-    func formatBytes(_ bytes: Int64) -> String {
-        let b = Double(bytes)
-        if b < 1024 { return "\(Int64(b)) B" }
-        if b < 1024 * 1024 { return String(format: "%.1f KB", b / 1024) }
-        if b < 1024 * 1024 * 1024 { return String(format: "%.1f MB", b / (1024 * 1024)) }
-        return String(format: "%.2f GB", b / (1024 * 1024 * 1024))
-    }
 }
 
 // MARK: - App Entry
@@ -418,9 +381,12 @@ struct ContentView: View {
 
                     if viewModel.isProcessing {
                         ZWZProcessingView(viewModel: viewModel)
+                    } else if viewModel.signatureBadge == .invalid,
+                              viewModel.sourcePath != nil {
+                        ZWZArchiveContentView(viewModel: viewModel)
                     } else if let errorMessage = viewModel.errorMessage {
                         ZWZErrorView(message: errorMessage) { viewModel.errorMessage = nil }
-                    } else if !viewModel.previewEntries.isEmpty {
+                    } else if !viewModel.previewEntries.isEmpty || viewModel.archiveSecurityInfo != nil {
                         ZWZArchiveContentView(viewModel: viewModel)
                     } else {
                         ZWZDropZone(viewModel: viewModel, isDragging: $isDropTargeted)
@@ -457,6 +423,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: $viewModel.showVaultUnlockPrompt) {
             ZWZMasterPasswordUnlockView(viewModel: viewModel)
+        }
+        .sheet(isPresented: $viewModel.showMissingPrivateKeyPrompt) {
+            ZWZMissingPrivateKeyRecoveryView(viewModel: viewModel)
         }
         .background {
             ArchiveEditorWindowPresenter(
@@ -968,6 +937,119 @@ struct ZWZArchiveTextEditor: View {
     }
 }
 
+@MainActor
+struct ZWZMissingPrivateKeyRecoveryView: View {
+    @ObservedObject private var viewModel: ArchiveViewModel
+    @StateObject private var identityModel: IdentityManagerViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    init(viewModel: ArchiveViewModel) {
+        _viewModel = ObservedObject(wrappedValue: viewModel)
+        _identityModel = StateObject(wrappedValue: IdentityManagerViewModel(
+            store: viewModel.identityStore,
+            onPrivateRestore: { [weak viewModel] in
+                viewModel?.resumePendingPrivateKeyOperationAfterRestore()
+            }
+        ))
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Image(systemName: "key.horizontal.fill")
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundColor(.zwzOrange)
+                    .frame(width: 36, height: 36)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(SettingsStrings.text("缺少匹配的私钥", "Matching Private Key Required"))
+                        .font(.system(size: 17, weight: .semibold, design: .rounded))
+                    Text(SettingsStrings.text(
+                        "恢复接收方的私钥备份后将自动重试一次。",
+                        "Restore a recipient private-key backup to retry once."
+                    ))
+                    .font(.system(size: 11, design: .rounded))
+                    .foregroundColor(.secondary)
+                }
+
+                Spacer()
+
+                Button {
+                    cancel()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 12, weight: .medium))
+                        .frame(width: 30, height: 30)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(L.string("cancel"))
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Label(
+                    SettingsStrings.text("归档声明的接收方（未验证）", "Archive-declared recipients (unverified)"),
+                    systemImage: "exclamationmark.shield"
+                )
+                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .foregroundColor(.zwzOrange)
+
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(Array(viewModel.missingPrivateKeyRecipients.enumerated()), id: \.offset) { _, recipient in
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(recipient.name.isEmpty
+                                    ? SettingsStrings.text("未知接收方", "Unknown Recipient")
+                                    : recipient.name)
+                                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                                Text(recipient.fingerprint)
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .textSelection(.enabled)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+                .frame(maxHeight: 120)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+
+            Divider()
+
+            IdentityManagerView(model: identityModel)
+                .padding(20)
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button(L.string("cancel"), action: cancel)
+                    .zwzSheetButtonStyle(.secondary)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+        }
+        .frame(width: 700, height: 640)
+        .background(LinearGradient.zwzBackground.opacity(0.5))
+        .interactiveDismissDisabled()
+        .onDisappear {
+            viewModel.dismissMissingPrivateKeyPrompt()
+        }
+    }
+
+    private func cancel() {
+        viewModel.dismissMissingPrivateKeyPrompt()
+        dismiss()
+    }
+}
+
 // MARK: - Toolbar
 
 struct ZWZToolbar: View {
@@ -1401,8 +1483,9 @@ struct ZWZErrorView: View {
 struct ZWZArchiveContentView: View {
     @ObservedObject var viewModel: ArchiveViewModel
     @ObservedObject private var virtualDisk = VirtualDiskManager.shared
-    @StateObject private var entryPreviewModel = ArchiveEntryPreviewModel()
+    @StateObject private var entryPreviewModel: ArchiveEntryPreviewModel
     @State private var showMountOptions = false
+    @State private var presentRecoveryAfterMountDismiss = false
     @State private var capacityMB = 256
     @State private var isPreviewSidebarPresented = false
     @State private var closedPreviewEntryID: UUID?
@@ -1412,6 +1495,20 @@ struct ZWZArchiveContentView: View {
     @AppStorage(ArchiveEntryPreviewSettings.sidebarEnabledKey) private var previewSidebarEnabled = true
     @AppStorage(ArchiveEntryPreviewSettings.triggerKey) private var previewTrigger = "single"
     @AppStorage(ArchiveEntryPreviewSettings.sidebarWidthKey) private var previewSidebarWidth = ArchiveEntryPreviewSettings.defaultSidebarWidth
+
+    init(viewModel: ArchiveViewModel) {
+        _viewModel = ObservedObject(wrappedValue: viewModel)
+        _entryPreviewModel = StateObject(wrappedValue: ArchiveEntryPreviewModel(
+            identityStore: viewModel.identityStore,
+            onProtectionFailure: { [weak viewModel] event in
+                viewModel?.handleEntryPreviewProtectionFailure(
+                    event.failure.error,
+                    allowsPrivateKeyRecovery: event.allowsPrivateKeyRecovery,
+                    retryAfterRestore: event.retryAfterPrivateKeyRestore
+                )
+            }
+        ))
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1431,10 +1528,15 @@ struct ZWZArchiveContentView: View {
                         .font(.system(size: 15, weight: .semibold, design: .rounded))
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    if let format = viewModel.detectedFormat {
-                        Text(format.displayName)
-                            .font(.system(size: 11))
-                            .foregroundColor(.zwzPink)
+                    HStack(spacing: 7) {
+                        if let format = viewModel.detectedFormat {
+                            Text(format.displayName)
+                                .font(.system(size: 11))
+                                .foregroundColor(.zwzPink)
+                        }
+                        if let signature = viewModel.signatureBadge {
+                            ZWZArchiveSignatureBadge(signature: signature)
+                        }
                     }
                 }
 
@@ -1472,6 +1574,7 @@ struct ZWZArchiveContentView: View {
                             .contentShape(RoundedRectangle(cornerRadius: 8))
                     }
                     .buttonStyle(.plain)
+                    .disabled(virtualDisk.session == nil && !viewModel.canOpenArchiveContent)
                     .help(virtualDisk.session == nil
                         ? SettingsStrings.text("挂载为虚拟磁盘", "Mount as Virtual Disk")
                         : SettingsStrings.text("卸载虚拟磁盘", "Unmount Virtual Disk"))
@@ -1490,6 +1593,7 @@ struct ZWZArchiveContentView: View {
                             .contentShape(RoundedRectangle(cornerRadius: 8))
                     }
                     .buttonStyle(.plain)
+                    .disabled(!viewModel.canOpenArchiveContent)
                     .help("编辑压缩包")
                 }
 
@@ -1500,7 +1604,7 @@ struct ZWZArchiveContentView: View {
                 ) {
                     viewModel.performSmartExtract()
                 }
-                .disabled(viewModel.isProcessing)
+                .disabled(viewModel.isProcessing || !viewModel.canOpenArchiveContent)
 
                 // 解压按钮（粉色渐变）
                 ZWZGradientButton(
@@ -1511,6 +1615,7 @@ struct ZWZArchiveContentView: View {
                     viewModel.password = ""
                     viewModel.showExtractOptions = true
                 }
+                .disabled(!viewModel.canOpenArchiveContent)
 
                 // 关闭
                 ZWZIconButton(icon: "xmark") {
@@ -1621,20 +1726,35 @@ struct ZWZArchiveContentView: View {
         .onChange(of: previewTrigger) { _, _ in
             handlePreviewSelectionChange(viewModel.selectedEntryId)
         }
+        .onChange(of: viewModel.canOpenArchiveContent) { _, canOpen in
+            if !canOpen {
+                hideEntryPreview()
+            }
+        }
         .onDisappear {
             hideEntryPreview()
         }
         .onAppear {
             normalizePreviewSidebarWidth()
         }
-        .sheet(isPresented: $showMountOptions) {
+        .sheet(isPresented: $showMountOptions, onDismiss: {
+            guard presentRecoveryAfterMountDismiss else { return }
+            presentRecoveryAfterMountDismiss = false
+            guard !viewModel.missingPrivateKeyRecipients.isEmpty else { return }
+            DispatchQueue.main.async {
+                viewModel.showMissingPrivateKeyPrompt = true
+            }
+        }) {
             VirtualDiskMountOptionsView(
-                archivePath: viewModel.sourcePath ?? "",
-                password: viewModel.password,
+                viewModel: viewModel,
                 capacityMB: $capacityMB,
                 minimumCapacityMB: VirtualDiskManager.recommendedCapacityMB(
                     uncompressedBytes: viewModel.previewEntries.reduce(UInt64(0)) { $0 + UInt64(max(0, viewModel.displaySize(for: $1))) }
-                )
+                ),
+                onPrivateKeyRecoveryRequired: {
+                    presentRecoveryAfterMountDismiss = true
+                    viewModel.showMissingPrivateKeyPrompt = false
+                }
             )
         }
     }
@@ -1665,6 +1785,7 @@ struct ZWZArchiveContentView: View {
                                 .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .disabled(!viewModel.canOpenArchiveContent)
                     } else {
                         Image(systemName: ArchiveEntryPresentation.iconName(forFileNamed: entry.name, isDirectory: false))
                             .foregroundColor(.zwzBlue)
@@ -1691,6 +1812,7 @@ struct ZWZArchiveContentView: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .disabled(!viewModel.canOpenArchiveContent)
                     } else {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(entry.name)
@@ -1735,10 +1857,12 @@ struct ZWZArchiveContentView: View {
                 .padding(.vertical, 3)
                 .contentShape(Rectangle())
                 .onTapGesture {
+                    guard viewModel.canOpenArchiveContent else { return }
                     closedPreviewEntryID = nil
                     viewModel.selectedEntryId = entry.id
                 }
                 .onTapGesture(count: 2) {
+                    guard viewModel.canOpenArchiveContent else { return }
                     closedPreviewEntryID = nil
                     viewModel.selectedEntryId = entry.id
                     if entry.isDirectory || previewTrigger == "single" {
@@ -1748,6 +1872,9 @@ struct ZWZArchiveContentView: View {
                     }
                 }
                 .onDrag {
+                    guard viewModel.canOpenArchiveContent else {
+                        return NSItemProvider()
+                    }
                     let tempURL = viewModel.extractEntryForDrag(entry: entry)
                     return NSItemProvider(contentsOf: tempURL) ?? NSItemProvider()
                 }
@@ -1773,7 +1900,8 @@ struct ZWZArchiveContentView: View {
     }
 
     private func updateEntryPreview(selectedEntryID: UUID?) {
-        guard let selectedEntryID,
+        guard viewModel.canOpenArchiveContent,
+              let selectedEntryID,
               previewSidebarEnabled,
               selectedEntryID != closedPreviewEntryID,
               let entry = viewModel.previewEntries.first(where: { $0.id == selectedEntryID }),
@@ -1899,11 +2027,75 @@ struct ZWZArchiveContentView: View {
     }
 }
 
+private struct ZWZArchiveSignatureBadge: View {
+    let signature: ZwzSignatureVerification
+
+    var body: some View {
+        Label(title, systemImage: icon)
+            .font(.system(size: 10, weight: .medium, design: .rounded))
+            .foregroundColor(color)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(maxWidth: 170, alignment: .leading)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(color.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 5))
+            .help(helpText)
+    }
+
+    private var title: String {
+        switch signature {
+        case .unsigned:
+            return SettingsStrings.text("未签名", "Unsigned")
+        case .validKnownSigner(let name, _):
+            return name.isEmpty
+                ? SettingsStrings.text("签名有效", "Valid Signature")
+                : SettingsStrings.text("签名有效 · \(name)", "Valid · \(name)")
+        case .validUnknownSigner:
+            return SettingsStrings.text("签名有效 · 未知签名者", "Valid · Unknown Signer")
+        case .invalid:
+            return SettingsStrings.text("签名无效", "Invalid Signature")
+        }
+    }
+
+    private var icon: String {
+        switch signature {
+        case .unsigned: return "pencil.slash"
+        case .validKnownSigner: return "checkmark.seal.fill"
+        case .validUnknownSigner: return "questionmark.diamond.fill"
+        case .invalid: return "xmark.seal.fill"
+        }
+    }
+
+    private var color: Color {
+        switch signature {
+        case .unsigned: return .secondary
+        case .validKnownSigner: return .green
+        case .validUnknownSigner: return .zwzOrange
+        case .invalid: return .red
+        }
+    }
+
+    private var helpText: String {
+        switch signature {
+        case .unsigned:
+            return SettingsStrings.text("此归档没有签名。", "This archive is not signed.")
+        case .validKnownSigner(let name, let fingerprint):
+            return "\(name)\n\(fingerprint)"
+        case .validUnknownSigner(let name, let fingerprint):
+            return "\(SettingsStrings.text("未知签名者", "Unknown signer")): \(name)\n\(fingerprint)"
+        case .invalid:
+            return SettingsStrings.text("签名验证失败，内容操作已禁用。", "Signature verification failed; content actions are disabled.")
+        }
+    }
+}
+
 struct VirtualDiskMountOptionsView: View {
-    let archivePath: String
-    let password: String
+    @ObservedObject var viewModel: ArchiveViewModel
     @Binding var capacityMB: Int
     let minimumCapacityMB: Int
+    let onPrivateKeyRecoveryRequired: () -> Void
     @Environment(\.dismiss) private var dismiss
     @AppStorage("zwz_mount_open_finder") private var openFinder = true
     @State private var errorMessage: String?
@@ -1932,24 +2124,31 @@ struct VirtualDiskMountOptionsView: View {
                 Button(SettingsStrings.text("挂载", "Mount")) {
                     isMounting = true
                     Task {
-                        do {
-                            try await VirtualDiskManager.shared.mount(
-                                archivePath: archivePath,
-                                password: password.isEmpty ? nil : password,
-                                capacityMB: capacityMB
-                            )
-                            if openFinder, let session = VirtualDiskManager.shared.session {
-                                NSWorkspace.shared.open(URL(fileURLWithPath: session.mountPath))
-                            }
+                        await viewModel.mountArchive(capacityMB: capacityMB)
+                        if viewModel.showMissingPrivateKeyPrompt {
+                            onPrivateKeyRecoveryRequired()
                             dismiss()
-                        } catch {
-                            errorMessage = error.localizedDescription
-                            isMounting = false
+                            return
                         }
+                        if let message = viewModel.errorMessage {
+                            errorMessage = message
+                            viewModel.errorMessage = nil
+                            isMounting = false
+                            return
+                        }
+                        guard let session = VirtualDiskManager.shared.session else {
+                            errorMessage = SettingsStrings.text("无法挂载虚拟磁盘。", "Unable to mount the virtual disk.")
+                            isMounting = false
+                            return
+                        }
+                        if openFinder {
+                            NSWorkspace.shared.open(URL(fileURLWithPath: session.mountPath))
+                        }
+                        dismiss()
                     }
                 }
                 .zwzSheetButtonStyle(.primary)
-                .disabled(isMounting)
+                .disabled(isMounting || !viewModel.canOpenArchiveContent)
             }
         }
         .padding(24)
@@ -2012,16 +2211,23 @@ struct ZWZCompressOptionsView: View {
                 .pickerStyle(.segmented)
             }
 
-            // 密码
-            ZWZSheetSection(title: L.string("password_optional")) {
-                SecureField(L.string("enter_password"), text: $viewModel.password)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 14, design: .rounded))
-
-                if !viewModel.password.isEmpty {
-                    ZWZPasswordStrengthView(strength: PasswordStrength.evaluate(viewModel.password))
+            ZWZSheetSection(title: SettingsStrings.text("加密方式", "Encryption")) {
+                Picker(
+                    SettingsStrings.text("加密方式", "Encryption"),
+                    selection: encryptionModeBinding
+                ) {
+                    Text(SettingsStrings.text("不加密", "None"))
+                        .tag(EncryptionModeSelection.none)
+                    Text(SettingsStrings.text("密码", "Password"))
+                        .tag(EncryptionModeSelection.password)
+                    Text(SettingsStrings.text("公钥", "Public Key"))
+                        .tag(EncryptionModeSelection.publicKey)
+                        .disabled(viewModel.compressFormat != .zwz)
                 }
+                .pickerStyle(.segmented)
             }
+
+            encryptionConfiguration
 
             // 分卷
             ZWZSheetSection(title: L.string("split_size_optional")) {
@@ -2049,12 +2255,122 @@ struct ZWZCompressOptionsView: View {
                     viewModel.performCompress()
                 }
                 .zwzSheetButtonStyle(.primary)
+                .disabled(!viewModel.canStartCompression)
             }
             .padding(.bottom, 24)
         }
         .padding(.horizontal, 28)
-        .frame(width: 500, height: 560)
+        .frame(width: 520, height: 680)
         .background(LinearGradient.zwzBackground.opacity(0.5))
+        .task {
+            try? await viewModel.refreshIdentityChoices()
+        }
+    }
+
+    @ViewBuilder
+    private var encryptionConfiguration: some View {
+        switch viewModel.encryptionModeSelection {
+        case .none:
+            EmptyView()
+        case .password:
+            ZWZSheetSection(title: SettingsStrings.text("密码", "Password")) {
+                SecureField(L.string("enter_password"), text: $viewModel.password)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 14, design: .rounded))
+
+                if !viewModel.password.isEmpty {
+                    ZWZPasswordStrengthView(strength: PasswordStrength.evaluate(viewModel.password))
+                }
+            }
+        case .publicKey:
+            ZWZSheetSection(title: SettingsStrings.text("接收方", "Recipients")) {
+                if viewModel.availableRecipients.isEmpty {
+                    Text(SettingsStrings.text("尚无可用的本地身份或公开联系人。", "No local identities or public contacts are available."))
+                        .font(.system(size: 12, design: .rounded))
+                        .foregroundColor(.secondary)
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            ForEach(viewModel.availableRecipients, id: \.fingerprint) { recipient in
+                                Toggle(isOn: recipientBinding(recipient.fingerprint)) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(recipient.name)
+                                            .font(.system(size: 12, weight: .medium, design: .rounded))
+                                            .lineLimit(1)
+                                        Text(shortFingerprint(recipient.fingerprint))
+                                            .font(.system(size: 10, design: .monospaced))
+                                            .foregroundColor(.secondary)
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .toggleStyle(.checkbox)
+                                .padding(.vertical, 6)
+                                .help(recipient.fingerprint)
+
+                                if recipient.fingerprint != viewModel.availableRecipients.last?.fingerprint {
+                                    Divider()
+                                }
+                            }
+                        }
+                    }
+                    .frame(height: 116)
+                }
+
+                if viewModel.selectedRecipientFingerprints.isEmpty {
+                    Text(SettingsStrings.text("至少选择一个接收方。", "Select at least one recipient."))
+                        .font(.system(size: 11, design: .rounded))
+                        .foregroundColor(.red)
+                }
+            }
+
+            ZWZSheetSection(title: SettingsStrings.text("签名者（可选）", "Signer (Optional)")) {
+                Picker(
+                    SettingsStrings.text("签名者", "Signer"),
+                    selection: signerBinding
+                ) {
+                    Text(SettingsStrings.text("不签名", "Unsigned"))
+                        .tag(nil as String?)
+                    ForEach(viewModel.availableSigningIdentities, id: \.fingerprint) { identity in
+                        Text(identity.name)
+                            .tag(identity.fingerprint as String?)
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: .infinity)
+            }
+        }
+    }
+
+    private var encryptionModeBinding: Binding<EncryptionModeSelection> {
+        Binding(
+            get: { viewModel.encryptionModeSelection },
+            set: { viewModel.selectEncryptionMode($0) }
+        )
+    }
+
+    private var signerBinding: Binding<String?> {
+        Binding(
+            get: { viewModel.selectedSignerFingerprint },
+            set: { viewModel.selectedSignerFingerprint = $0 }
+        )
+    }
+
+    private func recipientBinding(_ fingerprint: String) -> Binding<Bool> {
+        Binding(
+            get: { viewModel.selectedRecipientFingerprints.contains(fingerprint) },
+            set: { isSelected in
+                if isSelected {
+                    viewModel.selectedRecipientFingerprints.insert(fingerprint)
+                } else {
+                    viewModel.selectedRecipientFingerprints.remove(fingerprint)
+                }
+            }
+        )
+    }
+
+    private func shortFingerprint(_ fingerprint: String) -> String {
+        guard fingerprint.count > 24 else { return fingerprint }
+        return "\(fingerprint.prefix(16))...\(fingerprint.suffix(8))"
     }
 }
 

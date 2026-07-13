@@ -306,6 +306,32 @@ final class ArchiveEntryPreviewSupportTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: extractor.secondRoot.path))
     }
 
+    @MainActor
+    func testModelPrivateKeyRestoreRetryCannotRequestAnotherAutomaticRetry() async throws {
+        let extractor = MissingPrivateKeyPreviewExtractor()
+        let recorder = PreviewProtectionEventRecorder()
+        let model = ArchiveEntryPreviewModel(
+            extractor: extractor,
+            onProtectionFailure: { recorder.events.append($0) }
+        )
+
+        model.preview(
+            archivePath: "/archive.zwz",
+            entry: textEntry(path: "protected.txt")
+        )
+        try await waitUntil { recorder.events.count == 1 }
+        XCTAssertTrue(recorder.events[0].allowsPrivateKeyRecovery)
+        XCTAssertEqual(
+            recorder.events[0].failure,
+            .missingPrivateKey(["AA:BB"])
+        )
+
+        recorder.events[0].retryAfterPrivateKeyRestore()
+        try await waitUntil { recorder.events.count == 2 }
+        XCTAssertFalse(recorder.events[1].allowsPrivateKeyRecovery)
+        XCTAssertEqual(extractor.callCount, 2)
+    }
+
     private func write(_ data: Data, named name: String) throws -> URL {
         let url = root.appendingPathComponent(name)
         try data.write(to: url)
@@ -337,6 +363,29 @@ final class ArchiveEntryPreviewSupportTests: XCTestCase {
 }
 
 private struct PreviewTestTimeout: Error {}
+
+@MainActor
+private final class PreviewProtectionEventRecorder {
+    var events: [ArchiveEntryPreviewProtectionEvent] = []
+}
+
+private final class MissingPrivateKeyPreviewExtractor: ArchiveEntryPreviewExtracting, @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls = 0
+
+    var callCount: Int { lock.withLock { calls } }
+
+    func extractEntryToTemp(
+        archivePath: String,
+        entryPath: String,
+        password: String?,
+        maximumBytes: Int64,
+        cancellationToken: CancellationToken
+    ) throws -> URL {
+        lock.withLock { calls += 1 }
+        throw ZwzV3Error.noMatchingPrivateKey(["AA:BB"])
+    }
+}
 
 private final class BlockingPreviewExtractor: ArchiveEntryPreviewExtracting, @unchecked Sendable {
     private let condition = NSCondition()

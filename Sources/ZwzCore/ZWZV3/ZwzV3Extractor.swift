@@ -16,6 +16,17 @@ public final class ZwzV3Extractor {
         }
     }
 
+    public func inspectArchive(
+        archivePath: String,
+        keyProvider: ZwzPrivateKeyProvider? = nil
+    ) throws -> ZwzV3ArchiveInspection {
+        let parsed = try parseArchive(
+            archivePath: archivePath,
+            cancellationToken: nil
+        )
+        return inspect(parsed: parsed, keyProvider: keyProvider)
+    }
+
     public func listEntries(
         archivePath: String,
         keyProvider: ZwzPrivateKeyProvider
@@ -211,44 +222,13 @@ public final class ZwzV3Extractor {
         keyProvider: ZwzPrivateKeyProvider,
         cancellationToken: CancellationToken?
     ) throws -> ZwzV3OpenedArchive {
-        try cancellationToken?.checkCancellation()
-        let urls = try Self.archiveURLs(for: archivePath)
-        let archive = try Self.loadLogicalArchive(
-            from: urls,
+        let parsed = try parseArchive(
+            archivePath: archivePath,
             cancellationToken: cancellationToken
         )
-        try cancellationToken?.checkCancellation()
-        let parsed: ZwzV3ParsedArchive
-        do {
-            parsed = try ZwzV3BinaryCodec.parse(archive)
-        } catch {
-            if archive.count >= ZwzV3Header.encodedLength,
-               let header = try? ZwzV3BinaryCodec.decodeHeader(
-                   archive.subdata(in: 0..<ZwzV3Header.encodedLength)
-               ),
-               header.signatureAlgorithm == .ed25519 {
-                throw ZwzV3Error.invalidSignature
-            }
-            throw error
-        }
-
-        let signature: ZwzSignatureVerification
-        if let signer = parsed.signer {
-            guard ZwzV3Crypto.verify(
-                signer.signature,
-                bytes: parsed.canonicalSignedBytes,
-                publicKey: signer.signingPublicKey
-            ) else {
-                throw ZwzV3Error.invalidSignature
-            }
-            signature = keyProvider.isKnownSigningKey(
-                fingerprint: signer.fingerprint,
-                signingPublicKey: signer.signingPublicKey
-            )
-                ? .validKnownSigner(name: signer.name, fingerprint: signer.fingerprint)
-                : .validUnknownSigner(name: signer.name, fingerprint: signer.fingerprint)
-        } else {
-            signature = .unsigned
+        let inspection = inspect(parsed: parsed, keyProvider: keyProvider)
+        guard inspection.securityInfo.signature != .invalid else {
+            throw ZwzV3Error.invalidSignature
         }
 
         let contentKey = try unwrapContentKey(parsed: parsed, keyProvider: keyProvider)
@@ -288,10 +268,68 @@ public final class ZwzV3Extractor {
             index: index,
             records: records,
             contentKey: contentKey,
+            securityInfo: inspection.securityInfo
+        )
+    }
+
+    private func parseArchive(
+        archivePath: String,
+        cancellationToken: CancellationToken?
+    ) throws -> ZwzV3ParsedArchive {
+        try cancellationToken?.checkCancellation()
+        let urls = try Self.archiveURLs(for: archivePath)
+        let archive = try Self.loadLogicalArchive(
+            from: urls,
+            cancellationToken: cancellationToken
+        )
+        try cancellationToken?.checkCancellation()
+        do {
+            return try ZwzV3BinaryCodec.parse(archive)
+        } catch {
+            if archive.count >= ZwzV3Header.encodedLength,
+               let header = try? ZwzV3BinaryCodec.decodeHeader(
+                   archive.subdata(in: 0..<ZwzV3Header.encodedLength)
+               ),
+               header.signatureAlgorithm == .ed25519 {
+                throw ZwzV3Error.invalidSignature
+            }
+            throw error
+        }
+    }
+
+    private func inspect(
+        parsed: ZwzV3ParsedArchive,
+        keyProvider: ZwzPrivateKeyProvider?
+    ) -> ZwzV3ArchiveInspection {
+        let signature: ZwzSignatureVerification
+        if let signer = parsed.signer {
+            if ZwzV3Crypto.verify(
+                signer.signature,
+                bytes: parsed.canonicalSignedBytes,
+                publicKey: signer.signingPublicKey
+            ) {
+                signature = keyProvider?.isKnownSigningKey(
+                    fingerprint: signer.fingerprint,
+                    signingPublicKey: signer.signingPublicKey
+                ) == true
+                    ? .validKnownSigner(name: signer.name, fingerprint: signer.fingerprint)
+                    : .validUnknownSigner(name: signer.name, fingerprint: signer.fingerprint)
+            } else {
+                signature = .invalid
+            }
+        } else {
+            signature = .unsigned
+        }
+        let recipients = parsed.recipients.map {
+            ZwzRecipientInfo(name: $0.recipientName, fingerprint: $0.recipientFingerprint)
+        }
+        return ZwzV3ArchiveInspection(
+            recipients: recipients,
             securityInfo: ZwzArchiveSecurityInfo(
                 encryption: .publicKey,
-                recipientFingerprints: parsed.recipients.map(\.recipientFingerprint),
-                signature: signature
+                recipientFingerprints: recipients.map(\.fingerprint),
+                signature: signature,
+                signerSigningPublicKey: parsed.signer?.signingPublicKey
             )
         )
     }

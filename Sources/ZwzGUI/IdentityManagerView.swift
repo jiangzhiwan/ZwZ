@@ -65,7 +65,7 @@ struct IdentityManagerView: View {
 
     init(onPrivateRestore: (@MainActor @Sendable () -> Void)? = nil) {
         _model = StateObject(wrappedValue: IdentityManagerViewModel(
-            store: MacKeychainIdentityStore(),
+            store: ZwzGUIIdentityStore.shared,
             onPrivateRestore: onPrivateRestore
         ))
     }
