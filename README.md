@@ -58,13 +58,59 @@ ZwZ 自研的 **ZWZ 格式**采用 AES-256-GCM 认证加密——不仅加密文
 zwz compress ~/Documents/project
 
 # 命令行解压
-zwz extract archive.zip -o ~/output
+zwz extract archive.zip ~/output
 
 # 预览压缩包内容
 zwz list archive.rar
 ```
 
 GUI 适合日常使用，CLI 适合脚本自动化和远程服务器。
+
+---
+
+## ZWZ 公钥加密与签名
+
+ZWZ 支持无加密、密码加密和公钥加密三种模式。密码与公钥模式互斥；公钥模式可以同时选择多个接收方，并可选择一个本机身份进行 Ed25519 签名。任一接收方持有匹配的 X25519 私钥即可解密，文件内容、文件名、路径、大小、时间戳和目录结构均由 AES-256-GCM 认证加密保护。
+
+### GUI
+
+- 在“设置 > 密钥”中创建本机身份、导入或导出公开身份，以及备份或恢复私钥。
+- 创建 ZWZ 压缩包时可选择无加密、密码或公钥模式；公钥模式支持多个接收方和一个可选的本机签名身份。
+- 接收方名称与指纹是压缩包中的公开标签，未经过信任验证，不能单独证明接收方身份。
+- 签名状态区分“已知签名者且签名有效”“未知签名者但签名有效”“未签名”和“签名无效”。签名无效时，预览、解压、单项打开、编辑和虚拟磁盘挂载都会被拒绝。
+- 缺少匹配私钥时，可恢复 `.zwzkey` 私钥备份并重试原操作。编辑或虚拟磁盘保存公钥压缩包时会保留原接收方与签名保护，不会静默降级。
+
+### CLI
+
+```bash
+# 创建本机身份并导出公钥
+zwz key create "My Mac"
+zwz key export-public "My Mac" recipient.zwzpub
+
+# 接收方先导入公钥；--recipient 接受已导入的名称或指纹，不接受文件路径
+zwz key import-public recipient.zwzpub
+zwz compress -f zwz --recipient "Recipient Name" --sign "My Mac" source shared.zwz
+
+# 解压时自动从本机身份中寻找匹配私钥
+zwz extract archive.zwz output
+
+# 私钥备份与恢复，密码通过隐藏的终端输入读取
+zwz key backup "My Mac" identity.zwzkey
+zwz key restore identity.zwzkey
+```
+
+可重复使用 `--recipient <name-or-fingerprint>` 添加多个接收方。`--sign` 只能选择本机身份，并且必须与至少一个 `--recipient` 一起使用。密码加密使用 `--password`，不能与 `--recipient` 或 `--sign` 同时使用。
+
+### ZwzCore
+
+`CompressionOptions.encryption` 提供 `.none`、`.password` 和 `.publicKey`。公钥压缩、列表与解压通过带 `ZwzPrivateKeyProvider` 的 `ZwzAPI` 重载完成，并返回包含格式版本、加密类型、接收方指纹和结构化签名状态的结果。`ZwzAPI.inspect` 可在请求私钥及解密索引前读取公开接收方标签并验证可选签名。
+
+### 密钥与兼容性
+
+- 生产环境中的私钥保存在 macOS 钥匙串，并使用“用户在场”访问控制；每次解密或签名都会要求 Touch ID 或 Mac 登录密码确认。
+- `.zwzkey` 私钥备份使用 scrypt（N=65,536、r=8、p=1）派生密钥并由 AES-256-GCM 保护，必须设置独立密码。请至少保留一份可用私钥或加密备份；如果所有匹配私钥及备份均丢失，公钥加密内容将永久无法恢复。
+- ZWZ V2 无加密和密码加密压缩包继续支持检测、预览、列表和解压。
+- ZWZ V1 只能被安全检测并报告为不支持；本项目没有可验证的历史 V1 读写器或真实兼容 fixture，因此不声明 V1 解压兼容。
 
 ---
 
@@ -132,7 +178,8 @@ swift test
 
 | 特性 | 实现 |
 |------|------|
-| 加密 | AES-256-GCM 认证加密（CryptoSwift） |
+| 加密 | AES-256-GCM；密码模式 PBKDF2，公钥模式 X25519 + HKDF-SHA-256 |
+| 签名 | 可选 Ed25519，区分已知、未知、未签名和无效状态 |
 | 压缩 | Deflate / LZMA / Store（Apple Compression） |
 | ZIP 支持 | ZIPFoundation（AES 加密读写） |
 | RAR/7Z/TAR | SWCompression（纯 Swift 解压） |

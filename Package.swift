@@ -44,7 +44,10 @@ let package = Package(
         .testTarget(
             name: "ZwzCoreTests",
             dependencies: ["ZwzCore"],
-            path: "Tests/ZwzCoreTests"
+            path: "Tests/ZwzCoreTests",
+            resources: [
+                .copy("Fixtures")
+            ]
         ),
         .testTarget(
             name: "ZwzGUITests",
